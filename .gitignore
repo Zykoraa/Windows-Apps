@@ -39,6 +39,8 @@ restore_vis.py
 update_app.py
 gui_new.py
 test_*.py
+# ...but the real suite is not scratch work.
+!EvesGarden/tests/**
 .backup_pre_fix/
 
 # ------------------------------------------------------------------ editors
