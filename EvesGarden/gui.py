@@ -1924,6 +1924,11 @@ class App(ctk.CTk):
                                                width=520, show="\u2022")
         self.setup_secret_entry.pack(padx=44, pady=(0, 10))
 
+        self.setup_redirect_entry = ctk.CTkEntry(
+            card, placeholder_text="Redirect URI (must match your Spotify app)",
+            height=42, corner_radius=21, width=520)
+        self.setup_redirect_entry.pack(padx=44, pady=(0, 10))
+
         self.setup_status = ctk.CTkLabel(card, text="", wraplength=520,
                                          justify="left",
                                          font=ctk.CTkFont(size=12),
@@ -1947,6 +1952,7 @@ class App(ctk.CTk):
         existing_id = os.getenv("SPOTIPY_CLIENT_ID", "")
         if existing_id:
             self.setup_id_entry.insert(0, existing_id)
+        self.setup_redirect_entry.insert(0, spotify_auth.redirect_uri())
         self.setup_id_entry.focus_set()
 
     def close_setup(self):
@@ -1957,23 +1963,26 @@ class App(ctk.CTk):
     def _save_setup(self):
         client_id = self.setup_id_entry.get().strip()
         secret = self.setup_secret_entry.get().strip()
+        redirect = self.setup_redirect_entry.get().strip()
         self.setup_save_btn.configure(state="disabled", text="Checking...")
         self.setup_status.configure(text="Asking Spotify to confirm those keys...",
                                     text_color=self.theme["text_secondary"])
 
         def work():
             ok, message = credentials.verify(client_id, secret)
-            self._safe_after(0, self._finish_setup, ok, message, client_id, secret)
+            self._safe_after(0, self._finish_setup, ok, message, client_id, secret,
+                             redirect)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _finish_setup(self, ok, message, client_id, secret):
+    def _finish_setup(self, ok, message, client_id, secret, redirect=None):
         self.setup_save_btn.configure(state="normal", text="Verify and save")
         if not ok:
             self.setup_status.configure(text=message, text_color=self.theme["text"])
             return
 
-        where = credentials.save(client_id, secret)
+        where = credentials.save(client_id, secret, redirect_uri=redirect)
+        self._refresh_user_client()
         try:
             self.sp = setup_spotify()
             self.spotify_error = None

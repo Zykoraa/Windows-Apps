@@ -94,7 +94,7 @@ def _writable(directory):
         return False
 
 
-def save(client_id, client_secret, discord_id=None):
+def save(client_id, client_secret, discord_id=None, redirect_uri=None):
     """Write credentials beside the app, falling back to AppData.
 
     Returns the path written to, so the UI can tell the user where their
@@ -109,6 +109,8 @@ def save(client_id, client_secret, discord_id=None):
         f"SPOTIPY_CLIENT_ID={client_id}",
         f"SPOTIPY_CLIENT_SECRET={client_secret}",
     ]
+    if redirect_uri and redirect_uri.strip():
+        lines.append(f"SPOTIPY_REDIRECT_URI={redirect_uri.strip()}")
     if discord_id:
         lines.append(f"DISCORD_CLIENT_ID={discord_id.strip()}")
     body = "\n".join(lines) + "\n"
@@ -123,6 +125,8 @@ def save(client_id, client_secret, discord_id=None):
     os.environ["SPOTIPY_CLIENT_SECRET"] = client_secret
     if discord_id:
         os.environ["DISCORD_CLIENT_ID"] = discord_id.strip()
+    if redirect_uri and redirect_uri.strip():
+        os.environ["SPOTIPY_REDIRECT_URI"] = redirect_uri.strip()
     return target
 
 
