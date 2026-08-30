@@ -75,6 +75,8 @@ import io
 import tkinter as tk
 from library_index import LibraryIndex, SORTS
 from library_view import LibraryView
+import motion
+import ui_widgets
 import recycle
 from discover import Discover
 from play_queue import PlayQueue
@@ -185,6 +187,11 @@ class App(ctk.CTk):
 
         self.player = PlayerEngine()
         self._seeking = False
+        # Covers are kept as PIL images, not just CTkImages, so the next one
+        # can be blended onto the one already showing.
+        self._thumb_pil = None
+        self._np_pil = None
+        self._np_bg = None
         self._lyric_fonts = {}
         self._tray_icon = None
         self._lib_search_timer = None
@@ -316,6 +323,8 @@ class App(ctk.CTk):
     def stop_playback(self):
         self.player.stop()
         self.play_btn.configure(text="\u25b6")
+        self.progress_slider.set(0.0)
+        self.progress_slider.set_buffered(0.0)
         if getattr(self, "discord", None):
             self.discord.clear()
 
@@ -521,47 +530,50 @@ class App(ctk.CTk):
         if not self.winfo_exists():
             return
         if thumb is None:
-            self.album_art_label.configure(image="")
-            self.np_art_label.configure(image="")
-            self.dynamic_accent = self.theme["accent"]
-            self.np_overlay.configure(fg_color=self.theme["bg"])
-            return
+            # A track with no embedded cover still gets a tile. Blanking the
+            # label instead left a hole in the bottom bar, which was the most
+            # visible flicker in the app.
+            thumb = ui_widgets.placeholder_art(64, self.theme["surface"],
+                                               self.theme["text"])
+            np_art = ui_widgets.placeholder_art(400, self.theme["bg"],
+                                                self.theme["text"])
+            accent = None
 
-        self._thumb_img = ctk.CTkImage(light_image=thumb, dark_image=thumb, size=(64, 64))
-        self._np_img = ctk.CTkImage(light_image=np_art, dark_image=np_art, size=(400, 400))
-        self.album_art_label.configure(image=self._thumb_img)
-        self.np_art_label.configure(image=self._np_img)
+        # Deliberately no placeholder in between: holding the outgoing cover
+        # until the incoming one has decoded, then dissolving, reads better
+        # than a blank frame every time the track changes.
+        ui_widgets.crossfade(self.album_art_label, self._thumb_pil, thumb, 64)
+        ui_widgets.crossfade(self.np_art_label, self._np_pil, np_art, 400)
+        self._thumb_pil, self._np_pil = thumb, np_art
 
         self.dynamic_accent = accent or self.theme["accent"]
-        self.np_overlay.configure(fg_color=self._readable_bg(accent))
+        self._tint_now_playing(self._readable_bg(accent))
 
-    @staticmethod
-    def _luminance(hex_color):
-        r = int(hex_color[1:3], 16) / 255
-        g = int(hex_color[3:5], 16) / 255
-        b = int(hex_color[5:7], 16) / 255
-        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    def _tint_now_playing(self, target):
+        """Ease the now-playing backdrop across to the new cover's colour.
+
+        Snapping between two saturated album colours was jarring enough to
+        read as a glitch.
+        """
+        start = self._np_bg or self.theme["bg"]
+        self._np_bg = target
+        motion.animate(
+            self.np_overlay, motion.SLOW,
+            lambda t: self.np_overlay.configure(
+                fg_color=motion.blend(start, target, t)),
+            name="tint")
 
     def _readable_bg(self, accent):
-        """Darken a pale cover colour so the light-on-dark text stays legible.
+        """Move a cover colour away from the text colour until it is legible.
 
-        The dominant album colour was applied to the overlay as-is, so a pale
-        sleeve gave near-white text on a near-white background.
+        The dominant album colour used to be applied to the overlay as-is, so
+        a pale sleeve gave near-white text on a near-white background. It then
+        always darkened, which is right for the nine dark themes and wrong for
+        Rose Pine Dawn and Nordic Light -- so the direction now follows the
+        theme's own text colour.
         """
-        if not accent:
-            return self.theme["bg"]
-        try:
-            lum = self._luminance(accent)
-            if lum <= 0.35:
-                return accent
-            # Scale toward black until it clears the contrast threshold.
-            factor = 0.35 / lum
-            r = int(int(accent[1:3], 16) * factor)
-            g = int(int(accent[3:5], 16) * factor)
-            b = int(int(accent[5:7], 16) * factor)
-            return f"#{r:02x}{g:02x}{b:02x}"
-        except (ValueError, IndexError):
-            return self.theme["bg"]
+        return ui_widgets.readable_tint(accent, self.theme["text"],
+                                        self.theme["bg"])
 
     def build_ui(self):
         self.grid_rowconfigure(1, weight=1)
@@ -676,7 +688,9 @@ class App(ctk.CTk):
                                         height=32, corner_radius=16,
                                         font=theme_ui.font("body_med"),
                                         command=self.clear_library_filter)
-        self.crumb_back.pack(side="left")
+        # The bar itself now runs edge to edge so its tint does, so the
+        # inset that used to come from the grid lives on the children.
+        self.crumb_back.pack(side="left", padx=(24, 0))
         self.crumb_label = ctk.CTkLabel(self.crumb_bar, text="",
                                         font=theme_ui.font("title"))
         self.crumb_label.pack(side="left", padx=14)
@@ -740,21 +754,26 @@ class App(ctk.CTk):
         self.progress_row.grid(row=1, column=1, sticky="ew", pady=(0, 10))
         self.progress_row.grid_columnconfigure(1, weight=1)
 
+        # The times sit on the track, not on the middle of the widget: the
+        # seek bar reserves a band above itself for the scrub readout.
         self.time_elapsed = ctk.CTkLabel(self.progress_row, text="0:00", width=44,
                                          font=theme_ui.font("time"))
-        self.time_elapsed.grid(row=0, column=0, padx=(0, 8))
+        self.time_elapsed.grid(row=0, column=0, padx=(0, 8), sticky="s",
+                               pady=(0, 1))
 
-        self.progress_slider = ctk.CTkSlider(self.progress_row, from_=0.0, to=1.0, command=self.on_seek, height=12)
-        self.progress_slider.set(0.0)
+        # A stock CTkSlider showed the playhead and nothing else: no hover
+        # affordance, and no way to see where a scrub would land short of
+        # letting go and listening.
+        self.progress_slider = ui_widgets.SeekBar(
+            self.progress_row, self.theme, command=self._commit_seek,
+            formatter=self._scrub_label, on_scrub=self._on_scrub)
         self.progress_slider.grid(row=0, column=1, sticky="ew")
-        # While the user drags, the 100 ms refresh must stop yanking the knob
-        # back to the playhead.
-        self.progress_slider.bind("<Button-1>", self._seek_begin)
-        self.progress_slider.bind("<ButtonRelease-1>", self._seek_end)
+        self.progress_slider.set_buffered(0.0)
 
         self.time_total = ctk.CTkLabel(self.progress_row, text="0:00", width=44,
                                        font=theme_ui.font("time"))
-        self.time_total.grid(row=0, column=2, padx=(8, 0))
+        self.time_total.grid(row=0, column=2, padx=(8, 0), sticky="s",
+                             pady=(0, 1))
 
         self.eq_toggle_btn = ctk.CTkButton(self.bottom_bar, text="EQ", width=40, height=40, corner_radius=20, command=self.toggle_eq)
         self.eq_toggle_btn.grid(row=0, column=2, sticky="e", padx=(10, 0))
@@ -776,8 +795,9 @@ class App(ctk.CTk):
         self.volume_icon = ctk.CTkLabel(self.volume_frame, text="\U0001F50A",
                                         font=ctk.CTkFont(size=13), width=18)
         self.volume_icon.pack(side="left", padx=(0, 6))
-        self.volume_slider = ctk.CTkSlider(self.volume_frame, from_=0.0, to=1.0,
-                                           width=90, height=12, command=self.on_volume)
+        self.volume_slider = ui_widgets.SeekBar(
+            self.volume_frame, self.theme, command=self.on_volume,
+            on_drag=self.on_volume, wheel_step=0.05, width=96)
         self.volume_slider.set(1.0)
         self.volume_slider.pack(side="left")
 
@@ -811,11 +831,48 @@ class App(ctk.CTk):
         if getattr(self, "dl_visible", False):
             self.close_downloader()
         if hasattr(self, 'np_overlay_visible') and self.np_overlay_visible:
-            self.np_overlay.place_forget()
+            self._slide_out(self.np_overlay)
             self.np_overlay_visible = False
         else:
-            self.np_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self._slide_in(self.np_overlay)
             self.np_overlay_visible = True
+
+    # --------------------------------------------------------- overlay motion
+
+    @staticmethod
+    def _overlay_rely(overlay):
+        """Where an overlay currently sits, so an interrupted slide resumes
+        from there instead of jumping back to the edge."""
+        try:
+            info = overlay.place_info()
+            return float(info.get("rely", 1.0)) if info else 1.0
+        except Exception:
+            return 1.0
+
+    def _slide_in(self, overlay, duration=motion.BASE):
+        """Bring a full-screen panel up from the bottom edge.
+
+        Every overlay in the app used to appear the instant it was place()d
+        and vanish the instant it was forgotten. Nothing about that was
+        broken, but it made the app feel like it was cutting between slides.
+        """
+        start = self._overlay_rely(overlay) if overlay.winfo_ismapped() else 1.0
+        overlay.place(relx=0, rely=start, relwidth=1, relheight=1)
+        overlay.lift()
+        motion.animate(overlay, duration,
+                       lambda t: overlay.place_configure(rely=start * (1 - t)),
+                       name="slide")
+
+    def _slide_out(self, overlay, duration=motion.FAST):
+        """Drop a panel back off the bottom edge, faster than it came in."""
+        if not overlay.winfo_ismapped():
+            return
+        start = self._overlay_rely(overlay)
+        motion.animate(
+            overlay, duration,
+            lambda t: overlay.place_configure(rely=start + (1 - start) * t),
+            done=overlay.place_forget,
+            easing=motion.ease_in_out_cubic, name="slide")
 
     def open_downloader(self):
         """Show the downloader panel, building it the first time."""
@@ -834,8 +891,7 @@ class App(ctk.CTk):
         if getattr(self, "np_overlay_visible", False):
             self.toggle_now_playing_overlay()
 
-        self.dl_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
-        self.dl_overlay.lift()
+        self._slide_in(self.dl_overlay)
         self.dl_visible = True
         self._sync_download_buttons()
         self._rebuild_job_rows()
@@ -843,7 +899,7 @@ class App(ctk.CTk):
 
     def close_downloader(self):
         if getattr(self, "dl_overlay", None) is not None:
-            self.dl_overlay.place_forget()
+            self._slide_out(self.dl_overlay)
         self.dl_visible = False
         self.suggestions_frame.place_forget()
 
@@ -1368,9 +1424,7 @@ class App(ctk.CTk):
         for name in ("progress_slider", "volume_slider"):
             widget = getattr(self, name, None)
             if widget is not None:
-                widget.configure(button_color=t["accent"],
-                                 button_hover_color=t["accent_hover"],
-                                 progress_color=t["accent"])
+                widget.set_palette(t)
 
         if getattr(self, "now_playing_sub", None) is not None:
             self.now_playing_sub.configure(text_color=t["text_secondary"])
@@ -1445,10 +1499,10 @@ class App(ctk.CTk):
         self.player.visualizer_enabled = self.visualizer_visible
         self.settings.set("visualizer_visible", self.visualizer_visible)
         if self.visualizer_visible:
-            self.viz_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self._slide_in(self.viz_overlay)
             self.viz_dropdown.set(VIZ_MODES[self.visualizer_mode])
         else:
-            self.viz_overlay.place_forget()
+            self._slide_out(self.viz_overlay)
 
     def toggle_visualizer_mode(self, event=None):
         self.set_visualizer_mode(self.visualizer_mode + 1)
@@ -2124,6 +2178,11 @@ class App(ctk.CTk):
             self.now_playing_sub.configure(text=meta)
         self.time_total.configure(text="0:00")
         self.time_elapsed.configure(text="0:00")
+        # A local file is available end to end the moment it opens, so the
+        # whole rail is "buffered". The streaming preview path is what makes
+        # the distinction worth drawing.
+        self.progress_slider.set(0.0)
+        self.progress_slider.set_buffered(1.0)
 
         recent_file = os.path.join(LIBRARY_DIR, "recent.json")
         recent_list = []
@@ -2430,18 +2489,25 @@ class App(ctk.CTk):
                        {"text": "Could not play this file"})
             print(self.player.last_error)
 
-    def _seek_begin(self, _event=None):
-        self._seeking = True
+    def _on_scrub(self, active):
+        """The seek bar reports when a drag starts and ends.
 
-    def _seek_end(self, _event=None):
-        self.player.set_progress(self.progress_slider.get())
-        self._seeking = False
+        The 100 ms refresh has to stop pushing the playhead into the bar for
+        the duration, or the knob snaps back out from under the cursor.
+        """
+        self._seeking = active
 
-    def on_seek(self, value):
-        # Only commit the seek on release; committing on every drag pixel
-        # reset the EQ filter state dozens of times a second.
-        if not self._seeking:
-            self.player.set_progress(value)
+    def _commit_seek(self, value):
+        # Only on release. Committing on every drag pixel reset the EQ filter
+        # state dozens of times a second.
+        self.player.set_progress(value)
+
+    def _scrub_label(self, value):
+        """The time under the cursor, for the seek bar's readout bubble."""
+        duration = self.player.get_duration() or 0
+        if duration <= 0:
+            return ""
+        return fmt_time(value * duration)
 
     def on_volume(self, value):
         self.player.set_volume(value)

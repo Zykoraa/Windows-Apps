@@ -13,7 +13,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import customtkinter as ctk
+import motion
 import theme_ui
+import ui_widgets
 
 HEART_FULL = "♥"
 HEART_EMPTY = "♡"
@@ -24,6 +26,7 @@ from mutagen.id3 import ID3, APIC
 CHUNK = 40  # rows rendered per event-loop turn
 ROW_H = theme_ui.ROW_H
 ART = theme_ui.ROW_ART
+FADE_H = 14  # the header tint's fade-out into the list below it
 
 
 def plural(n, word):
@@ -72,6 +75,13 @@ class LibraryView:
         self._art_pool = ThreadPoolExecutor(max_workers=4,
                                             thread_name_prefix="cover")
 
+        # The album-colour wash behind the breadcrumb.
+        self._tint_band = None
+        self._tint_key = None
+        self._tint_colour = None
+        self._tint_cache = {}
+        self.crumb_bar.bind("<Configure>", lambda _e: self._redraw_tint())
+
     # ------------------------------------------------------------ navigation
 
     def set_view(self, name):
@@ -119,13 +129,15 @@ class LibraryView:
         if self.filter:
             kind, value, label = self.filter[0], self.filter[1], self.filter[2]
             self.crumb_label.configure(text=label)
-            self.crumb_bar.grid(row=1, column=0, sticky="ew", padx=24, pady=(2, 6))
+            self._show_crumb_bar()
 
             if kind == "artist":
                 # An artist page is a shelf of albums, not 25 loose tracks.
                 albums = [a for a in self.index.albums(search=query or None)
                           if a["artist"] == value]
                 if albums:
+                    self._page_tint((kind, value),
+                                    albums[0].get("cover_path"))
                     self._render(albums, self._artist_album_row,
                                  ("artist-albums", value, query), "albums")
                     return
@@ -135,16 +147,20 @@ class LibraryView:
                 sort="Album" if kind == "album" else self.sort,
                 **{kind: value},
             )
+            self._page_tint((kind, value),
+                            rows[0].get("path") if rows else None)
             self._render(rows, self._track_row, ("tracks", kind, value, query), "tracks")
             return
 
         self.crumb_bar.grid_forget()
+        self._page_tint(None, None)
         if self.view == "Playlists":
             if self.playlist_id is not None:
                 rows = self.index.playlist_tracks(self.playlist_id)
                 self.crumb_label.configure(text=self.playlist_name or "Playlist")
-                self.crumb_bar.grid(row=1, column=0, sticky="ew",
-                                    padx=24, pady=(2, 6))
+                self._show_crumb_bar()
+                self._page_tint(("playlist", self.playlist_id),
+                                rows[0].get("path") if rows else None)
                 self._render(rows, self._track_row,
                              ("playlist", self.playlist_id, query), "track")
                 return
@@ -535,7 +551,14 @@ class LibraryView:
     # ------------------------------------------------------------- cover art
 
     def request_thumb(self, path, size, label):
-        """Load embedded cover art off the UI thread, cached by path and size."""
+        """Load embedded cover art off the UI thread, cached by path and size.
+
+        The placeholder tile goes down first, unconditionally. Art is decoded
+        on a worker, so every row used to be an empty box that filled in a
+        moment later, and scrolling a long list was a wall of pop-in.
+        """
+        label.configure(image=ui_widgets.placeholder_ctk(
+            size, self.theme["surface"], self.theme["text"]))
         if not path:
             return
         key = (path, size)
@@ -573,6 +596,107 @@ class LibraryView:
         except Exception:
             pass
 
+
+    # ------------------------------------------------------------ page tint
+
+    def _show_crumb_bar(self):
+        """The breadcrumb, sized and positioned as a page header.
+
+        Edge to edge rather than inset, because it now carries the album's
+        colour and an inset band of colour reads as a stray box.
+        """
+        self.crumb_bar.grid(row=1, column=0, sticky="ew", padx=0,
+                            pady=(0, 8), ipady=14)
+
+    def _page_tint(self, key, cover_path):
+        """Wash the page header with the dominant colour of its cover.
+
+        Every page in the library looked identical apart from its text. One
+        band of colour taken from the artwork is enough to make an album page
+        feel like that album's page.
+        """
+        if key == self._tint_key:
+            return
+        self._tint_key = key
+        if key is None:
+            self._set_tint(None)
+            return
+
+        if key in self._tint_cache:
+            self._set_tint(self._tint_cache[key])
+            return
+
+        self._set_tint(None)
+        if not cover_path:
+            self._tint_cache[key] = None
+            return
+
+        def work():
+            colour = None
+            try:
+                audio = MP3(cover_path, ID3=ID3)
+                data = next((t.data for t in (audio.tags or {}).values()
+                             if isinstance(t, APIC)), None)
+                if data:
+                    colour = ui_widgets.dominant_colour(
+                        Image.open(io.BytesIO(data)).convert("RGB"))
+            except Exception:
+                pass
+            self.schedule(0, self._tint_ready, key, colour)
+
+        self._art_pool.submit(work)
+
+    def _tint_ready(self, key, colour):
+        self._tint_cache[key] = colour
+        # The user may have navigated on while colorgram was working.
+        if key == self._tint_key:
+            self._set_tint(colour)
+
+    def _set_tint(self, colour):
+        """Ease the header from whatever it is now to the new colour."""
+        target = (ui_widgets.readable_tint(colour, self.theme["text"],
+                                           self.theme["bg"])
+                  if colour else self.theme["bg"])
+        start = self._tint_colour or self.theme["bg"]
+        self._tint_colour = target
+
+        def step(t):
+            shade = motion.blend(start, target, t)
+            self.crumb_bar.configure(fg_color=shade)
+            self._redraw_tint(shade)
+
+        motion.animate(self.crumb_bar, motion.SLOW, step, name="tint")
+
+    def _redraw_tint(self, shade=None):
+        """The strip that fades the header band down into the track list.
+
+        Drawn as an image rather than as a widget background because Tk has
+        no gradients, and kept clear of the breadcrumb's own children -- a
+        CustomTkinter button paints its corners with its parent's flat colour,
+        so anything sitting over the gradient would show a box around itself.
+        """
+        shade = shade or self._tint_colour or self.theme["bg"]
+        band = self._tint_band
+        if band is None:
+            # CustomTkinter only accepts width/height on the constructor, so
+            # the strip is sized here rather than in the place() call.
+            band = self._tint_band = ctk.CTkLabel(
+                self.crumb_bar, text="", height=FADE_H, corner_radius=0)
+        if not band.winfo_exists():
+            return
+
+        width = self.crumb_bar.winfo_width()
+        if shade == self.theme["bg"] or width <= 1:
+            band.place_forget()
+            return
+
+        image = ui_widgets.gradient_image(width, FADE_H, shade,
+                                          self.theme["bg"])
+        self._tint_image = ctk.CTkImage(light_image=image, dark_image=image,
+                                        size=(width, FADE_H))
+        band.configure(image=self._tint_image)
+        band.place(x=0, rely=1.0, anchor="sw", relwidth=1)
+        band.lower()
 
     def marked_duplicates(self):
         """Paths the user has ticked for removal in the Duplicates view."""
