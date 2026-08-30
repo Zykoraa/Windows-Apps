@@ -52,8 +52,20 @@ first run and writes them itself:
 
 1. Create an app at <https://developer.spotify.com/dashboard> — any name, no
    card required
-2. Copy the Client ID and Client Secret into the app's "Connect Spotify"
+2. In that app's **Settings**, add this exact Redirect URI:
+   `http://127.0.0.1:8888/callback`
+3. Copy the Client ID and Client Secret into the app's "Connect Spotify"
    screen
+
+### Playlists need a sign-in
+
+Spotify no longer lets an app read playlists — even public ones — without a
+signed-in user. Press **Sign in to Spotify** in the downloader, approve it in
+the browser once, and playlist links start working. The token is cached, so
+it only asks the first time.
+
+Only two scopes are requested, both read-only:
+`playlist-read-private` and `playlist-read-collaborative`.
 
 They are saved to `EvesGarden.env` next to the executable, so a copied folder
 stays working. If the app lives somewhere read-only it falls back to

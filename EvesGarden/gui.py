@@ -83,10 +83,11 @@ import visualizers
 import app_icon
 from discord_presence import DiscordPresence
 import credentials
+import spotify_auth
 from downloader import (
     setup_spotify, search_spotify_track, search_spotify_artist,
     get_artist_albums, get_spotify_album_tracks, get_spotify_playlist_tracks,
-    get_spotify_album_tracks_info, process_track, download_many,
+    get_spotify_album_tracks_info, process_track, download_many, get_config_dir,
     get_related_tracks, repair_library, find_orphaned_downloads,
     SpotifyAuthError,
 )
@@ -196,6 +197,10 @@ class App(ctk.CTk):
         if self.discord.available:
             self.discord.start()
         self._discord_tick = 0
+
+        # A signed-in client, created lazily: only playlists need one.
+        self.user_sp = None
+        self._refresh_user_client()
 
         self.dl_visible = False
         self.dl_overlay = None
@@ -1060,9 +1065,18 @@ class App(ctk.CTk):
         self.retry_button = ctk.CTkButton(
             buttons, text="Retry failed", height=46, width=140, corner_radius=23,
             command=self.retry_failed, font=ctk.CTkFont(size=14, weight="bold"))
+        # Playlists need a signed-in user; everything else works app-only.
+        self.signin_btn = ctk.CTkButton(
+            buttons, text="Sign in to Spotify", height=46, width=170,
+            corner_radius=23, fg_color="transparent", border_width=2,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=self.spotify_sign_in)
+        self.signin_btn.pack(side="left", padx=8)
+
         self.dl_progress_lbl = ctk.CTkLabel(buttons, text="",
                                             font=ctk.CTkFont(size=13))
         self.dl_progress_lbl.pack(side="right")
+        self._sync_signin_button()
 
         # Per-track state, so a failure no longer scrolls out of the log and
         # disappears with no record of what broke.
@@ -1301,6 +1315,10 @@ class App(ctk.CTk):
             if widget is not None:
                 widget.configure(fg_color=t["accent"], hover_color=t["accent_hover"],
                                  text_color=t["bg"])
+        if getattr(self, "signin_btn", None) is not None:
+            self.signin_btn.configure(border_color=t["accent"],
+                                      hover_color=t["surface_hover"],
+                                      text_color=t["text"])
         if getattr(self, "cancel_button", None) is not None:
             self.cancel_button.configure(border_color=t["accent"],
                                          hover_color=t["surface_hover"],
@@ -1793,6 +1811,66 @@ class App(ctk.CTk):
         # characters with an ellipsis for display, which never matched.
         self.fetch_lyrics(full_name)
 
+    def _config_dir(self):
+        return get_config_dir()
+
+    def _refresh_user_client(self):
+        """Pick up a cached sign-in without opening a browser."""
+        try:
+            self.user_sp = spotify_auth.get_client(
+                os.getenv("SPOTIPY_CLIENT_ID", ""),
+                os.getenv("SPOTIPY_CLIENT_SECRET", ""),
+                self._config_dir(),
+            )
+        except Exception:
+            self.user_sp = None
+        return self.user_sp is not None
+
+    def spotify_sign_in(self):
+        """Open the browser so Spotify can authorise reading playlists."""
+        if not self.sp:
+            self.log("Set up your Spotify credentials first.")
+            return
+        self.signin_btn.configure(state="disabled", text="Check your browser...")
+        self.log("Opening your browser to sign in to Spotify...")
+        self.log(f"If nothing opens, the redirect URI "
+                 f"{spotify_auth.REDIRECT_URI} must be listed in your Spotify "
+                 f"app's settings.")
+
+        def work():
+            ok, message = spotify_auth.sign_in(
+                os.getenv("SPOTIPY_CLIENT_ID", ""),
+                os.getenv("SPOTIPY_CLIENT_SECRET", ""),
+                self._config_dir(),
+            )
+            self._safe_after(0, self._finish_sign_in, ok, message)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_sign_in(self, ok, message):
+        self._refresh_user_client()
+        self.log(message)
+        self._sync_signin_button()
+        if ok:
+            self.log("Playlists will work now -- paste the link again.")
+
+    def spotify_sign_out(self):
+        spotify_auth.sign_out(self._config_dir())
+        self.user_sp = None
+        self.log("Signed out of Spotify.")
+        self._sync_signin_button()
+
+    def _sync_signin_button(self):
+        button = getattr(self, "signin_btn", None)
+        if button is None:
+            return
+        if self.user_sp is not None:
+            button.configure(state="normal", text="Signed in \u2713",
+                             command=self.spotify_sign_out)
+        else:
+            button.configure(state="normal", text="Sign in to Spotify",
+                             command=self.spotify_sign_in)
+
     def open_setup(self, first_run=False):
         """Ask for Spotify credentials in the app.
 
@@ -1824,7 +1902,10 @@ class App(ctk.CTk):
                   "minute, and no card is required.\n\n"
                   "1.  Open the dashboard below and sign in.\n"
                   "2.  Create app  ->  give it any name, tick the terms.\n"
-                  "3.  Copy the Client ID and Client Secret into the boxes.")
+                  "3.  In the app's Settings, add this Redirect URI:\n"
+                  "        " + spotify_auth.REDIRECT_URI + "\n"
+                  "     (needed later to download playlists)\n"
+                  "4.  Copy the Client ID and Client Secret into the boxes.")
         ).pack(padx=44, pady=(0, 14), anchor="w")
 
         ctk.CTkButton(card, text="Open the Spotify dashboard", height=36,
@@ -2363,7 +2444,8 @@ class App(ctk.CTk):
                 track_urls = [url]
             elif "playlist" in url:
                 self._gui_log("Fetching playlist tracks...")
-                track_urls = get_spotify_playlist_tracks(self.sp, url)
+                track_urls = get_spotify_playlist_tracks(self.sp, url,
+                                                         user_sp=self.user_sp)
             elif "album" in url:
                 self._gui_log("Fetching album tracks...")
                 track_urls = get_spotify_album_tracks(self.sp, url)

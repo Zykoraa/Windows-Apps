@@ -108,7 +108,10 @@ def search_spotify_artist(sp, query):
 
 
 def get_artist_albums(sp, artist_id):
-    results = sp.artist_albums(artist_id, album_type="album,single", limit=50)
+    # Spotify caps this endpoint at 10 per page for app-only credentials --
+    # anything larger comes back as "400 Invalid limit". The pagination loop
+    # below still walks the whole discography.
+    results = sp.artist_albums(artist_id, album_type="album,single", limit=10)
     albums = results["items"]
     while results["next"]:
         results = sp.next(results)
@@ -171,23 +174,37 @@ def get_related_tracks(sp, seed_track_id, limit=5):
     return out[:limit]
 
 
-def get_spotify_playlist_tracks(sp, playlist_url):
+def get_spotify_playlist_tracks(sp, playlist_url, user_sp=None):
+    """Read a playlist's tracks.
+
+    Spotify now requires user authentication for every playlist, public ones
+    included, so this prefers a signed-in client when one is available and
+    explains how to get one when it is not.
+    """
+    client = user_sp or sp
     try:
-        results = sp.playlist_items(playlist_url, additional_types=("track",))
+        results = client.playlist_items(playlist_url, additional_types=("track",))
     except spotipy.SpotifyException as e:
         if e.http_status in (401, 403, 404):
+            if user_sp is None:
+                raise SpotifyAuthError(
+                    "Reading a playlist needs you to sign in to Spotify.\n\n"
+                    "Spotify no longer lets apps read playlists -- even public "
+                    "ones -- without a signed-in user.\n\n"
+                    "Use the Sign in to Spotify button, approve it in the "
+                    "browser, then paste the playlist link again."
+                ) from e
             raise SpotifyAuthError(
-                "This playlist can't be read with app-only credentials.\n"
-                "Spotify only exposes PUBLIC playlists this way -- private, "
-                "collaborative and Spotify-generated playlists (Discover Weekly, "
-                "Daily Mix, Release Radar) need a signed-in user.\n"
-                "Try a public playlist, or download the album/tracks directly."
+                "That playlist could not be read even while signed in.\n\n"
+                "It may have been deleted, or it belongs to another account "
+                "and is private. Collaborative and private playlists are only "
+                "readable by an account they are shared with."
             ) from e
         raise
 
     tracks = results["items"]
     while results["next"]:
-        results = sp.next(results)
+        results = client.next(results)
         tracks.extend(results["items"])
 
     return [

@@ -6,6 +6,7 @@
 EvesGarden.env
 .cache
 .spotify-token-cache
+.spotify-user-token
 
 # ------------------------------------------------------------- build output
 dist/
