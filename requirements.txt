@@ -1,0 +1,26 @@
+# Spotify metadata + YouTube audio source
+spotipy>=2.23
+yt-dlp>=2024.1.0
+mutagen>=1.46
+requests>=2.31
+python-dotenv>=1.0
+
+# Playback engine
+pyaudio>=0.2.14
+pydub>=0.25
+numpy>=1.24
+scipy>=1.10
+
+# GUI  (media keys use ctypes/RegisterHotKey - no pynput needed)
+customtkinter>=5.2
+pillow>=10.0
+pystray>=0.19
+colorgram.py>=1.2
+# library index uses sqlite3 from the stdlib
+syncedlyrics>=0.7
+
+# Discord Rich Presence (optional; needs DISCORD_CLIENT_ID in .env)
+pypresence>=4.3
+
+# Packaging (dev only)
+# pyinstaller>=6.0

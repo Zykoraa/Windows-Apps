@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------- secrets
+# Never commit credentials. The Spotify client secret is a real secret and
+# this repository is public.
+.env
+*.env
+EvesGarden.env
+.cache
+.spotify-token-cache
+
+# ------------------------------------------------------------- build output
+dist/
+dist_new/
+build/
+build_new/
+*.pyc
+__pycache__/
+*.spec.bak
+
+# Bundled ffmpeg/ffprobe: ~424 MB of third-party binaries. Fetch them from
+# https://www.gyan.dev/ffmpeg/builds/ and drop them in bin/ before building.
+bin/
+
+# ----------------------------------------------------------------- user data
+# Downloaded music, the library index, and per-machine UI state.
+downloads/
+*.mp3
+library.db
+settings.json
+*.log
+
+# -------------------------------------------------------------- scratch work
+# One-off scripts used to edit gui.py during development; not part of the app.
+fix_*.py
+patch_*.py
+apply_*.py
+write_gui*.py
+restore_vis.py
+update_app.py
+gui_new.py
+test_*.py
+.backup_pre_fix/
+
+# ------------------------------------------------------------------ editors
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
