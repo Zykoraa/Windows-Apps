@@ -9,6 +9,7 @@ incrementally by mtime.
 """
 
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -51,6 +52,59 @@ PRIMARY_ARTIST = """COALESCE(NULLIF(albumartist,''),
     CASE WHEN instr(COALESCE(artist,''), ',') > 0
          THEN TRIM(substr(artist, 1, instr(artist, ',') - 1))
          ELSE artist END, '')"""
+
+# Qualifiers that do not change which song it is. Kept as explicit
+# alternatives rather than one clever pattern, because the failure mode of a
+# clever one is silently merging two different recordings.
+_QUALIFIERS = (
+    r"feat\.?|ft\.?|featuring|with"
+    r"|remastered?(?:\s*\d{2,4})?|re-?master"
+    r"|live(?:\s+(?:at|from|in)\b.*)?"
+    r"|explicit|clean|dirty"
+    r"|radio\s*edit|single\s*(?:version|edit)|album\s*version"
+    r"|bonus(?:\s*track)?|deluxe|mono|stereo"
+    r"|\d{1,3}(?:st|nd|rd|th)\s+anniversary|anniversary"
+    r"|original\s*mix|extended\s*(?:mix|version)"
+)
+
+# "(Remastered 2011)", "[Explicit]" -- anything bracketed that is only a
+# qualifier.
+_NOISE_BRACKET = re.compile(
+    r"\s*[\(\[]\s*(?:" + _QUALIFIERS + r")[^\)\]]*[\)\]]",
+    re.IGNORECASE)
+
+# "- Remastered 2011", "- Live at Wembley" -- a trailing dashed qualifier.
+_NOISE_DASH = re.compile(
+    r"\s+-\s*(?:" + _QUALIFIERS + r").*$",
+    re.IGNORECASE)
+
+# Split an artist credit at the first collaborator marker.
+_ARTIST_SPLIT = re.compile(
+    r"\s*(?:,|&|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\bwith\b|\bx\b|\bvs\.?\b)\s*",
+    re.IGNORECASE)
+
+_PUNCT = re.compile(r"[^\w\s]")
+_SPACE = re.compile(r"\s+")
+
+
+def normalise_title(title):
+    """Reduce a title to the part that identifies the song."""
+    text = (title or "").lower()
+    previous = None
+    while previous != text:
+        previous = text
+        text = _NOISE_BRACKET.sub("", text)
+        text = _NOISE_DASH.sub("", text)
+    text = _PUNCT.sub(" ", text)
+    return _SPACE.sub(" ", text).strip()
+
+
+def normalise_artist(artist):
+    """Primary artist only, so a feature credit does not split a pair."""
+    text = (artist or "").lower()
+    first = _ARTIST_SPLIT.split(text)[0] if text else ""
+    return _SPACE.sub(" ", _PUNCT.sub(" ", first)).strip()
+
 
 SORTS = {
     "Title":   "LOWER(COALESCE(NULLIF(title,''), path))",
@@ -291,14 +345,70 @@ class LibraryIndex:
             params,
         )
 
-    def duplicates(self):
-        """Same artist+title under different paths -- invisible when browsing by filename."""
-        return self._query(
-            "SELECT LOWER(COALESCE(artist,'')) AS a, LOWER(COALESCE(title,'')) AS t,"
-            " COUNT(*) AS n, GROUP_CONCAT(path, '|') AS paths"
-            " FROM tracks WHERE COALESCE(title,'') <> ''"
-            " GROUP BY a, t HAVING n > 1 ORDER BY n DESC"
-        )
+    def duplicates(self, duration_slack=8.0):
+        """Group tracks that look like the same song.
+
+        Exact title matching misses most real duplicates, because the same
+        song arrives as "Song", "Song (Remastered 2011)" and
+        "Song (feat. X) - Radio Edit". Titles are normalised down to their
+        core before grouping, and a duration check keeps genuinely different
+        recordings apart -- a 3-minute single and a 9-minute live cut of the
+        same name are not duplicates.
+        """
+        rows = self._query(
+            "SELECT path, title, artist, album, duration, bitrate, size,"
+            " play_count, added FROM tracks")
+
+        buckets = {}
+        for row in rows:
+            key = (normalise_artist(row["artist"]), normalise_title(row["title"]))
+            if not key[1]:
+                continue
+            buckets.setdefault(key, []).append(row)
+
+        groups = []
+        for (artist, title), members in buckets.items():
+            if len(members) < 2:
+                continue
+            # Split a bucket further when durations disagree, so a remix or a
+            # live version is not offered up for deletion.
+            members.sort(key=lambda r: r["duration"] or 0)
+            runs, current = [], [members[0]]
+            for row in members[1:]:
+                a = current[-1]["duration"] or 0
+                b = row["duration"] or 0
+                if abs(a - b) <= duration_slack:
+                    current.append(row)
+                else:
+                    runs.append(current)
+                    current = [row]
+            runs.append(current)
+
+            for run in runs:
+                if len(run) < 2:
+                    continue
+                # Suggest keeping the best copy: highest bitrate, then
+                # longest, then most played, then the one you had first.
+                run.sort(key=lambda r: (-(r["bitrate"] or 0),
+                                        -(r["duration"] or 0),
+                                        -(r["play_count"] or 0),
+                                        r["added"] or 0))
+                groups.append({
+                    "artist": run[0]["artist"] or artist,
+                    "title": run[0]["title"] or title,
+                    "keep": run[0],
+                    "extra": run[1:],
+                    "reclaim": sum(r["size"] or 0 for r in run[1:]),
+                })
+
+        groups.sort(key=lambda g: -g["reclaim"])
+        return groups
+
+    def forget(self, path):
+        """Drop a row after its file is deleted."""
+        with self._lock:
+            self._conn.execute("DELETE FROM tracks WHERE path = ?", (path,))
+            self._conn.commit()
 
     def cover_url(self, path):
         rows = self._query("SELECT cover_url FROM tracks WHERE path = ?", (path,))

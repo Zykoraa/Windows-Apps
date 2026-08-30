@@ -59,6 +59,8 @@ class LibraryView:
         self._rows_by_path = {}
         self._locked = set()
         self.playing_path = None
+        # path -> BooleanVar, for the duplicate review checkboxes
+        self.dup_marks = {}
         self._art_pool = ThreadPoolExecutor(max_workers=4,
                                             thread_name_prefix="cover")
 
@@ -129,6 +131,12 @@ class LibraryView:
             return
 
         self.crumb_bar.grid_forget()
+        if self.view == "Duplicates":
+            groups = self.index.duplicates()
+            self.dup_marks = {}
+            self._render(groups, self._duplicate_group,
+                         ("dupes", len(groups)), "duplicate group")
+            return
         if self.view == "Albums":
             rows = self.index.albums(search=query or None)
             self._render(rows, self._album_row, ("albums", query), "albums")
@@ -146,7 +154,8 @@ class LibraryView:
         refresh, including on every keystroke in the search box.
         """
         signature = (key, tuple(
-            r.get("path") or (r.get("album"), r.get("artist"), r.get("n"))
+            r.get("path") or r.get("album")
+            or (r.get("title"), r.get("artist"), len(r.get("extra") or []))
             for r in rows))
         if signature == self._signature:
             return
@@ -164,7 +173,9 @@ class LibraryView:
 
         if not rows:
             ctk.CTkLabel(self.frame,
-                         text="Nothing here yet. Use Download More to add music.",
+                         text=("No duplicates found — your library is clean."
+                               if self.view == "Duplicates" else
+                               "Nothing here yet. Use Add music to get started."),
                          text_color=self.theme["text_secondary"],
                          font=ctk.CTkFont(size=15)).pack(pady=40)
             self._set_status(f"{self.index.count()} tracks indexed")
@@ -298,6 +309,65 @@ class LibraryView:
         self._clickable(row, lambda a=album["album"], r=album["artist"]:
                         self.open_album(a, r))
 
+    def _duplicate_group(self, group):
+        """One suspected duplicate: the copy to keep, and the ones to drop."""
+        card = ctk.CTkFrame(self.frame, fg_color=self.theme["surface"],
+                            corner_radius=theme_ui.RADIUS)
+        card.pack(fill="x", padx=6, pady=6)
+
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.pack(fill="x", padx=14, pady=(12, 4))
+        ctk.CTkLabel(head, text=f"{group['artist']} — {group['title']}",
+                     anchor="w", font=theme_ui.font("heading"),
+                     text_color=self.theme["text"]).pack(side="left")
+        ctk.CTkLabel(head,
+                     text=f"frees {group['reclaim'] / 1e6:.0f} MB",
+                     anchor="e", font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(side="right")
+
+        def describe(row):
+            bits = []
+            if row.get("bitrate"):
+                bits.append(f"{row['bitrate'] // 1000} kbps")
+            if row.get("duration"):
+                bits.append(fmt_time(row["duration"]))
+            if row.get("size"):
+                bits.append(f"{row['size'] / 1e6:.0f} MB")
+            return "  ·  ".join(bits)
+
+        keep = group["keep"]
+        keep_row = ctk.CTkFrame(card, fg_color="transparent")
+        keep_row.pack(fill="x", padx=14, pady=2)
+        ctk.CTkLabel(keep_row, text="KEEP", width=54, anchor="w",
+                     font=theme_ui.font("small"),
+                     text_color=self.theme["accent"]).pack(side="left")
+        ctk.CTkLabel(keep_row, text=os.path.basename(keep["path"]), anchor="w",
+                     font=theme_ui.font("caption"),
+                     text_color=self.theme["text"]).pack(side="left", fill="x",
+                                                         expand=True)
+        ctk.CTkLabel(keep_row, text=describe(keep), anchor="e",
+                     font=theme_ui.font("small"),
+                     text_color=self.theme["text_secondary"]).pack(side="right")
+
+        for extra in group["extra"]:
+            row = ctk.CTkFrame(card, fg_color="transparent")
+            row.pack(fill="x", padx=14, pady=2)
+            var = ctk.BooleanVar(value=True)
+            self.dup_marks[extra["path"]] = var
+            ctk.CTkCheckBox(row, text="", variable=var, width=54,
+                            checkbox_width=18, checkbox_height=18,
+                            fg_color=self.theme["accent"],
+                            hover_color=self.theme["accent_hover"]).pack(side="left")
+            ctk.CTkLabel(row, text=os.path.basename(extra["path"]), anchor="w",
+                         font=theme_ui.font("caption"),
+                         text_color=self.theme["text_secondary"]).pack(
+                             side="left", fill="x", expand=True)
+            ctk.CTkLabel(row, text=describe(extra), anchor="e",
+                         font=theme_ui.font("small"),
+                         text_color=self.theme["text_secondary"]).pack(side="right")
+
+        ctk.CTkFrame(card, fg_color="transparent", height=8).pack()
+
     def _artist_album_row(self, album):
         """One album on an artist's page: large cover, title, year, length."""
         row = self._row(76)
@@ -383,3 +453,8 @@ class LibraryView:
                 label.configure(image=image)
         except Exception:
             pass
+
+
+    def marked_duplicates(self):
+        """Paths the user has ticked for removal in the Duplicates view."""
+        return [p for p, var in self.dup_marks.items() if var.get()]

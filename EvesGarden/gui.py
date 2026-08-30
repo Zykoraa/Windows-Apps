@@ -74,6 +74,7 @@ import io
 import tkinter as tk
 from library_index import LibraryIndex, SORTS
 from library_view import LibraryView
+import recycle
 from settings import Settings
 from download_manager import (
     DownloadManager, QUEUED, RUNNING, DONE, SKIPPED, FAILED, CANCELLED,
@@ -606,7 +607,7 @@ class App(ctk.CTk):
         # one folder, discarding the album and artist tags every download
         # writes.
         self.view_tabs = ctk.CTkSegmentedButton(
-            self.library_header, values=["Songs", "Albums", "Artists"],
+            self.library_header, values=["Songs", "Albums", "Artists", "Duplicates"],
             command=self.set_library_view, corner_radius=theme_ui.RADIUS_PILL,
             height=36, font=theme_ui.font("body_med"))
         self.view_tabs.set(self.library_view)
@@ -640,6 +641,11 @@ class App(ctk.CTk):
         self.theme_dropdown.pack(side="right", padx=10)
 
         # Only offered when there is actually something to recover.
+        self.dedupe_btn = ctk.CTkButton(
+            self.library_header, text="Move ticked to Recycle Bin",
+            command=self.remove_duplicates, corner_radius=theme_ui.RADIUS_PILL,
+            height=36, width=0, font=theme_ui.font("body_med"))
+
         self.repair_btn = ctk.CTkButton(self.library_header, text="Repair library",
                                         command=self.run_repair, corner_radius=20,
                                         font=ctk.CTkFont(weight="bold"))
@@ -1298,7 +1304,7 @@ class App(ctk.CTk):
                                  text_color=t["text"])
 
         for name in ("nav_dl_btn", "play_btn", "eq_toggle_btn", "viz_toggle_btn",
-                     "repair_btn"):
+                     "repair_btn", "dedupe_btn"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.configure(fg_color=t["accent"], hover_color=t["accent_hover"],
@@ -1662,6 +1668,50 @@ class App(ctk.CTk):
         self.time_elapsed.configure(text=fmt_time(self.player.get_position()))
         self.time_total.configure(text=fmt_time(self.player.get_duration()))
 
+    def _sync_dedupe_button(self):
+        """Only offer the delete action while the Duplicates view is open."""
+        button = getattr(self, "dedupe_btn", None)
+        if button is None:
+            return
+        if self.library_view == "Duplicates" and getattr(self, "library", None):
+            marked = len(self.library.marked_duplicates())
+            button.configure(text=f"Move {marked} to Recycle Bin",
+                             state="normal" if marked else "disabled")
+            button.pack(side="left", padx=6)
+        else:
+            button.pack_forget()
+
+    def remove_duplicates(self):
+        """Recycle the ticked copies, then re-scan.
+
+        These go to the Recycle Bin rather than being deleted outright, so a
+        wrong call is undoable from Explorer.
+        """
+        paths = self.library.marked_duplicates()
+        if not paths:
+            return
+        self.dedupe_btn.configure(state="disabled", text="Removing...")
+
+        def work():
+            recycled, failed = recycle.send_to_recycle_bin(paths)
+            for path in recycled:
+                try:
+                    self.index.forget(path)
+                except Exception:
+                    pass
+            self._safe_after(0, self._finish_dedupe, len(recycled), failed)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_dedupe(self, removed, failed):
+        note = f"Moved {removed} file{'' if removed == 1 else 's'} to the Recycle Bin"
+        if failed:
+            note += f"; {len(failed)} could not be removed"
+        self.library_status.configure(text=note)
+        self.library.invalidate()
+        self.render_library()
+        self._sync_dedupe_button()
+
     def refresh_repair_button(self):
         """Show the repair action only when orphaned raw downloads exist."""
         try:
@@ -1716,6 +1766,7 @@ class App(ctk.CTk):
         self.library.render()
         self.current_rows = self.library.rows
         self.current_library_files = self.library.paths
+        self._sync_dedupe_button()
 
     def set_library_view(self, name):
         self.library_view = name
