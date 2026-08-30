@@ -66,8 +66,16 @@ signed-in user. Press **Sign in to Spotify** in the downloader, approve it in
 the browser once, and playlist links start working. The token is cached, so
 it only asks the first time.
 
-Only two scopes are requested, both read-only:
-`playlist-read-private` and `playlist-read-collaborative`.
+Three read-only scopes are requested: `playlist-read-private`,
+`playlist-read-collaborative` and `user-library-read` (the last one is what
+makes **Liked Songs** downloadable — paste
+`https://open.spotify.com/collection/tracks`).
+
+**Spotify's own playlists cannot be downloaded by any app.** Discover Weekly,
+Daily Mix, Release Radar, Today's Top Hits and the rest of Spotify's
+editorial and algorithmic playlists were closed to the API in 2024 and return
+404 even to the user they were made for. Copy the tracks into a playlist of
+your own and use that instead.
 
 They are saved to `EvesGarden.env` next to the executable, so a copied folder
 stays working. If the app lives somewhere read-only it falls back to

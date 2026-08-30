@@ -174,18 +174,72 @@ def get_related_tracks(sp, seed_track_id, limit=5):
     return out[:limit]
 
 
+# Spotify's own editorial and algorithmic playlists -- Discover Weekly, Daily
+# Mix, Release Radar, Today's Top Hits and the rest -- all sit under this
+# prefix. Spotify closed them to the API in late 2024; they 404 for everyone,
+# including the user they were generated for.
+SPOTIFY_OWNED_PREFIX = "37i9dQZ"
+
+
+def is_liked_songs(url):
+    """Liked Songs is not a playlist; it lives behind /me/tracks."""
+    return "collection/tracks" in (url or "")
+
+
+def get_liked_songs(user_sp):
+    """Every track in Liked Songs, newest first."""
+    if user_sp is None:
+        raise SpotifyAuthError(
+            "Reading your Liked Songs needs you to sign in to Spotify.\n\n"
+            "Use the Sign in to Spotify button, then paste the link again."
+        )
+    try:
+        results = user_sp.current_user_saved_tracks(limit=50)
+    except spotipy.SpotifyException as e:
+        if e.http_status == 403:
+            raise SpotifyAuthError(
+                "Your saved sign-in predates Liked Songs support.\n\n"
+                "Press Signed in to sign out, then sign in again to grant "
+                "the extra permission."
+            ) from e
+        raise
+
+    items = results["items"]
+    while results["next"]:
+        results = user_sp.next(results)
+        items.extend(results["items"])
+    return [
+        i["track"]["external_urls"]["spotify"]
+        for i in items
+        if i.get("track") and i["track"].get("external_urls")
+    ]
+
+
 def get_spotify_playlist_tracks(sp, playlist_url, user_sp=None):
     """Read a playlist's tracks.
 
     Spotify now requires user authentication for every playlist, public ones
-    included, so this prefers a signed-in client when one is available and
-    explains how to get one when it is not.
+    included, so this prefers a signed-in client when one is available.
     """
+    if is_liked_songs(playlist_url):
+        return get_liked_songs(user_sp)
+
     client = user_sp or sp
     try:
         results = client.playlist_items(playlist_url, additional_types=("track",))
     except spotipy.SpotifyException as e:
         if e.http_status in (401, 403, 404):
+            if SPOTIFY_OWNED_PREFIX in (playlist_url or ""):
+                raise SpotifyAuthError(
+                    "Spotify's own playlists can't be read by any app.\n\n"
+                    "Discover Weekly, Daily Mix, Release Radar, Today's Top "
+                    "Hits and the rest of Spotify's editorial and algorithmic "
+                    "playlists were closed to the API in 2024. This is a "
+                    "Spotify restriction, not something the app can work "
+                    "around.\n\n"
+                    "You can copy the tracks into a playlist of your own and "
+                    "paste that instead."
+                ) from e
             if user_sp is None:
                 raise SpotifyAuthError(
                     "Reading a playlist needs you to sign in to Spotify.\n\n"
@@ -196,9 +250,11 @@ def get_spotify_playlist_tracks(sp, playlist_url, user_sp=None):
                 ) from e
             raise SpotifyAuthError(
                 "That playlist could not be read even while signed in.\n\n"
-                "It may have been deleted, or it belongs to another account "
-                "and is private. Collaborative and private playlists are only "
-                "readable by an account they are shared with."
+                "Playlists made by Spotify itself are blocked from the API, "
+                "and someone else's private or collaborative playlist is only "
+                "readable by an account it is shared with.\n\n"
+                "Your own playlists should work -- if this is one of yours, "
+                "tell me the link."
             ) from e
         raise
 

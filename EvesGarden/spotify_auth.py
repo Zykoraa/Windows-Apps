@@ -34,7 +34,10 @@ REDIRECT_URI = DEFAULT_REDIRECT_URI
 
 # Only what is needed to list playlists and read their tracks. No write
 # scopes, nothing touching playback or the user's profile.
-SCOPES = "playlist-read-private playlist-read-collaborative"
+# user-library-read is what makes "Liked Songs" readable; it lives behind
+# /me/tracks rather than being a real playlist.
+SCOPES = ("playlist-read-private playlist-read-collaborative "
+          "user-library-read")
 
 _lock = threading.Lock()
 

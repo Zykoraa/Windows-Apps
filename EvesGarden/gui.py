@@ -88,6 +88,7 @@ from downloader import (
     setup_spotify, search_spotify_track, search_spotify_artist,
     get_artist_albums, get_spotify_album_tracks, get_spotify_playlist_tracks,
     get_spotify_album_tracks_info, process_track, download_many, get_config_dir,
+    is_liked_songs,
     get_related_tracks, repair_library, find_orphaned_downloads,
     SpotifyAuthError,
 )
@@ -2454,7 +2455,14 @@ class App(ctk.CTk):
 
     def download_thread(self, url, out_dir):
         try:
-            if "track" in url:
+            if is_liked_songs(url):
+                # "Liked Songs" has no playlist id -- its URL is
+                # open.spotify.com/collection/tracks, so the plain
+                # "playlist" check below never matched it.
+                self._gui_log("Fetching your Liked Songs...")
+                track_urls = get_spotify_playlist_tracks(self.sp, url,
+                                                         user_sp=self.user_sp)
+            elif "track" in url:
                 track_urls = [url]
             elif "playlist" in url:
                 self._gui_log("Fetching playlist tracks...")
