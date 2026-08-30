@@ -66,6 +66,9 @@ class LibraryView:
         self.dup_marks = {}
         self._hearts = {}
         self.on_like = None          # set by the app; toggles and re-paints
+        self.on_menu = None          # right-click: (path, x, y)
+        self.playlist_id = None      # set while viewing one playlist
+        self.playlist_name = None
         self._art_pool = ThreadPoolExecutor(max_workers=4,
                                             thread_name_prefix="cover")
 
@@ -136,6 +139,19 @@ class LibraryView:
             return
 
         self.crumb_bar.grid_forget()
+        if self.view == "Playlists":
+            if self.playlist_id is not None:
+                rows = self.index.playlist_tracks(self.playlist_id)
+                self.crumb_label.configure(text=self.playlist_name or "Playlist")
+                self.crumb_bar.grid(row=1, column=0, sticky="ew",
+                                    padx=24, pady=(2, 6))
+                self._render(rows, self._track_row,
+                             ("playlist", self.playlist_id, query), "track")
+                return
+            rows = self.index.playlists()
+            self._render(rows, self._playlist_row, ("playlists", query),
+                         "playlist")
+            return
         if self.view == "Liked":
             rows = self.index.tracks(search=query or None, liked_only=True,
                                      sort="Recently liked")
@@ -191,7 +207,8 @@ class LibraryView:
             ctk.CTkLabel(self.frame,
                          text=({"Duplicates": "No duplicates found — your library is clean.",
                                 "Liked": "No liked songs yet. Tap the heart on any track.",
-                                "Recent": "Nothing played yet."}.get(self.view)
+                                "Recent": "Nothing played yet.",
+                                "Playlists": "No playlists yet. Use New playlist to make one."}.get(self.view)
                                or "Nothing here yet. Use Add music to get started."),
                          text_color=self.theme["text_secondary"],
                          font=ctk.CTkFont(size=15)).pack(pady=40)
@@ -286,6 +303,18 @@ class LibraryView:
             widget.bind("<Leave>", leave, add="+")
         row._hover_enter, row._hover_leave = enter, leave
 
+    def _menuable(self, widget, path):
+        """Right-click opens the track actions menu, on the row and children."""
+        def popup(event, p=path):
+            if self.on_menu:
+                self.on_menu(p, event.x_root, event.y_root)
+            return "break"
+        widget.bind("<Button-3>", popup)
+        for child in widget.winfo_children():
+            child.bind("<Button-3>", popup)
+            for grandchild in child.winfo_children():
+                grandchild.bind("<Button-3>", popup)
+
     def _clickable(self, widget, handler):
         # The heart owns its own click; the row must not also start playback.
         if getattr(widget, "_no_row_click", False):
@@ -340,6 +369,7 @@ class LibraryView:
         row._track_path = track["path"]
         self._rows_by_path[track["path"]] = row
         self._clickable(row, lambda p=track["path"]: self.on_play(p))
+        self._menuable(row, track["path"])
         if self.playing_path == track["path"]:
             self._paint_playing(row)
 
@@ -421,6 +451,41 @@ class LibraryView:
                          text_color=self.theme["text_secondary"]).pack(side="right")
 
         ctk.CTkFrame(card, fg_color="transparent", height=8).pack()
+
+    def _playlist_row(self, playlist):
+        row = self._row(72)
+        art = ctk.CTkLabel(row, text="", width=56, height=56, corner_radius=6)
+        art.pack(side="left", padx=(10, 14))
+        self.request_thumb(playlist.get("cover_path"), 56, art)
+
+        ctk.CTkLabel(row, text=fmt_time(playlist.get("total")), width=56,
+                     anchor="e", font=theme_ui.font("time"),
+                     text_color=self.theme["text_secondary"]
+                     ).pack(side="right", padx=(8, 16))
+
+        box = ctk.CTkFrame(row, fg_color="transparent")
+        box.pack(side="left", fill="both", expand=True)
+        ctk.CTkLabel(box, text=playlist["name"], anchor="w",
+                     font=theme_ui.font("heading"),
+                     text_color=self.theme["text"]).pack(anchor="w", pady=(14, 0))
+        ctk.CTkLabel(box, text=plural(playlist["n"], "track"), anchor="w",
+                     font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+        self._clickable(row, lambda pid=playlist["id"], name=playlist["name"]:
+                        self.open_playlist(pid, name))
+
+    def open_playlist(self, playlist_id, name):
+        self.playlist_id = playlist_id
+        self.playlist_name = name
+        self.invalidate()
+        self.render()
+
+    def close_playlist(self):
+        self.playlist_id = None
+        self.playlist_name = None
+        self.invalidate()
+        self.render()
 
     def _artist_album_row(self, album):
         """One album on an artist's page: large cover, title, year, length."""

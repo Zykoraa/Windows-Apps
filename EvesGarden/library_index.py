@@ -44,6 +44,24 @@ CREATE INDEX IF NOT EXISTS idx_artist ON tracks(artist);
 CREATE INDEX IF NOT EXISTS idx_played ON tracks(last_played);
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+CREATE TABLE IF NOT EXISTS playlists (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    name     TEXT NOT NULL,
+    created  REAL,
+    updated  REAL
+);
+
+-- position keeps the user's ordering; a track may appear once per playlist.
+CREATE TABLE IF NOT EXISTS playlist_items (
+    playlist_id INTEGER NOT NULL,
+    path        TEXT NOT NULL,
+    position    INTEGER NOT NULL,
+    added       REAL,
+    PRIMARY KEY (playlist_id, path),
+    FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_pl_items ON playlist_items(playlist_id, position);
 """
 
 # Featured-artist tracks carry "Tom Misch, De La Soul" in TPE1, and files
@@ -457,6 +475,97 @@ class LibraryIndex:
                 "UPDATE tracks SET play_count = play_count + 1, last_played = ?"
                 " WHERE path = ?", (time.time(), path),
             )
+            self._conn.commit()
+
+    # ----------------------------------------------------------- playlists
+
+    def playlists(self):
+        """Every playlist with its track count and total length."""
+        return self._query(
+            "SELECT p.id, p.name, p.created, p.updated,"
+            "       COUNT(i.path) AS n,"
+            "       COALESCE(SUM(t.duration), 0) AS total,"
+            "       MIN(CASE WHEN t.has_art = 1 THEN i.path END) AS cover_path"
+            "  FROM playlists p"
+            "  LEFT JOIN playlist_items i ON i.playlist_id = p.id"
+            "  LEFT JOIN tracks t        ON t.path = i.path"
+            " GROUP BY p.id ORDER BY LOWER(p.name)")
+
+    def create_playlist(self, name):
+        name = (name or "").strip() or "New playlist"
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO playlists(name, created, updated) VALUES(?,?,?)",
+                (name, now, now))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def rename_playlist(self, playlist_id, name):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE playlists SET name = ?, updated = ? WHERE id = ?",
+                ((name or "").strip() or "Untitled", time.time(), playlist_id))
+            self._conn.commit()
+
+    def delete_playlist(self, playlist_id):
+        with self._lock:
+            self._conn.execute("DELETE FROM playlist_items WHERE playlist_id = ?",
+                               (playlist_id,))
+            self._conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+            self._conn.commit()
+
+    def playlist_tracks(self, playlist_id):
+        """Tracks in the user's order, skipping any whose file has gone."""
+        return self._query(
+            "SELECT t.*, i.position FROM playlist_items i"
+            "  JOIN tracks t ON t.path = i.path"
+            " WHERE i.playlist_id = ? ORDER BY i.position", (playlist_id,))
+
+    def add_to_playlist(self, playlist_id, paths):
+        """Append tracks, ignoring any already present. Returns how many landed."""
+        if isinstance(paths, str):
+            paths = [paths]
+        now = time.time()
+        added = 0
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(position), -1) AS m FROM playlist_items"
+                " WHERE playlist_id = ?", (playlist_id,)).fetchone()
+            position = (row["m"] if row else -1) + 1
+            for path in paths:
+                try:
+                    self._conn.execute(
+                        "INSERT INTO playlist_items(playlist_id, path, position, added)"
+                        " VALUES(?,?,?,?)", (playlist_id, path, position, now))
+                    position += 1
+                    added += 1
+                except sqlite3.IntegrityError:
+                    pass          # already in this playlist
+            self._conn.execute("UPDATE playlists SET updated = ? WHERE id = ?",
+                               (now, playlist_id))
+            self._conn.commit()
+        return added
+
+    def remove_from_playlist(self, playlist_id, path):
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM playlist_items WHERE playlist_id = ? AND path = ?",
+                (playlist_id, path))
+            self._conn.execute("UPDATE playlists SET updated = ? WHERE id = ?",
+                               (time.time(), playlist_id))
+            self._conn.commit()
+
+    def reorder_playlist(self, playlist_id, ordered_paths):
+        """Rewrite positions to match the given order."""
+        with self._lock:
+            for index, path in enumerate(ordered_paths):
+                self._conn.execute(
+                    "UPDATE playlist_items SET position = ?"
+                    " WHERE playlist_id = ? AND path = ?",
+                    (index, playlist_id, path))
+            self._conn.execute("UPDATE playlists SET updated = ? WHERE id = ?",
+                               (time.time(), playlist_id))
             self._conn.commit()
 
     # ----------------------------------------------------------- key/value

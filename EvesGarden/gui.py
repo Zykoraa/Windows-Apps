@@ -1,4 +1,5 @@
 import colorgram
+import subprocess
 import webbrowser
 import sys
 import os
@@ -76,6 +77,7 @@ from library_index import LibraryIndex, SORTS
 from library_view import LibraryView
 import recycle
 from discover import Discover
+from play_queue import PlayQueue
 from settings import Settings
 from download_manager import (
     DownloadManager, QUEUED, RUNNING, DONE, SKIPPED, FAILED, CANCELLED,
@@ -213,6 +215,11 @@ class App(ctk.CTk):
         # A signed-in client, created lazily: only playlists need one.
         self.user_sp = None
         self._refresh_user_client()
+
+        self.queue = PlayQueue(
+            on_change=lambda: self._safe_after(0, self._render_queue))
+        self.queue_visible = False
+        self._queue_meta = {}
 
         self.discover = Discover(self.sp, _base_ydl_opts, _score_candidate)
         self.discover_results = []
@@ -441,17 +448,15 @@ class App(ctk.CTk):
         self.repeat_btn.configure(text_color=color)
 
     def play_next(self):
-        if not self.current_playlist: return
-        self.current_index += 1
-        if self.current_index >= len(self.current_playlist):
-            if self.repeat:
-                self.current_index = 0
-            else:
-                self.current_index -= 1
-                self.player.stop()
-                self.play_btn.configure(text="▶")
-                return
-        self.play_file(self.current_playlist[self.current_index])
+        """Anything queued by hand wins; otherwise continue through the list."""
+        nxt = self._queue_next()
+        if not nxt:
+            self.player.stop()
+            self.play_btn.configure(text="▶")
+            return
+        if nxt in self.current_playlist:
+            self.current_index = self.current_playlist.index(nxt)
+        self.play_file(nxt)
 
     def play_prev(self):
         if not self.current_playlist: return
@@ -614,8 +619,8 @@ class App(ctk.CTk):
         # one folder, discarding the album and artist tags every download
         # writes.
         self.view_tabs = ctk.CTkSegmentedButton(
-            self.library_header, values=["Songs", "Liked", "Recent", "Albums", "Artists",
-                    "Duplicates"],
+            self.library_header, values=["Songs", "Liked", "Recent", "Playlists", "Albums",
+                    "Artists", "Duplicates"],
             command=self.set_library_view, corner_radius=theme_ui.RADIUS_PILL,
             height=36, font=theme_ui.font("body_med"))
         self.view_tabs.set(self.library_view)
@@ -649,6 +654,12 @@ class App(ctk.CTk):
         self.theme_dropdown.pack(side="right", padx=10)
 
         # Only offered when there is actually something to recover.
+        self.new_pl_btn = ctk.CTkButton(
+            self.library_header, text="New playlist",
+            command=self.prompt_new_playlist,
+            corner_radius=theme_ui.RADIUS_PILL, height=36, width=0,
+            font=theme_ui.font("body_med"))
+
         self.dedupe_btn = ctk.CTkButton(
             self.library_header, text="Move ticked to Recycle Bin",
             command=self.remove_duplicates, corner_radius=theme_ui.RADIUS_PILL,
@@ -753,6 +764,12 @@ class App(ctk.CTk):
 
         # Volume: the engine had no gain stage at all, so the only way to turn
         # the app down was the system mixer.
+        self.queue_btn = ctk.CTkButton(
+            self.bottom_bar, text="☰", width=40, height=40,
+            corner_radius=20, command=self.toggle_queue,
+            font=theme_ui.font("body", size=15))
+        self.queue_btn.grid(row=0, column=4, sticky="e", padx=(0, 20))
+
         self.volume_frame = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         self.volume_frame.grid(row=1, column=2, columnspan=2, sticky="e",
                                padx=(10, 20), pady=(0, 10))
@@ -773,6 +790,7 @@ class App(ctk.CTk):
         self.library.view = self.library_view
         self.library.sort = self.library_sort
         self.library.on_like = self.toggle_like
+        self.library.on_menu = self.show_track_menu
 
         self._build_resize_grips()
 
@@ -1327,7 +1345,7 @@ class App(ctk.CTk):
                                  text_color=t["text"])
 
         for name in ("nav_dl_btn", "play_btn", "eq_toggle_btn", "viz_toggle_btn",
-                     "repair_btn", "dedupe_btn"):
+                     "repair_btn", "dedupe_btn", "new_pl_btn", "queue_btn"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.configure(fg_color=t["accent"], hover_color=t["accent_hover"],
@@ -1692,6 +1710,15 @@ class App(ctk.CTk):
         self.time_elapsed.configure(text=fmt_time(self.player.get_position()))
         self.time_total.configure(text=fmt_time(self.player.get_duration()))
 
+    def _sync_playlist_button(self):
+        button = getattr(self, "new_pl_btn", None)
+        if button is None:
+            return
+        if self.library_view == "Playlists":
+            button.pack(side="left", padx=6)
+        else:
+            button.pack_forget()
+
     def _sync_dedupe_button(self):
         """Only offer the delete action while the Duplicates view is open."""
         button = getattr(self, "dedupe_btn", None)
@@ -1786,6 +1813,179 @@ class App(ctk.CTk):
 
     # -- thin delegates onto LibraryView ---------------------------------
 
+    def toggle_queue(self):
+        """Slide the up-next panel in and out."""
+        if getattr(self, "queue_panel", None) is None:
+            self._build_queue_panel()
+        self.queue_visible = not self.queue_visible
+        if self.queue_visible:
+            # CustomTkinter wants width on the constructor, not on place().
+            self.queue_panel.place(relx=1.0, rely=0, anchor="ne", relheight=1.0)
+            self.queue_panel.lift()
+            self._render_queue()
+        else:
+            self.queue_panel.place_forget()
+
+    def _build_queue_panel(self):
+        t = self.theme
+        self.queue_panel = ctk.CTkFrame(self.main_area, corner_radius=0,
+                                        width=330, fg_color=t["surface"])
+        self.queue_panel.pack_propagate(False)
+        header = ctk.CTkFrame(self.queue_panel, fg_color="transparent")
+        header.pack(fill="x", padx=16, pady=(16, 8))
+        ctk.CTkLabel(header, text="Up next", font=theme_ui.font("title"),
+                     text_color=t["text"]).pack(side="left")
+        ctk.CTkButton(header, text="Clear", width=64, height=28,
+                      corner_radius=14, font=theme_ui.font("small"),
+                      fg_color="transparent", border_width=1,
+                      command=self.queue.clear).pack(side="right")
+        self.queue_list = ctk.CTkScrollableFrame(self.queue_panel,
+                                                 fg_color="transparent")
+        self.queue_list.pack(fill="both", expand=True, padx=8, pady=(0, 12))
+
+    def _queue_entry(self, path, queued):
+        row = ctk.CTkFrame(self.queue_list, fg_color="transparent", height=44)
+        row.pack(fill="x", padx=4, pady=1)
+        row.pack_propagate(False)
+        meta = self._queue_meta.get(path, {})
+        title = meta.get("title") or os.path.basename(path)
+
+        if queued:
+            ctk.CTkButton(row, text="✕", width=26, height=26,
+                          corner_radius=13, fg_color="transparent",
+                          font=theme_ui.font("small"),
+                          command=lambda p=path: self.queue.remove(p)
+                          ).pack(side="right", padx=4)
+
+        box = ctk.CTkFrame(row, fg_color="transparent")
+        box.pack(side="left", fill="both", expand=True)
+        ctk.CTkLabel(box, text=title[:32], anchor="w",
+                     font=theme_ui.font("body_med"),
+                     text_color=self.theme["text"]).pack(anchor="w", pady=(5, 0))
+        ctk.CTkLabel(box, text=(meta.get("artist") or "")[:32], anchor="w",
+                     font=theme_ui.font("small"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+    def _render_queue(self):
+        if getattr(self, "queue_panel", None) is None or not self.queue_visible:
+            return
+        for widget in self.queue_list.winfo_children():
+            widget.destroy()
+
+        upcoming = self.queue.upcoming
+        following = self.queue.context_after(15)
+        # One index lookup for the whole panel rather than one per row.
+        wanted = set(upcoming) | set(following)
+        self._queue_meta = {t["path"]: t for t in self.index.tracks()
+                            if t["path"] in wanted}
+
+        if upcoming:
+            ctk.CTkLabel(self.queue_list, text="QUEUED", anchor="w",
+                         font=theme_ui.font("small"),
+                         text_color=self.theme["accent"]).pack(
+                             anchor="w", padx=8, pady=(4, 2))
+            for path in upcoming:
+                self._queue_entry(path, True)
+
+        if following:
+            ctk.CTkLabel(self.queue_list, text="THEN FROM THIS LIST", anchor="w",
+                         font=theme_ui.font("small"),
+                         text_color=self.theme["text_secondary"]).pack(
+                             anchor="w", padx=8, pady=(12, 2))
+            for path in following:
+                self._queue_entry(path, False)
+
+        if not upcoming and not following:
+            ctk.CTkLabel(self.queue_list, text="Nothing queued.",
+                         font=theme_ui.font("body"),
+                         text_color=self.theme["text_secondary"]).pack(pady=20)
+
+    def show_track_menu(self, path, x, y):
+        """Right-click actions for one track."""
+        menu = tk.Menu(self, tearoff=0,
+                       bg=self.theme["surface"], fg=self.theme["text"],
+                       activebackground=self.theme["accent"],
+                       activeforeground=self.theme["bg"],
+                       borderwidth=0, font=(theme_ui.ui_family(), 10))
+        menu.add_command(label="Play", command=lambda: self.play_from_library(path))
+        menu.add_command(label="Play next",
+                         command=lambda: self.queue.add(path, next_up=True))
+        menu.add_command(label="Add to queue", command=lambda: self.queue.add(path))
+        menu.add_separator()
+
+        liked = self.index.is_liked(path)
+        menu.add_command(label="Remove from Liked" if liked else "Add to Liked",
+                         command=lambda: self._like_from_menu(path))
+
+        playlists = self.index.playlists()
+        if playlists:
+            submenu = tk.Menu(menu, tearoff=0, bg=self.theme["surface"],
+                              fg=self.theme["text"],
+                              activebackground=self.theme["accent"],
+                              activeforeground=self.theme["bg"], borderwidth=0)
+            for playlist in playlists:
+                submenu.add_command(
+                    label=playlist["name"],
+                    command=lambda pid=playlist["id"]: self._add_to_playlist(pid, path))
+            menu.add_cascade(label="Add to playlist", menu=submenu)
+        menu.add_command(label="New playlist with this...",
+                         command=lambda: self.prompt_new_playlist([path]))
+
+        if self.library.view == "Playlists" and self.library.playlist_id:
+            menu.add_separator()
+            menu.add_command(label="Remove from this playlist",
+                             command=lambda: self._remove_from_playlist(path))
+
+        menu.add_separator()
+        menu.add_command(label="Show in Explorer",
+                         command=lambda: self._reveal(path))
+        try:
+            menu.tk_popup(int(x), int(y))
+        finally:
+            menu.grab_release()
+
+    def _like_from_menu(self, path):
+        liked = self.toggle_like(path)
+        self.library.set_heart(path, liked)
+
+    def _add_to_playlist(self, playlist_id, path):
+        added = self.index.add_to_playlist(playlist_id, path)
+        self.library_status.configure(
+            text="Added to playlist" if added else "Already in that playlist")
+
+    def _remove_from_playlist(self, path):
+        self.index.remove_from_playlist(self.library.playlist_id, path)
+        self.library.invalidate()
+        self.render_library()
+
+    def _reveal(self, path):
+        try:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        except Exception as e:
+            print(f"Could not open Explorer: {e}")
+
+    def prompt_new_playlist(self, paths=()):
+        """Ask for a name, create the playlist, and drop any tracks in."""
+        dialog = ctk.CTkInputDialog(text="Name your playlist", title="New playlist")
+        name = dialog.get_input()
+        if not name:
+            return
+        playlist_id = self.index.create_playlist(name)
+        if paths:
+            self.index.add_to_playlist(playlist_id, list(paths))
+        self.library_view = "Playlists"
+        self.view_tabs.set("Playlists")
+        self.library.playlist_id = None
+        self.library.set_view("Playlists")
+        self.render_library()
+
+    def _queue_next(self):
+        current = None
+        if 0 <= self.current_index < len(self.current_playlist):
+            current = self.current_playlist[self.current_index]
+        return self.queue.next_path(shuffle=self.shuffle, repeat=self.repeat,
+                                    current=current)
+
     def toggle_like(self, path):
         """Flip a track's heart and keep the bottom bar in step."""
         liked = self.index.toggle_liked(path)
@@ -1820,9 +2020,11 @@ class App(ctk.CTk):
         self.current_rows = self.library.rows
         self.current_library_files = self.library.paths
         self._sync_dedupe_button()
+        self._sync_playlist_button()
 
     def set_library_view(self, name):
         self.library_view = name
+        self.library.playlist_id = None
         self.settings.set("library_view", name)
         self.library.set_view(name)
         self.render_library()
@@ -1834,6 +2036,10 @@ class App(ctk.CTk):
         self.render_library()
 
     def clear_library_filter(self):
+        if self.library.view == "Playlists" and self.library.playlist_id:
+            self.library.close_playlist()
+            self.render_library()
+            return
         # Back steps up one level rather than always jumping to the top.
         self.library.go_back()
         self.render_library()
@@ -1898,6 +2104,8 @@ class App(ctk.CTk):
             self.current_playlist = [file_path]
             self.current_index = 0
 
+        # Whatever list you played from becomes what plays after the queue.
+        self.queue.set_context(self.current_playlist, start=file_path)
         self.play_file(file_path)
 
     def play_file(self, file_path):
@@ -1939,6 +2147,8 @@ class App(ctk.CTk):
             self.index.record_play(file_path)
         except Exception:
             pass
+        self.queue.note_playing(file_path)
+        self._render_queue()
         view = getattr(self, "library", None)
         if view is not None:
             view.mark_playing(file_path)
