@@ -41,6 +41,8 @@ gui_new.py
 test_*.py
 # ...but the real suite is not scratch work.
 !EvesGarden/tests/**
+!EvesGarden/tests/*.py
+EvesGarden/tests/__pycache__/
 .backup_pre_fix/
 
 # ------------------------------------------------------------------ editors
