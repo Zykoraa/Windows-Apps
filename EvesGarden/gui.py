@@ -130,12 +130,21 @@ ctk.set_appearance_mode("Dark")
 ctk.ThemeManager.theme["CTkFont"]["family"] = "JetBrainsMono NF"
 
 # Monkeypatch CTkFont to ensure all explicit calls use the nerd font
+import theme_ui
+
+# Every CTkFont used to be forced to JetBrainsMono NF, a coding face, which
+# is why the whole app read like a terminal. Default to the UI face instead
+# and let call sites that genuinely want fixed-width ask for it.
 _original_ctk_font = ctk.CTkFont
-class JetBrainsFont(_original_ctk_font):
+
+
+class _UIFont(_original_ctk_font):
     def __init__(self, *args, **kwargs):
-        kwargs["family"] = "JetBrainsMono NF"
+        kwargs.setdefault("family", theme_ui.ui_family())
         super().__init__(*args, **kwargs)
-ctk.CTkFont = JetBrainsFont
+
+
+ctk.CTkFont = _UIFont
 
 class App(ctk.CTk):
     def __init__(self):
@@ -584,9 +593,11 @@ class App(ctk.CTk):
         # 2. Main Area (Library)
         self.main_area = ctk.CTkFrame(self, corner_radius=0, fg_color=self.theme["bg"])
         self.main_area.grid(row=1, column=0, sticky="nsew")
-        self.main_area.grid_rowconfigure(1, weight=1)
         self.main_area.grid_columnconfigure(0, weight=1)
-        self.main_area.grid_rowconfigure(2, weight=0)
+        self.main_area.grid_rowconfigure(0, weight=0)   # header
+        self.main_area.grid_rowconfigure(1, weight=0)   # breadcrumb
+        self.main_area.grid_rowconfigure(2, weight=1)   # list
+        self.main_area.grid_rowconfigure(3, weight=0)   # status
 
         self.library_header = ctk.CTkFrame(self.main_area, height=60, fg_color="transparent")
         self.library_header.grid(row=0, column=0, sticky="ew", padx=20, pady=10)
@@ -596,24 +607,35 @@ class App(ctk.CTk):
         # writes.
         self.view_tabs = ctk.CTkSegmentedButton(
             self.library_header, values=["Songs", "Albums", "Artists"],
-            command=self.set_library_view, corner_radius=15)
+            command=self.set_library_view, corner_radius=theme_ui.RADIUS_PILL,
+            height=36, font=theme_ui.font("body_med"))
         self.view_tabs.set(self.library_view)
         self.view_tabs.pack(side="left", padx=(0, 12))
 
-        self.lib_search_entry = ctk.CTkEntry(self.library_header, placeholder_text="Search title, artist or album...", border_width=0, corner_radius=15, height=35, width=280)
-        self.lib_search_entry.pack(side="left", padx=10)
+        self.lib_search_entry = ctk.CTkEntry(
+            self.library_header, placeholder_text="Search title, artist or album",
+            border_width=1, corner_radius=theme_ui.RADIUS_PILL, height=36,
+            width=320, font=theme_ui.font("body"))
+        self.lib_search_entry.pack(side="left", padx=(4, 10))
         self.lib_search_entry.bind("<KeyRelease>", self._on_library_search)
 
         self.sort_dropdown = ctk.CTkOptionMenu(
             self.library_header, values=list(SORTS.keys()),
-            command=self.set_library_sort, corner_radius=15, width=150)
+            command=self.set_library_sort, corner_radius=theme_ui.RADIUS_PILL,
+            width=170, height=36, font=theme_ui.font("body"))
         self.sort_dropdown.set(self.library_sort)
         self.sort_dropdown.pack(side="left", padx=10)
 
-        self.nav_dl_btn = ctk.CTkButton(self.library_header, text="Download More", command=self.open_downloader, corner_radius=20, font=ctk.CTkFont(weight="bold"))
-        self.nav_dl_btn.pack(side="left", padx=10)
+        self.nav_dl_btn = ctk.CTkButton(
+            self.library_header, text="+  Add music", command=self.open_downloader,
+            corner_radius=theme_ui.RADIUS_PILL, height=36, width=132,
+            font=theme_ui.font("body_med"))
+        self.nav_dl_btn.pack(side="left", padx=6)
 
-        self.theme_dropdown = ctk.CTkOptionMenu(self.library_header, values=list(THEMES.keys()), command=self.change_theme, corner_radius=15)
+        self.theme_dropdown = ctk.CTkOptionMenu(
+            self.library_header, values=list(THEMES.keys()),
+            command=self.change_theme, corner_radius=theme_ui.RADIUS_PILL,
+            width=155, height=36, font=theme_ui.font("body"))
         self.theme_dropdown.set(self.current_theme_name)
         self.theme_dropdown.pack(side="right", padx=10)
 
@@ -625,19 +647,21 @@ class App(ctk.CTk):
 
         # Shown only while drilled into one album or artist.
         self.crumb_bar = ctk.CTkFrame(self.main_area, fg_color="transparent")
-        self.crumb_back = ctk.CTkButton(self.crumb_bar, text="←  All", width=80,
-                                        corner_radius=15, command=self.clear_library_filter)
+        self.crumb_back = ctk.CTkButton(self.crumb_bar, text="←  Back", width=92,
+                                        height=32, corner_radius=16,
+                                        font=theme_ui.font("body_med"),
+                                        command=self.clear_library_filter)
         self.crumb_back.pack(side="left")
         self.crumb_label = ctk.CTkLabel(self.crumb_bar, text="",
-                                        font=ctk.CTkFont(size=18, weight="bold"))
+                                        font=theme_ui.font("title"))
         self.crumb_label.pack(side="left", padx=14)
 
         self.library_frame = ctk.CTkScrollableFrame(self.main_area, fg_color="transparent")
-        self.library_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=10)
+        self.library_frame.grid(row=2, column=0, sticky="nsew", padx=20, pady=(4, 6))
 
         self.library_status = ctk.CTkLabel(self.main_area, text="", anchor="w",
                                            font=ctk.CTkFont(size=11))
-        self.library_status.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 6))
+        self.library_status.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 8))
 
         # 3. Bottom Playback Bar
         self.bottom_bar = ctk.CTkFrame(self, height=90, corner_radius=0, fg_color=self.theme["surface"])
@@ -654,8 +678,18 @@ class App(ctk.CTk):
         self.album_art_label.bind("<Button-1>", self.toggle_now_playing_overlay)
         self.album_art_label.configure(cursor="hand2")
 
-        self.now_playing_label = ctk.CTkLabel(self.now_playing_frame, text="No track selected", font=ctk.CTkFont(size=14, weight="bold"))
-        self.now_playing_label.pack(side="left")
+        # One flat "Artist - Title" string gave the title no prominence, so
+        # split it: title leads, artist and album sit under it.
+        np_text = ctk.CTkFrame(self.now_playing_frame, fg_color="transparent")
+        np_text.pack(side="left", fill="y")
+        self.now_playing_label = ctk.CTkLabel(np_text, text="No track selected",
+                                              font=theme_ui.font("heading"),
+                                              anchor="w", justify="left")
+        self.now_playing_label.pack(anchor="w", pady=(16, 0))
+        self.now_playing_sub = ctk.CTkLabel(np_text, text="",
+                                            font=theme_ui.font("caption"),
+                                            anchor="w", justify="left")
+        self.now_playing_sub.pack(anchor="w")
 
         self.controls_frame = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         self.controls_frame.grid(row=0, column=1, pady=5)
@@ -675,8 +709,8 @@ class App(ctk.CTk):
         self.progress_row.grid(row=1, column=1, sticky="ew", pady=(0, 10))
         self.progress_row.grid_columnconfigure(1, weight=1)
 
-        self.time_elapsed = ctk.CTkLabel(self.progress_row, text="0:00", width=42,
-                                         font=ctk.CTkFont(size=11))
+        self.time_elapsed = ctk.CTkLabel(self.progress_row, text="0:00", width=44,
+                                         font=theme_ui.font("time"))
         self.time_elapsed.grid(row=0, column=0, padx=(0, 8))
 
         self.progress_slider = ctk.CTkSlider(self.progress_row, from_=0.0, to=1.0, command=self.on_seek, height=12)
@@ -687,8 +721,8 @@ class App(ctk.CTk):
         self.progress_slider.bind("<Button-1>", self._seek_begin)
         self.progress_slider.bind("<ButtonRelease-1>", self._seek_end)
 
-        self.time_total = ctk.CTkLabel(self.progress_row, text="0:00", width=42,
-                                       font=ctk.CTkFont(size=11))
+        self.time_total = ctk.CTkLabel(self.progress_row, text="0:00", width=44,
+                                       font=theme_ui.font("time"))
         self.time_total.grid(row=0, column=2, padx=(8, 0))
 
         self.eq_toggle_btn = ctk.CTkButton(self.bottom_bar, text="EQ", width=40, height=40, corner_radius=20, command=self.toggle_eq)
@@ -1087,7 +1121,7 @@ class App(ctk.CTk):
         self.job_rows = {}
 
         self.log_box = ctk.CTkTextbox(self.dl_frame, corner_radius=15, height=120,
-                                      font=ctk.CTkFont(family="Consolas", size=12))
+                                      font=theme_ui.font("mono"))
         self.log_box.grid(row=4, column=0, padx=36, pady=(6, 22), sticky="nsew")
         self.log_box.configure(state="disabled")
 
@@ -1291,6 +1325,8 @@ class App(ctk.CTk):
                                  button_hover_color=t["accent_hover"],
                                  progress_color=t["accent"])
 
+        if getattr(self, "now_playing_sub", None) is not None:
+            self.now_playing_sub.configure(text_color=t["text_secondary"])
         for name in ("now_playing_label", "time_elapsed", "time_total", "volume_icon"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -1634,8 +1670,9 @@ class App(ctk.CTk):
             orphans = []
         if orphans:
             size_mb = sum(os.path.getsize(p) for p in orphans) / 1e6
+            noun = "file" if len(orphans) == 1 else "files"
             self.repair_btn.configure(
-                text=f"Repair {len(orphans)} file(s) \u00b7 {size_mb:.0f} MB")
+                text=f"Repair {len(orphans)} {noun}  ({size_mb:.0f} MB)")
             self.repair_btn.pack(side="left", padx=10)
         else:
             self.repair_btn.pack_forget()
@@ -1693,7 +1730,8 @@ class App(ctk.CTk):
         self.render_library()
 
     def clear_library_filter(self):
-        self.library.clear_filter()
+        # Back steps up one level rather than always jumping to the top.
+        self.library.go_back()
         self.render_library()
 
     def open_album(self, album, artist):
@@ -1760,8 +1798,18 @@ class App(ctk.CTk):
 
     def play_file(self, file_path):
         full_name = os.path.splitext(os.path.basename(file_path))[0]
-        filename = full_name if len(full_name) <= 50 else full_name[:47] + "..."
+        try:
+            matches = [t for t in self.index.tracks() if t["path"] == file_path]
+            row = matches[0] if matches else None
+        except Exception:
+            row = None
+        display = (row or {}).get("title") or full_name
+        filename = display if len(display) <= 46 else display[:43] + "..."
         self.now_playing_label.configure(text=filename)
+        if hasattr(self, "now_playing_sub"):
+            meta = " · ".join(x for x in ((row or {}).get("artist"),
+                                          (row or {}).get("album")) if x)
+            self.now_playing_sub.configure(text=meta)
         self.time_total.configure(text="0:00")
         self.time_elapsed.configure(text="0:00")
 
@@ -1787,13 +1835,10 @@ class App(ctk.CTk):
             self.index.record_play(file_path)
         except Exception:
             pass
+        view = getattr(self, "library", None)
+        if view is not None:
+            view.mark_playing(file_path)
 
-        row = None
-        try:
-            matches = [t for t in self.index.tracks() if t["path"] == file_path]
-            row = matches[0] if matches else None
-        except Exception:
-            pass
         if hasattr(self, "np_title_lbl"):
             self.np_title_lbl.configure(
                 text=(row or {}).get("title") or full_name)

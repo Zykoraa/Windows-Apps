@@ -10,13 +10,21 @@ set passed to the constructor.
 import io
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import customtkinter as ctk
+import theme_ui
 from PIL import Image
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC
 
 CHUNK = 40  # rows rendered per event-loop turn
+ROW_H = theme_ui.ROW_H
+ART = theme_ui.ROW_ART
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
 
 
 def fmt_time(seconds):
@@ -46,6 +54,13 @@ class LibraryView:
         self._art_cache = {}
         self._signature = None
         self._token = 0
+        # Rows keyed by path so the playing track can be highlighted without
+        # re-rendering the list.
+        self._rows_by_path = {}
+        self._locked = set()
+        self.playing_path = None
+        self._art_pool = ThreadPoolExecutor(max_workers=4,
+                                            thread_name_prefix="cover")
 
     # ------------------------------------------------------------ navigation
 
@@ -70,6 +85,18 @@ class LibraryView:
         self.filter = ("artist", artist, artist)
         self.render()
 
+    def open_album_of(self, album, artist):
+        """An album reached from inside an artist, so Back returns there."""
+        self.filter = ("album", album, f"{artist} › {album}", artist)
+        self.render()
+
+    def go_back(self):
+        """Up one level: album -> its artist, artist -> the full list."""
+        if self.filter and self.filter[0] == "album" and len(self.filter) > 3:
+            self.open_artist(self.filter[3])
+        else:
+            self.clear_filter()
+
     def invalidate(self):
         """Force the next render to rebuild even if the row set looks identical."""
         self._signature = None
@@ -80,9 +107,19 @@ class LibraryView:
         query = self.get_query() or ""
 
         if self.filter:
-            kind, value, label = self.filter
+            kind, value, label = self.filter[0], self.filter[1], self.filter[2]
             self.crumb_label.configure(text=label)
-            self.crumb_bar.grid(row=0, column=0, sticky="ew", padx=24, pady=(0, 4))
+            self.crumb_bar.grid(row=1, column=0, sticky="ew", padx=24, pady=(2, 6))
+
+            if kind == "artist":
+                # An artist page is a shelf of albums, not 25 loose tracks.
+                albums = [a for a in self.index.albums(search=query or None)
+                          if a["artist"] == value]
+                if albums:
+                    self._render(albums, self._artist_album_row,
+                                 ("artist-albums", value, query), "albums")
+                    return
+
             rows = self.index.tracks(
                 search=query or None,
                 sort="Album" if kind == "album" else self.sort,
@@ -122,6 +159,8 @@ class LibraryView:
 
         self.rows = rows
         self.paths = [r["path"] for r in rows if r.get("path")]
+        self._rows_by_path = {}
+        self._locked = set()
 
         if not rows:
             ctk.CTkLabel(self.frame,
@@ -140,7 +179,28 @@ class LibraryView:
                 self.schedule(1, chunk, start + CHUNK)
 
         chunk(0)
-        self._set_status(f"{len(rows)} {noun}")
+        self._set_status(plural(len(rows), noun.rstrip("s")))
+
+    def mark_playing(self, path):
+        """Tint whichever row is playing, and clear the previous one."""
+        previous = self._rows_by_path.get(self.playing_path)
+        if previous is not None and previous.winfo_exists():
+            self._locked.discard(previous)
+            try:
+                previous.configure(fg_color="transparent")
+            except Exception:
+                pass
+        self.playing_path = path
+        row = self._rows_by_path.get(path)
+        if row is not None and row.winfo_exists():
+            self._paint_playing(row)
+
+    def _paint_playing(self, row):
+        self._locked.add(row)
+        try:
+            row.configure(fg_color=self.theme.get("surface", "transparent"))
+        except Exception:
+            pass
 
     def _set_status(self, text):
         try:
@@ -150,12 +210,31 @@ class LibraryView:
 
     # ------------------------------------------------------------------ rows
 
-    def _row(self, height=56):
+    def _row(self, height=ROW_H):
         row = ctk.CTkFrame(self.frame, fg_color="transparent",
-                           corner_radius=10, height=height)
-        row.pack(fill="x", padx=6, pady=3)
+                           corner_radius=theme_ui.RADIUS, height=height)
+        row.pack(fill="x", padx=6, pady=1)
         row.pack_propagate(False)
+        # Rows gave no feedback at all before; a hover tint makes it obvious
+        # what is about to be clicked in a long list.
+        self._hoverable(row)
         return row
+
+    def _hoverable(self, row):
+        tint = self.theme.get("surface_hover", self.theme["surface"])
+
+        def enter(_e=None):
+            if row.winfo_exists() and row not in self._locked:
+                row.configure(fg_color=tint)
+
+        def leave(_e=None):
+            if row.winfo_exists() and row not in self._locked:
+                row.configure(fg_color="transparent")
+
+        for widget in (row,):
+            widget.bind("<Enter>", enter, add="+")
+            widget.bind("<Leave>", leave, add="+")
+        row._hover_enter, row._hover_leave = enter, leave
 
     def _clickable(self, widget, handler):
         widget.bind("<Button-1>", lambda e: handler())
@@ -168,19 +247,36 @@ class LibraryView:
 
     def _track_row(self, track):
         row = self._row()
-        title = track.get("title") or os.path.basename(track["path"])
-        detail = " · ".join(
-            x for x in (track.get("artist") or "", track.get("album") or "") if x)
+        art = ctk.CTkLabel(row, text="", width=ART, height=ART,
+                           corner_radius=6)
+        art.pack(side="left", padx=(10, 12))
+        self.request_thumb(track.get("path"), ART, art)
 
-        ctk.CTkLabel(row, text=title, anchor="w",
-                     font=ctk.CTkFont(size=15, weight="bold"),
-                     text_color=self.theme["text"]).pack(side="left", padx=(16, 8))
-        ctk.CTkLabel(row, text=detail, anchor="w", font=ctk.CTkFont(size=12),
-                     text_color=self.theme["text_secondary"]).pack(side="left", padx=4)
-        ctk.CTkLabel(row, text=fmt_time(track.get("duration")), width=48, anchor="e",
-                     font=ctk.CTkFont(size=12),
-                     text_color=self.theme["text_secondary"]).pack(side="right", padx=16)
+        # Duration packs before the text block so it keeps its column when a
+        # long title would otherwise push it off the edge.
+        ctk.CTkLabel(row, text=fmt_time(track.get("duration")), width=52,
+                     anchor="e", font=theme_ui.font("time"),
+                     text_color=self.theme["text_secondary"]
+                     ).pack(side="right", padx=(8, 16))
+
+        box = ctk.CTkFrame(row, fg_color="transparent")
+        box.pack(side="left", fill="both", expand=True)
+        title = track.get("title") or os.path.splitext(
+            os.path.basename(track["path"]))[0]
+        ctk.CTkLabel(box, text=title, anchor="w", justify="left",
+                     font=theme_ui.font("heading"),
+                     text_color=self.theme["text"]).pack(anchor="w", pady=(9, 0))
+        detail = "  ·  ".join(
+            x for x in (track.get("artist") or "", track.get("album") or "") if x)
+        ctk.CTkLabel(box, text=detail, anchor="w", justify="left",
+                     font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+        row._track_path = track["path"]
+        self._rows_by_path[track["path"]] = row
         self._clickable(row, lambda p=track["path"]: self.on_play(p))
+        if self.playing_path == track["path"]:
+            self._paint_playing(row)
 
     def _album_row(self, album):
         row = self._row(64)
@@ -193,7 +289,7 @@ class LibraryView:
         ctk.CTkLabel(box, text=album["album"], anchor="w",
                      font=ctk.CTkFont(size=15, weight="bold"),
                      text_color=self.theme["text"]).pack(anchor="w")
-        meta = (f"{album['artist']} · {album['n']} tracks"
+        meta = (f"{album['artist']} · {plural(album['n'], 'track')}"
                 f" · {fmt_time(album['total'])}")
         if album.get("year"):
             meta += f" · {album['year']}"
@@ -201,6 +297,33 @@ class LibraryView:
                      text_color=self.theme["text_secondary"]).pack(anchor="w")
         self._clickable(row, lambda a=album["album"], r=album["artist"]:
                         self.open_album(a, r))
+
+    def _artist_album_row(self, album):
+        """One album on an artist's page: large cover, title, year, length."""
+        row = self._row(76)
+        art = ctk.CTkLabel(row, text="", width=60, height=60, corner_radius=6)
+        art.pack(side="left", padx=(10, 14))
+        self.request_thumb(album.get("cover_path"), 60, art)
+
+        ctk.CTkLabel(row, text=fmt_time(album.get("total")), width=56, anchor="e",
+                     font=theme_ui.font("time"),
+                     text_color=self.theme["text_secondary"]
+                     ).pack(side="right", padx=(8, 16))
+
+        box = ctk.CTkFrame(row, fg_color="transparent")
+        box.pack(side="left", fill="both", expand=True)
+        ctk.CTkLabel(box, text=album["album"], anchor="w", justify="left",
+                     font=theme_ui.font("heading"),
+                     text_color=self.theme["text"]).pack(anchor="w", pady=(16, 0))
+        bits = [plural(album["n"], "track")]
+        if album.get("year"):
+            bits.insert(0, str(album["year"]))
+        ctk.CTkLabel(box, text="  ·  ".join(bits), anchor="w",
+                     font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+        self._clickable(row, lambda a=album["album"], r=album["artist"]:
+                        self.open_album_of(a, r))
 
     def _artist_row(self, artist):
         row = self._row(64)
@@ -213,8 +336,10 @@ class LibraryView:
         ctk.CTkLabel(box, text=artist["artist"], anchor="w",
                      font=ctk.CTkFont(size=15, weight="bold"),
                      text_color=self.theme["text"]).pack(anchor="w")
-        ctk.CTkLabel(box, text=f"{artist['n']} tracks · {artist['albums']} album(s)",
-                     anchor="w", font=ctk.CTkFont(size=12),
+        ctk.CTkLabel(box,
+                     text=f"{plural(artist['n'], 'track')} · "
+                          f"{plural(artist['albums'], 'album')}",
+                     anchor="w", font=theme_ui.font("caption"),
                      text_color=self.theme["text_secondary"]).pack(anchor="w")
         self._clickable(row, lambda a=artist["artist"]: self.open_artist(a))
 
@@ -243,7 +368,10 @@ class LibraryView:
                 return
             self.schedule(0, self._set_thumb, key, img, size, label)
 
-        threading.Thread(target=work, daemon=True).start()
+        # A hundred-row list used to spawn a hundred threads at once, which
+        # is why covers trickled in. Four workers keep the disk busy without
+        # the churn.
+        self._art_pool.submit(work)
 
     def _set_thumb(self, key, img, size, label):
         if len(self._art_cache) > 300:
