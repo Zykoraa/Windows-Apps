@@ -69,9 +69,15 @@ pip install -r requirements.txt
 python gui.py
 ```
 
-`ffmpeg.exe` and `ffprobe.exe` must be in `bin/`. Grab a build from
-<https://www.gyan.dev/ffmpeg/builds/> — the `essentials` build is plenty and
-is far smaller than the full one.
+`ffmpeg.exe` and `ffprobe.exe` must be in `bin/`. They are not committed to
+the repository. Grab the `essentials` build from
+<https://www.gyan.dev/ffmpeg/builds/> — it has everything this app needs
+(MP3 encoding, WebM/Opus and M4A/AAC decoding) at less than half the size of
+the full build.
+
+Releases are built automatically: pushing a tag like `v1.0.2` runs
+[the workflow](../.github/workflows/release-evesgarden.yml), which fetches
+ffmpeg, builds the `.exe`, zips it and attaches it to a new GitHub release.
 
 ## Building the .exe
 

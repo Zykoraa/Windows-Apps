@@ -1,0 +1,132 @@
+name: Release Eve's Garden
+
+# Runs when a tag like v1.0.1 is pushed. Everything below happens on a
+# GitHub-hosted Windows machine, not on your PC: it installs Python, fetches
+# ffmpeg, builds the .exe, zips it and attaches the zip to a new release.
+on:
+  push:
+    tags:
+      - "v*"
+  # Also runnable by hand from the Actions tab, which is handy for testing
+  # the build without publishing anything.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (leave blank to build without releasing)"
+        required: false
+
+permissions:
+  contents: write        # needed to create the release and upload the zip
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: EvesGarden
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Fetch ffmpeg
+        working-directory: EvesGarden
+        shell: pwsh
+        run: |
+          # The essentials build carries everything this app needs (mp3
+          # encoding, webm/opus and m4a/aac decoding) at less than half the
+          # size of the full build. ffmpeg binaries are not committed to the
+          # repository, so they are fetched at build time and checked against
+          # the publisher's own SHA256.
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+
+          $want = (Invoke-WebRequest -Uri "$url.sha256" -UseBasicParsing).Content.Trim().ToLower()
+          $got  = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($want -ne $got) {
+            Write-Error "ffmpeg checksum mismatch: expected $want, got $got"
+            exit 1
+          }
+          Write-Host "ffmpeg checksum verified: $got"
+
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg" -Force
+          $bin = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe |
+                  Select-Object -First 1).DirectoryName
+          New-Item -ItemType Directory -Path bin -Force | Out-Null
+          Copy-Item "$bin\ffmpeg.exe","$bin\ffprobe.exe" -Destination bin -Force
+          Get-ChildItem bin | ForEach-Object {
+            "{0}  {1:N0} MB" -f $_.Name, ($_.Length / 1MB)
+          }
+
+      - name: Build the executable
+        working-directory: EvesGarden
+        run: python -m PyInstaller gui.spec --noconfirm
+
+      - name: Check the build produced something runnable
+        working-directory: EvesGarden
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist\gui\gui.exe)) { throw "gui.exe was not produced" }
+          if (-not (Test-Path dist\gui\_internal\bin\ffmpeg.exe)) { throw "ffmpeg was not bundled" }
+          # A stray credentials file here would be published to the world.
+          if (Test-Path dist\gui\EvesGarden.env) { throw "credentials found in the build output" }
+          "gui.exe: {0:N1} MB" -f ((Get-Item dist\gui\gui.exe).Length / 1MB)
+
+      - name: Package
+        working-directory: EvesGarden
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notlike "v*") { $tag = "dev" }
+          $name = "EvesGarden-$tag-win64.zip"
+          Compress-Archive -Path dist\gui\* -DestinationPath $name -CompressionLevel Optimal
+          "ZIP_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "{0}: {1:N1} MB" -f $name, ((Get-Item $name).Length / 1MB)
+
+      - name: Upload as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EvesGarden-windows
+          path: EvesGarden/${{ env.ZIP_NAME }}
+          retention-days: 14
+
+      - name: Publish the release
+        # Only when a real tag was pushed, so manual runs just build.
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: EvesGarden/${{ env.ZIP_NAME }}
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            1. Download the `.zip` below
+            2. Unzip it anywhere
+            3. Run `gui.exe`
+
+            Nothing else to install. Keep `gui.exe` and `_internal/` together.
+
+            Windows will show a blue **"Windows protected your PC"** box the
+            first time, because the executable is not code-signed. Click
+            **More info** then **Run anyway**.
+
+            ## First run
+
+            The app asks for free Spotify credentials so it can look up track
+            and album details. Create an app at
+            https://developer.spotify.com/dashboard (any name, no card
+            needed) and paste the Client ID and Client Secret into the setup
+            screen. You can skip this and still play music you already have.
+
+            Discord Rich Presence needs no setup.
