@@ -54,6 +54,8 @@ first run and writes them itself:
    card required
 2. In that app's **Settings**, add this exact Redirect URI:
    `http://127.0.0.1:8888/callback`
+   (already have a redirect you would rather reuse? Put it in
+   `SPOTIPY_REDIRECT_URI` instead — any loopback address and path works)
 3. Copy the Client ID and Client Secret into the app's "Connect Spotify"
    screen
 

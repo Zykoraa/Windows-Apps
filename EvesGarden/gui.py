@@ -1834,7 +1834,7 @@ class App(ctk.CTk):
         self.signin_btn.configure(state="disabled", text="Check your browser...")
         self.log("Opening your browser to sign in to Spotify...")
         self.log(f"If nothing opens, the redirect URI "
-                 f"{spotify_auth.REDIRECT_URI} must be listed in your Spotify "
+                 f"{spotify_auth.redirect_uri()} must be listed in your Spotify "
                  f"app's settings.")
 
         def work():
@@ -1903,7 +1903,7 @@ class App(ctk.CTk):
                   "1.  Open the dashboard below and sign in.\n"
                   "2.  Create app  ->  give it any name, tick the terms.\n"
                   "3.  In the app's Settings, add this Redirect URI:\n"
-                  "        " + spotify_auth.REDIRECT_URI + "\n"
+                  "        " + spotify_auth.redirect_uri() + "\n"
                   "     (needed later to download playlists)\n"
                   "4.  Copy the Client ID and Client Secret into the boxes.")
         ).pack(padx=44, pady=(0, 14), anchor="w")
@@ -2321,7 +2321,12 @@ class App(ctk.CTk):
                 img_lbl = ctk.CTkLabel(row, text="", image=album['ctk_image'])
                 img_lbl.pack(side="left", padx=(0, 10))
 
-            text_lbl = ctk.CTkLabel(row, text=album['name'], text_color=self.theme["text"], font=ctk.CTkFont(size=14, weight="bold"), justify="left")
+            # Without a wraplength these ran off the edge of the dialog, so a
+            # title like "Where the Light Is: John Mayer Live In Los Angeles"
+            # was cut off mid-word.
+            text_lbl = ctk.CTkLabel(row, text=album['name'], text_color=self.theme["text"],
+                                    font=ctk.CTkFont(size=14, weight="bold"),
+                                    justify="left", anchor="w", wraplength=300)
             text_lbl.pack(side="left", fill="x", expand=True)
 
             tracks_frame = ctk.CTkFrame(album_container, fg_color="transparent")

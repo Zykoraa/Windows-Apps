@@ -8,16 +8,29 @@ public ones included. Reading a playlist therefore needs a real sign-in.
 This runs the Authorization Code flow: the browser opens, you approve once,
 and the refresh token is cached so it never asks again.
 
-The Spotify app must list this exact redirect URI (Spotify requires the
-loopback IP, not the word "localhost"):
-
-    http://127.0.0.1:8888/callback
+The Spotify app must list whichever redirect URI is in use. It defaults to
+http://127.0.0.1:8888/callback, and SPOTIPY_REDIRECT_URI overrides that so an
+existing redirect can be reused instead. Spotify requires the loopback IP
+here, not the word "localhost".
 """
 
 import os
 import threading
 
-REDIRECT_URI = "http://127.0.0.1:8888/callback"
+# Spotify has to send the browser back somewhere after you approve, and the
+# address must match one listed in your app's settings exactly. Set
+# SPOTIPY_REDIRECT_URI in your .env to reuse a redirect you already have --
+# any loopback address and path works, the port just has to be free.
+DEFAULT_REDIRECT_URI = "http://127.0.0.1:8888/callback"
+
+
+def redirect_uri():
+    return (os.getenv("SPOTIPY_REDIRECT_URI", "").strip()
+            or DEFAULT_REDIRECT_URI)
+
+
+# Kept for callers that only want something to display.
+REDIRECT_URI = DEFAULT_REDIRECT_URI
 
 # Only what is needed to list playlists and read their tracks. No write
 # scopes, nothing touching playback or the user's profile.
@@ -35,7 +48,7 @@ def _auth_manager(client_id, client_secret, config_dir, open_browser):
     return SpotifyOAuth(
         client_id=client_id,
         client_secret=client_secret,
-        redirect_uri=REDIRECT_URI,
+        redirect_uri=redirect_uri(),
         scope=SCOPES,
         cache_path=cache_path(config_dir),
         open_browser=open_browser,
@@ -87,7 +100,7 @@ def sign_in(client_id, client_secret, config_dir):
             import spotipy
             auth = _auth_manager(client_id, client_secret, config_dir, True)
             # get_access_token drives the whole dance: it opens the browser,
-            # runs a one-shot local server on port 8888 to catch the redirect,
+            # runs a one-shot local server on the redirect port to catch it,
             # and exchanges the code for a token.
             auth.get_access_token(check_cache=True)
             client = spotipy.Spotify(auth_manager=auth, requests_timeout=15)
@@ -114,10 +127,11 @@ def _explain(error):
     if "INVALID_CLIENT" in text.upper() or "redirect" in text.lower():
         return ("Spotify rejected the redirect address. Open your app at\n"
                 "https://developer.spotify.com/dashboard -> Settings, and add\n"
-                f"this exact Redirect URI:\n    {REDIRECT_URI}")
+                f"this exact Redirect URI:\n    {redirect_uri()}")
     if "address already in use" in text.lower() or "10048" in text:
-        return ("Port 8888 is already in use by another program. Close it and\n"
-                "try again.")
+        port = redirect_uri().rsplit(":", 1)[-1].split("/")[0]
+        return (f"Port {port} is already in use by another program. Close it,\n"
+                " or point SPOTIPY_REDIRECT_URI at a different port.")
     if "access_denied" in text.lower():
         return "Sign-in was cancelled."
     return f"Sign-in failed: {type(error).__name__}: {text[:160]}"
