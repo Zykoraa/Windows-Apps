@@ -1,0 +1,98 @@
+# Eve's Garden
+
+A Windows music player and downloader. It reads track, album and artwork
+details from Spotify, pulls the audio from YouTube, tags the result properly,
+and plays it back with a 10-band EQ, synced lyrics, 32 visualisers and Discord
+Rich Presence.
+
+![icon](assets/icon.png)
+
+## What it does
+
+**Library** — a SQLite index over the ID3 tags of your files, so you can
+browse by song, album or artist, sort by year or play count, and search across
+title, artist and album rather than just filenames.
+
+**Downloading** — paste a Spotify track, album or playlist link, or just
+search. Candidate YouTube sources are scored against the Spotify track's
+duration and penalised for `live`, `karaoke`, `remix`, `full album` and the
+like, so you get the right version rather than the first hit. Downloads run
+three at a time with per-track state, cancel, and retry-failed.
+
+**Playback** — a serial cascade of RBJ peaking biquads for the EQ (unity at
+0 dB, so "flat" really is flat), soft-clipping to round off peaks, volume,
+seek, shuffle, repeat, and resume where you left off.
+
+**Presentation** — 18 themes, 32 visualiser modes with 13 colour palettes,
+synced lyrics, and album-art-derived accent colours with a contrast check.
+
+## Setup
+
+You need your own free Spotify API credentials. The app asks for them on
+first run and writes them itself:
+
+1. Create an app at <https://developer.spotify.com/dashboard> — any name, no
+   card required
+2. Copy the Client ID and Client Secret into the app's "Connect Spotify"
+   screen
+
+They are saved to `EvesGarden.env` next to the executable, so a copied folder
+stays working. If the app lives somewhere read-only it falls back to
+`%LOCALAPPDATA%\EvesGarden\`. See `.env.example` to write the file by hand
+instead.
+
+Discord Rich Presence needs no setup.
+
+## Running from source
+
+```bash
+pip install -r requirements.txt
+python gui.py
+```
+
+`ffmpeg.exe` and `ffprobe.exe` must be in `bin/`. Grab a build from
+<https://www.gyan.dev/ffmpeg/builds/> — the `essentials` build is plenty and
+is far smaller than the full one.
+
+## Building the .exe
+
+```bash
+pip install pyinstaller
+python -m PyInstaller gui.spec --noconfirm
+```
+
+Output lands in `dist/gui/`. Keep `gui.exe` and `_internal/` together.
+
+To change the app icon, edit `DESIGN` in `make_icon.py` (`Monstera`, `Leaf`,
+`Bloom` or `Sprout`), run it, and rebuild — it regenerates `assets/icon.ico`
+and the base64 copy embedded in `app_icon.py`.
+
+## Layout
+
+| File | Purpose |
+| --- | --- |
+| `gui.py` | The app window, playback controls and overlays |
+| `library_index.py` | SQLite index over the ID3 tags |
+| `library_view.py` | Songs / Albums / Artists browser |
+| `downloader.py` | Spotify metadata, YouTube sourcing, tagging |
+| `download_manager.py` | Download queue with per-track state |
+| `player_engine.py` | Decoding, EQ, playback |
+| `visualizers.py` | 32 visualiser modes and 13 palettes |
+| `discord_presence.py` | Rich Presence |
+| `credentials.py` | Where credentials are read from and written to |
+| `settings.py` | Persisted UI state |
+| `media_keys.py` | Media keys via `RegisterHotKey` |
+| `make_icon.py` | Generates the app icon |
+
+## Notes
+
+Media keys are registered with `RegisterHotKey`, which asks Windows for those
+specific keys only — not a system-wide keyboard hook.
+
+Credentials are never compiled into the binary. A client secret inside an
+executable can be read straight back out of the PyInstaller archive, so each
+person supplies their own. If you share a build you made, delete
+`EvesGarden.env` from the folder first.
+
+For personal use. You are responsible for respecting the terms of the
+services it talks to.
