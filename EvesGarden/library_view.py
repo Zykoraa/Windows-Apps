@@ -14,6 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import customtkinter as ctk
 import theme_ui
+
+HEART_FULL = "♥"
+HEART_EMPTY = "♡"
 from PIL import Image
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC
@@ -61,6 +64,8 @@ class LibraryView:
         self.playing_path = None
         # path -> BooleanVar, for the duplicate review checkboxes
         self.dup_marks = {}
+        self._hearts = {}
+        self.on_like = None          # set by the app; toggles and re-paints
         self._art_pool = ThreadPoolExecutor(max_workers=4,
                                             thread_name_prefix="cover")
 
@@ -131,6 +136,16 @@ class LibraryView:
             return
 
         self.crumb_bar.grid_forget()
+        if self.view == "Liked":
+            rows = self.index.tracks(search=query or None, liked_only=True,
+                                     sort="Recently liked")
+            self._render(rows, self._track_row, ("liked", query), "liked song")
+            return
+        if self.view == "Recent":
+            rows = self.index.tracks(search=query or None, played_only=True,
+                                     sort="Recently played")
+            self._render(rows, self._track_row, ("recent", query), "track")
+            return
         if self.view == "Duplicates":
             groups = self.index.duplicates()
             self.dup_marks = {}
@@ -169,13 +184,15 @@ class LibraryView:
         self.rows = rows
         self.paths = [r["path"] for r in rows if r.get("path")]
         self._rows_by_path = {}
+        self._hearts = {}
         self._locked = set()
 
         if not rows:
             ctk.CTkLabel(self.frame,
-                         text=("No duplicates found — your library is clean."
-                               if self.view == "Duplicates" else
-                               "Nothing here yet. Use Add music to get started."),
+                         text=({"Duplicates": "No duplicates found — your library is clean.",
+                                "Liked": "No liked songs yet. Tap the heart on any track.",
+                                "Recent": "Nothing played yet."}.get(self.view)
+                               or "Nothing here yet. Use Add music to get started."),
                          text_color=self.theme["text_secondary"],
                          font=ctk.CTkFont(size=15)).pack(pady=40)
             self._set_status(f"{self.index.count()} tracks indexed")
@@ -191,6 +208,28 @@ class LibraryView:
 
         chunk(0)
         self._set_status(plural(len(rows), noun.rstrip("s")))
+
+    def _toggle_like(self, path, label):
+        if not self.on_like:
+            return
+        liked = self.on_like(path)
+        try:
+            label.configure(text=HEART_FULL if liked else HEART_EMPTY,
+                            text_color=(self.theme["accent"] if liked
+                                        else self.theme["text_secondary"]))
+        except Exception:
+            pass
+        if self.view == "Liked" and not liked:
+            self.invalidate()
+            self.render()
+
+    def set_heart(self, path, liked):
+        """Repaint one row's heart, for when it is liked from elsewhere."""
+        label = self._hearts.get(path)
+        if label is not None and label.winfo_exists():
+            label.configure(text=HEART_FULL if liked else HEART_EMPTY,
+                            text_color=(self.theme["accent"] if liked
+                                        else self.theme["text_secondary"]))
 
     def mark_playing(self, path):
         """Tint whichever row is playing, and clear the previous one."""
@@ -248,6 +287,9 @@ class LibraryView:
         row._hover_enter, row._hover_leave = enter, leave
 
     def _clickable(self, widget, handler):
+        # The heart owns its own click; the row must not also start playback.
+        if getattr(widget, "_no_row_click", False):
+            return
         widget.bind("<Button-1>", lambda e: handler())
         try:
             widget.configure(cursor="hand2")
@@ -269,6 +311,18 @@ class LibraryView:
                      anchor="e", font=theme_ui.font("time"),
                      text_color=self.theme["text_secondary"]
                      ).pack(side="right", padx=(8, 16))
+
+        liked = bool(track.get("liked"))
+        heart = ctk.CTkLabel(row, text=HEART_FULL if liked else HEART_EMPTY,
+                             width=26, cursor="hand2",
+                             font=theme_ui.font("body", size=16),
+                             text_color=(self.theme["accent"] if liked
+                                         else self.theme["text_secondary"]))
+        heart._no_row_click = True
+        heart.pack(side="right", padx=(2, 4))
+        heart.bind("<Button-1>", lambda e, pth=track["path"], lbl=heart:
+                   self._toggle_like(pth, lbl))
+        self._hearts[track["path"]] = heart
 
         box = ctk.CTkFrame(row, fg_color="transparent")
         box.pack(side="left", fill="both", expand=True)

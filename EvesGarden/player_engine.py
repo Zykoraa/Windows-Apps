@@ -8,6 +8,8 @@ import pyaudio
 from scipy.signal import lfilter, lfilter_zi
 from pydub import AudioSegment
 
+from stream_source import StreamSource
+
 # Centre frequencies of the ten EQ bands, matching the slider labels.
 EQ_FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 EQ_Q = 1.41  # roughly one octave per band
@@ -81,6 +83,10 @@ class PlayerEngine:
         # displaying it.
         self.visualizer_enabled = False
         self.smoothed_bands = np.zeros(NUM_VIS_BANDS)
+
+        # Set while playing a remote URL instead of a decoded local file.
+        self.stream = None
+        self.stream_title = None
 
         self.thread = None
         self._stop_flag = threading.Event()
@@ -219,6 +225,41 @@ class PlayerEngine:
             self._rebuild_filters()
         return True
 
+    def load_stream(self, url, duration=0.0, title=None, ffmpeg=None):
+        """Play a remote URL without downloading it.
+
+        The decoded-file path keeps working untouched; the play loop simply
+        pulls from whichever source is set.
+        """
+        self.stop()
+        self.last_error = None
+        self.smoothed_bands = np.zeros(NUM_VIS_BANDS)
+
+        rate, chans = self._pick_output_format()
+        self.sample_rate, self.channels = rate, chans
+        self.audio_data = None
+        self.stream_title = title
+
+        if ffmpeg is None:
+            base = (sys._MEIPASS if getattr(sys, "frozen", False)
+                    else os.path.dirname(os.path.abspath(__file__)))
+            ffmpeg = os.path.join(base, "bin", "ffmpeg.exe")
+
+        self.stream = StreamSource(
+            url, ffmpeg, sample_rate=rate, channels=chans, duration=duration,
+            on_error=lambda msg: setattr(self, "last_error", msg),
+        )
+        self._rebuild_filters()
+        if not self.stream.start():
+            self.last_error = self.stream.error or "Could not open the stream"
+            self.stream = None
+            return False
+        return True
+
+    @property
+    def is_streaming(self):
+        return self.stream is not None
+
     # ------------------------------------------------------------ visualiser
 
     def compute_visualizer(self, chunk):
@@ -259,7 +300,8 @@ class PlayerEngine:
     # ------------------------------------------------------------- playback
 
     def play(self):
-        if self.audio_data is None or len(self.audio_data) == 0:
+        if self.stream is None and (self.audio_data is None
+                                    or len(self.audio_data) == 0):
             return
         if self.playing:
             self.paused = False
@@ -291,6 +333,9 @@ class PlayerEngine:
         self.thread = None
         self.playing = False
         self.current_frame = 0
+        stream, self.stream = self.stream, None
+        if stream is not None:
+            stream.stop()
 
     def _play_loop(self):
         stream = None
@@ -304,20 +349,28 @@ class PlayerEngine:
                 frames_per_buffer=self.chunk_size,
             )
 
-            total = len(self.audio_data)
+            total = 0 if self.stream is not None else len(self.audio_data)
             while not self._stop_flag.is_set():
                 if self.paused:
                     time.sleep(0.02)
                     continue
 
-                start = self.current_frame
-                if start >= total:
-                    finished = True
-                    break
-
-                end = min(start + self.chunk_size, total)
-                chunk = self.audio_data[start:end].astype(np.float32) / 32768.0
-                self.current_frame = end
+                if self.stream is not None:
+                    block = self.stream.read(self.chunk_size)
+                    if block is None:
+                        finished = True
+                        break
+                    if block.shape[0] == 0:
+                        continue          # waiting on the network
+                    chunk = block.astype(np.float32) / 32768.0
+                else:
+                    start = self.current_frame
+                    if start >= total:
+                        finished = True
+                        break
+                    end = min(start + self.chunk_size, total)
+                    chunk = self.audio_data[start:end].astype(np.float32) / 32768.0
+                    self.current_frame = end
 
                 chunk = self.apply_eq(chunk)
                 self.compute_visualizer(chunk)
@@ -349,22 +402,35 @@ class PlayerEngine:
 
     def get_duration(self):
         """Track length in seconds."""
+        if self.stream is not None:
+            return float(self.stream.duration or 0.0)
         if self.audio_data is None or self.sample_rate <= 0:
             return 0.0
         return len(self.audio_data) / float(self.sample_rate)
 
     def get_position(self):
         """Current playhead in seconds."""
+        if self.stream is not None:
+            return self.stream.position()
         if self.audio_data is None or self.sample_rate <= 0:
             return 0.0
         return self.current_frame / float(self.sample_rate)
 
     def get_progress(self):
+        if self.stream is not None:
+            total = self.get_duration()
+            return min(1.0, self.stream.position() / total) if total else 0.0
         if self.audio_data is None or len(self.audio_data) == 0:
             return 0.0
         return min(1.0, self.current_frame / len(self.audio_data))
 
     def set_progress(self, percent):
+        if self.stream is not None:
+            total = self.get_duration()
+            if total:
+                self.stream.seek(float(np.clip(percent, 0.0, 1.0)) * total)
+                self.reset_filters()
+            return
         if self.audio_data is None or len(self.audio_data) == 0:
             return
         percent = float(np.clip(percent, 0.0, 1.0))

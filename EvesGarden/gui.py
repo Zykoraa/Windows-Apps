@@ -75,6 +75,7 @@ import tkinter as tk
 from library_index import LibraryIndex, SORTS
 from library_view import LibraryView
 import recycle
+from discover import Discover
 from settings import Settings
 from download_manager import (
     DownloadManager, QUEUED, RUNNING, DONE, SKIPPED, FAILED, CANCELLED,
@@ -89,7 +90,7 @@ from downloader import (
     setup_spotify, search_spotify_track, search_spotify_artist,
     get_artist_albums, get_spotify_album_tracks, get_spotify_playlist_tracks,
     get_spotify_album_tracks_info, process_track, download_many, get_config_dir,
-    is_liked_songs,
+    is_liked_songs, _base_ydl_opts, _score_candidate,
     get_related_tracks, repair_library, find_orphaned_downloads,
     SpotifyAuthError,
 )
@@ -212,6 +213,11 @@ class App(ctk.CTk):
         # A signed-in client, created lazily: only playlists need one.
         self.user_sp = None
         self._refresh_user_client()
+
+        self.discover = Discover(self.sp, _base_ydl_opts, _score_candidate)
+        self.discover_results = []
+        self._discover_timer = None
+        self._streaming_track = None
 
         self.dl_visible = False
         self.dl_overlay = None
@@ -362,6 +368,7 @@ class App(ctk.CTk):
             ("<v>", self.toggle_visualizer_visibility),
             ("<s>", self.toggle_shuffle), ("<r>", self.toggle_repeat),
             ("<n>", self.toggle_now_playing_overlay),
+            ("<l>", self.like_now_playing),
         ):
             self.bind(seq, guard(fn))
 
@@ -607,7 +614,8 @@ class App(ctk.CTk):
         # one folder, discarding the album and artist tags every download
         # writes.
         self.view_tabs = ctk.CTkSegmentedButton(
-            self.library_header, values=["Songs", "Albums", "Artists", "Duplicates"],
+            self.library_header, values=["Songs", "Liked", "Recent", "Albums", "Artists",
+                    "Duplicates"],
             command=self.set_library_view, corner_radius=theme_ui.RADIUS_PILL,
             height=36, font=theme_ui.font("body_med"))
         self.view_tabs.set(self.library_view)
@@ -678,6 +686,12 @@ class App(ctk.CTk):
 
         self.now_playing_frame = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         self.now_playing_frame.grid(row=0, column=0, rowspan=2, sticky="w", padx=20)
+
+        self.np_like_btn = ctk.CTkLabel(self.now_playing_frame, text="♡",
+                                        width=30, cursor="hand2",
+                                        font=theme_ui.font("body", size=18))
+        self.np_like_btn.pack(side="right", padx=(10, 6))
+        self.np_like_btn.bind("<Button-1>", lambda e: self.like_now_playing())
 
         self.album_art_label = ctk.CTkLabel(self.now_playing_frame, text="", width=64, height=64)
         self.album_art_label.pack(side="left", padx=(0, 10))
@@ -758,6 +772,7 @@ class App(ctk.CTk):
         )
         self.library.view = self.library_view
         self.library.sort = self.library_sort
+        self.library.on_like = self.toggle_like
 
         self._build_resize_grips()
 
@@ -1061,12 +1076,13 @@ class App(ctk.CTk):
         self.dl_frame = ctk.CTkFrame(parent, fg_color="transparent")
         self.dl_frame.pack(fill="both", expand=True)
         self.dl_frame.grid_columnconfigure(0, weight=1)
-        self.dl_frame.grid_rowconfigure(3, weight=3)
-        self.dl_frame.grid_rowconfigure(4, weight=1)
+        # Results deserve the room; the log is a footnote.
+        self.dl_frame.grid_rowconfigure(3, weight=1)
+        self.dl_frame.grid_rowconfigure(4, weight=0)
 
         header = ctk.CTkFrame(self.dl_frame, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=36, pady=(22, 6))
-        self.dl_heading = ctk.CTkLabel(header, text="Add music",
+        self.dl_heading = ctk.CTkLabel(header, text="Discover",
                                        font=ctk.CTkFont(size=22, weight="bold"))
         self.dl_heading.pack(side="left")
         self.dl_close_btn = ctk.CTkButton(header, text="Back to library", width=150,
@@ -1074,7 +1090,8 @@ class App(ctk.CTk):
                                           command=self.close_downloader)
         self.dl_close_btn.pack(side="right")
         self.dl_hint = ctk.CTkLabel(
-            header, text="Search, or paste a Spotify track / album / playlist link",
+            header,
+            text="Search to preview anything, or paste a Spotify link to download",
             font=ctk.CTkFont(size=12))
         self.dl_hint.pack(side="right", padx=16)
 
@@ -1082,7 +1099,7 @@ class App(ctk.CTk):
             self.dl_frame, placeholder_text="Search artist or song, or paste a Spotify URL...",
             height=52, corner_radius=26, font=ctk.CTkFont(size=16))
         self.url_entry.grid(row=1, column=0, padx=36, pady=(6, 10), sticky="ew")
-        self.url_entry.bind("<KeyRelease>", self.on_key_release)
+        self.url_entry.bind("<KeyRelease>", self._on_discover_key)
         self.url_entry.bind("<FocusIn>", lambda e: self.on_key_release(None))
         self.url_entry.bind("<Return>", lambda e: self.start_download())
 
@@ -1119,14 +1136,20 @@ class App(ctk.CTk):
         self.dl_progress_lbl.pack(side="right")
         self._sync_signin_button()
 
+        # Search results: preview straight from here, download only what you
+        # decide to keep.
+        self.results_frame = ctk.CTkScrollableFrame(
+            self.dl_frame, corner_radius=theme_ui.RADIUS, label_text="Results")
+        self.results_frame.grid(row=3, column=0, padx=36, pady=(6, 6),
+                                sticky="nsew")
+
         # Per-track state, so a failure no longer scrolls out of the log and
         # disappears with no record of what broke.
         self.jobs_frame = ctk.CTkScrollableFrame(self.dl_frame, corner_radius=15,
                                                  label_text="Queue")
-        self.jobs_frame.grid(row=3, column=0, padx=36, pady=(6, 6), sticky="nsew")
         self.job_rows = {}
 
-        self.log_box = ctk.CTkTextbox(self.dl_frame, corner_radius=15, height=120,
+        self.log_box = ctk.CTkTextbox(self.dl_frame, corner_radius=15, height=84,
                                       font=theme_ui.font("mono"))
         self.log_box.grid(row=4, column=0, padx=36, pady=(6, 22), sticky="nsew")
         self.log_box.configure(state="disabled")
@@ -1594,6 +1617,7 @@ class App(ctk.CTk):
         self._save_state()
         for stop in (
             lambda: self._tray_icon and self._tray_icon.stop(),
+            lambda: self.discover.close(),
             lambda: self.discord.stop(),
             lambda: self.media_keys.stop(),
             lambda: self.downloads.cancel(),
@@ -1762,6 +1786,35 @@ class App(ctk.CTk):
 
     # -- thin delegates onto LibraryView ---------------------------------
 
+    def toggle_like(self, path):
+        """Flip a track's heart and keep the bottom bar in step."""
+        liked = self.index.toggle_liked(path)
+        if getattr(self, "_now_playing_row", None) and                 self._now_playing_row.get("path") == path:
+            self._sync_now_playing_heart(liked)
+        return liked
+
+    def _sync_now_playing_heart(self, liked=None):
+        button = getattr(self, "np_like_btn", None)
+        if button is None:
+            return
+        row = getattr(self, "_now_playing_row", None)
+        path = (row or {}).get("path")
+        if liked is None:
+            liked = bool(path and self.index.is_liked(path))
+        button.configure(text="♥" if liked else "♡",
+                         text_color=(self.theme["accent"] if liked
+                                     else self.theme["text_secondary"]))
+
+    def like_now_playing(self):
+        row = getattr(self, "_now_playing_row", None)
+        path = (row or {}).get("path")
+        if not path:
+            return
+        liked = self.toggle_like(path)
+        view = getattr(self, "library", None)
+        if view is not None:
+            view.set_heart(path, liked)
+
     def render_library(self):
         self.library.render()
         self.current_rows = self.library.rows
@@ -1889,6 +1942,7 @@ class App(ctk.CTk):
         view = getattr(self, "library", None)
         if view is not None:
             view.mark_playing(file_path)
+        self._sync_now_playing_heart()
 
         if hasattr(self, "np_title_lbl"):
             self.np_title_lbl.configure(
@@ -2109,9 +2163,9 @@ class App(ctk.CTk):
             return
         if playing is None:
             playing = self.player.playing and not self.player.paused
-        stem = os.path.splitext(os.path.basename(row.get("path", "")))[0]
+        stem = os.path.splitext(os.path.basename(row.get("path") or ""))[0]
         self.discord.update(
-            title=row.get("title") or stem,
+            title=row.get("title") or stem or "Preview",
             artist=row.get("artist") or "",
             album=row.get("album") or "",
             cover_url=row.get("cover_url"),
@@ -2121,6 +2175,8 @@ class App(ctk.CTk):
         )
 
     def _ensure_cover_url(self, file_path, row):
+        if not file_path:
+            return
         """Resolve a remote cover once per track, for Discord's large image.
 
         The embedded APIC art cannot be handed to Discord -- it needs a URL --
@@ -2258,6 +2314,168 @@ class App(ctk.CTk):
         self.log_box.insert("end", message + "\n")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+
+    def _on_discover_key(self, event=None):
+        """Debounce typing, then search Spotify."""
+        if self._discover_timer:
+            try:
+                self.after_cancel(self._discover_timer)
+            except Exception:
+                pass
+        self._discover_timer = self._safe_after(350, self.run_discover_search)
+
+    def run_discover_search(self):
+        query = self.url_entry.get().strip()
+        if not query or "http" in query or not self.sp:
+            return
+        self._render_discover_message("Searching...")
+
+        def work():
+            try:
+                results = self.discover.search(query)
+            except Exception as e:
+                self._safe_after(0, self._render_discover_message,
+                                 f"Search failed: {e}")
+                return
+            self._safe_after(0, self._render_discover, results)
+            # Warm the top few so pressing play does not wait on YouTube.
+            for track in results[:4]:
+                self.discover.prefetch(track)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_discover_message(self, text):
+        if not self._dl_alive():
+            return
+        for widget in self.results_frame.winfo_children():
+            widget.destroy()
+        ctk.CTkLabel(self.results_frame, text=text,
+                     font=theme_ui.font("body"),
+                     text_color=self.theme["text_secondary"]).pack(pady=24)
+
+    def _render_discover(self, results):
+        if not self._dl_alive():
+            return
+        self.discover_results = results
+        for widget in self.results_frame.winfo_children():
+            widget.destroy()
+        if not results:
+            self._render_discover_message("Nothing found.")
+            return
+        for track in results:
+            self._discover_row(track)
+
+    def _discover_row(self, track):
+        row = ctk.CTkFrame(self.results_frame, fg_color="transparent",
+                           corner_radius=theme_ui.RADIUS, height=58)
+        row.pack(fill="x", padx=4, pady=2)
+        row.pack_propagate(False)
+
+        art = ctk.CTkLabel(row, text="", width=42, height=42, corner_radius=5)
+        art.pack(side="left", padx=(8, 12))
+        self.discover.fetch_cover(
+            track["cover_url"], 42,
+            lambda img, lbl=art: self._safe_after(0, self._set_discover_art, lbl, img))
+
+        download = ctk.CTkButton(row, text="Download", width=94, height=30,
+                                 corner_radius=15, font=theme_ui.font("small"),
+                                 command=lambda t=track: self.download_discovered(t))
+        download.pack(side="right", padx=(6, 10))
+
+        preview = ctk.CTkButton(row, text="\u25b6  Preview", width=100, height=30,
+                                corner_radius=15, font=theme_ui.font("small"),
+                                fg_color="transparent", border_width=1,
+                                command=lambda t=track, b=None: self.preview_track(t))
+        preview.pack(side="right", padx=4)
+        track["_preview_btn"] = preview
+
+        ctk.CTkLabel(row, text=fmt_time(track["duration"]), width=48, anchor="e",
+                     font=theme_ui.font("time"),
+                     text_color=self.theme["text_secondary"]).pack(side="right")
+
+        box = ctk.CTkFrame(row, fg_color="transparent")
+        box.pack(side="left", fill="both", expand=True)
+        ctk.CTkLabel(box, text=track["title"], anchor="w", justify="left",
+                     font=theme_ui.font("body_med"),
+                     text_color=self.theme["text"]).pack(anchor="w", pady=(10, 0))
+        detail = "  ·  ".join(x for x in (track["artist"], track["album"],
+                                          track["year"]) if x)
+        ctk.CTkLabel(box, text=detail, anchor="w", justify="left",
+                     font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+    def _set_discover_art(self, label, image):
+        try:
+            if not label.winfo_exists():
+                return
+            size = image.size[0]
+            label._art = ctk.CTkImage(light_image=image, dark_image=image,
+                                      size=(size, size))
+            label.configure(image=label._art)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------- preview
+
+    def preview_track(self, track):
+        """Stream a search result without saving it to disk."""
+        button = track.get("_preview_btn")
+        if button is not None:
+            try:
+                button.configure(text="Loading...", state="disabled")
+            except Exception:
+                pass
+        self._streaming_track = track
+        self.now_playing_label.configure(text=track["title"])
+        self.now_playing_sub.configure(
+            text=f"{track['artist']}  ·  preview")
+
+        def work():
+            try:
+                resolved = self.discover.stream_url(track)
+            except Exception as e:
+                self._safe_after(0, self._preview_failed, track, str(e))
+                return
+            self._safe_after(0, self._start_preview, track, resolved)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _start_preview(self, track, resolved):
+        ok = self.player.load_stream(resolved["url"],
+                                     duration=resolved.get("duration") or track["duration"],
+                                     title=track["title"])
+        button = track.get("_preview_btn")
+        if not ok:
+            self._preview_failed(track, self.player.last_error or "stream failed")
+            return
+        self.player.play()
+        self.play_btn.configure(text="\u23f8")
+        if button is not None:
+            try:
+                button.configure(text="\u25b6  Preview", state="normal")
+            except Exception:
+                pass
+        # A stream is not in the library, so nothing to highlight or like.
+        self._now_playing_row = {"path": None, "title": track["title"],
+                                 "artist": track["artist"],
+                                 "album": track["album"],
+                                 "cover_url": track.get("cover_large")}
+        self._push_discord(playing=True)
+        self.log(f"Previewing {track['artist']} - {track['title']} (not downloaded)")
+
+    def _preview_failed(self, track, message):
+        button = track.get("_preview_btn")
+        if button is not None:
+            try:
+                button.configure(text="\u25b6  Preview", state="normal")
+            except Exception:
+                pass
+        self.log(f"Could not preview {track['title']}: {message}")
+
+    def download_discovered(self, track):
+        """Keep a previewed track: download and tag it properly."""
+        self._start_batch([track["url"]],
+                          labels={track["url"]: f"{track['artist']} - {track['title']}"})
 
     def on_key_release(self, event):
         if self.search_timer:

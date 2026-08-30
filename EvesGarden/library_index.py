@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS tracks (
     added        REAL,
     play_count   INTEGER DEFAULT 0,
     last_played  REAL,
-    cover_url    TEXT
+    cover_url    TEXT,
+    liked        INTEGER DEFAULT 0,
+    liked_at     REAL
 );
 CREATE INDEX IF NOT EXISTS idx_album  ON tracks(album);
 CREATE INDEX IF NOT EXISTS idx_artist ON tracks(artist);
@@ -114,6 +116,7 @@ SORTS = {
     "Recently added":  "added DESC",
     "Recently played": "COALESCE(last_played, 0) DESC",
     "Most played":     "play_count DESC, LOWER(COALESCE(title,''))",
+    "Recently liked":  "COALESCE(liked_at, 0) DESC",
 }
 
 
@@ -195,8 +198,11 @@ class LibraryIndex:
             # Databases created before cover_url existed need the column added
             # rather than being thrown away.
             columns = {r[1] for r in self._conn.execute("PRAGMA table_info(tracks)")}
-            if "cover_url" not in columns:
-                self._conn.execute("ALTER TABLE tracks ADD COLUMN cover_url TEXT")
+            for column, ddl in (("cover_url", "cover_url TEXT"),
+                                ("liked", "liked INTEGER DEFAULT 0"),
+                                ("liked_at", "liked_at REAL")):
+                if column not in columns:
+                    self._conn.execute(f"ALTER TABLE tracks ADD COLUMN {ddl}")
             self._conn.commit()
 
     def close(self):
@@ -287,7 +293,8 @@ class LibraryIndex:
         rows = self._query("SELECT COUNT(*) AS n FROM tracks")
         return rows[0]["n"] if rows else 0
 
-    def tracks(self, search=None, sort="Title", album=None, artist=None):
+    def tracks(self, search=None, sort="Title", album=None, artist=None,
+               liked_only=False, played_only=False):
         """Filtered, sorted track rows.
 
         Search covers title, artist, album and filename -- the old filter only
@@ -309,6 +316,10 @@ class LibraryIndex:
         if artist is not None:
             where.append(f"({PRIMARY_ARTIST} = ? OR COALESCE(artist,'') = ?)")
             params += [artist, artist]
+        if liked_only:
+            where.append("liked = 1")
+        if played_only:
+            where.append("COALESCE(last_played, 0) > 0")
 
         sql = "SELECT * FROM tracks"
         if where:
@@ -409,6 +420,25 @@ class LibraryIndex:
         with self._lock:
             self._conn.execute("DELETE FROM tracks WHERE path = ?", (path,))
             self._conn.commit()
+
+    def is_liked(self, path):
+        rows = self._query("SELECT liked FROM tracks WHERE path = ?", (path,))
+        return bool(rows and rows[0]["liked"])
+
+    def set_liked(self, path, liked=True):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE tracks SET liked = ?, liked_at = ? WHERE path = ?",
+                (1 if liked else 0, time.time() if liked else None, path))
+            self._conn.commit()
+        return bool(liked)
+
+    def toggle_liked(self, path):
+        return self.set_liked(path, not self.is_liked(path))
+
+    def liked_count(self):
+        rows = self._query("SELECT COUNT(*) AS n FROM tracks WHERE liked = 1")
+        return rows[0]["n"] if rows else 0
 
     def cover_url(self, path):
         rows = self._query("SELECT cover_url FROM tracks WHERE path = ?", (path,))
