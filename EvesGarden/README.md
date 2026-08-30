@@ -7,6 +7,25 @@ Rich Presence.
 
 ![icon](assets/icon.png)
 
+## Download
+
+**[Download the latest release](https://github.com/Zykoraa/Windows-Apps/releases/latest)**
+-- a single `.zip`, no installer.
+
+1. Unzip it anywhere
+2. Run `gui.exe`
+
+Nothing else to install. Python, ffmpeg and every library are already inside
+the folder. Just keep `gui.exe` and `_internal/` together.
+
+Windows will likely show a blue "Windows protected your PC" box the first
+time, because the executable is not code-signed. Click **More info** ->
+**Run anyway**.
+
+On first launch the app asks for Spotify credentials -- see [Setup](#setup)
+below. You can skip that and still play music you already have; it is only
+needed for downloading.
+
 ## What it does
 
 **Library** — a SQLite index over the ID3 tags of your files, so you can
