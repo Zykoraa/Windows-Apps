@@ -122,7 +122,8 @@ import themes
 from themes import THEMES
 
 ctk.set_appearance_mode("Dark")
-ctk.ThemeManager.theme["CTkFont"]["family"] = "JetBrainsMono NF"
+# The default family is set in App.__init__ instead: resolving it needs a
+# live Tk interpreter, and there is none yet at import time.
 
 # Monkeypatch CTkFont to ensure all explicit calls use the nerd font
 import theme_ui
@@ -147,6 +148,13 @@ class App(ctk.CTk):
         # Both must exist before anything schedules work via _safe_after().
         self._closing = False
         self._ui_calls = thread_queue.Queue()
+
+        # CustomTkinter builds plenty of its own labels -- the caption on a
+        # scrollable frame, the text in an option menu, the segmented button --
+        # and takes their family from here rather than from any font we pass
+        # in. It was left on the coding face, so all of those rendered as
+        # terminal text beside the UI face everything else was using.
+        ctk.ThemeManager.theme["CTkFont"]["family"] = theme_ui.ui_family()
 
         self.settings = Settings(SETTINGS_PATH)
         self.index = LibraryIndex(INDEX_PATH)
@@ -1520,22 +1528,40 @@ class App(ctk.CTk):
         header = ctk.CTkFrame(self.dl_frame, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=36, pady=(22, 6))
         self.dl_heading = ctk.CTkLabel(header, text="Discover",
-                                       font=ctk.CTkFont(size=22, weight="bold"))
+                                       font=theme_ui.font("display"))
         self.dl_heading.pack(side="left")
-        self.dl_close_btn = ctk.CTkButton(header, text="Back to library", width=150,
-                                          height=34, corner_radius=17,
-                                          command=self.close_downloader)
+        self.dl_close_btn = ctk.CTkButton(
+            header, text="Back to library", width=150, height=36,
+            corner_radius=theme_ui.RADIUS_PILL,
+            font=theme_ui.font("body_med"), command=self.close_downloader)
         self.dl_close_btn.pack(side="right")
         self.dl_hint = ctk.CTkLabel(
             header,
             text="Search to preview anything, or paste a Spotify link to download",
-            font=ctk.CTkFont(size=12))
+            font=theme_ui.font("caption"))
         self.dl_hint.pack(side="right", padx=16)
 
+        # The search row carries the glyph the palette uses, so the two
+        # search surfaces read as the same idea.
+        self.dl_search_row = ctk.CTkFrame(self.dl_frame, height=52,
+                                          corner_radius=theme_ui.RADIUS_PILL,
+                                          fg_color=self.theme["surface"])
+        self.dl_search_row.grid(row=1, column=0, padx=36, pady=(6, 10),
+                                sticky="ew")
+        self.dl_search_row.pack_propagate(False)
+        search_row = self.dl_search_row
+        self.dl_search_icon = ui_widgets.glyph_canvas(
+            search_row, "search", size=24,
+            colour=self.theme["text_secondary"],
+            background=self.theme["surface"], stroke=1.8)
+        self.dl_search_icon.pack(side="left", padx=(20, 10))
         self.url_entry = ctk.CTkEntry(
-            self.dl_frame, placeholder_text="Search artist or song, or paste a Spotify URL...",
-            height=52, corner_radius=26, font=ctk.CTkFont(size=16))
-        self.url_entry.grid(row=1, column=0, padx=36, pady=(6, 10), sticky="ew")
+            search_row,
+            placeholder_text="Search an artist, album or song, or paste a Spotify link",
+            height=44, border_width=0, fg_color="transparent",
+            font=theme_ui.font("body", size=16))
+        self.url_entry.pack(side="left", fill="both", expand=True,
+                            padx=(0, 20))
         self.url_entry.bind("<KeyRelease>", self._on_discover_key)
         self.url_entry.bind("<FocusIn>", lambda e: self.on_key_release(None))
         self.url_entry.bind("<Return>", lambda e: self.start_download())
@@ -1549,28 +1575,31 @@ class App(ctk.CTk):
         buttons.grid(row=2, column=0, padx=36, pady=(2, 8), sticky="ew")
 
         self.download_button = ctk.CTkButton(
-            buttons, text="Start download", height=46, width=180, corner_radius=23,
-            font=ctk.CTkFont(size=15, weight="bold"), command=self.start_download)
+            buttons, text="Start download", height=44, width=176,
+            corner_radius=theme_ui.RADIUS_PILL,
+            font=theme_ui.font("heading"), command=self.start_download)
         self.download_button.pack(side="left")
 
         # A long album run used to be uninterruptible.
         self.cancel_button = ctk.CTkButton(
-            buttons, text="Cancel", height=46, width=110, corner_radius=23,
-            command=self.cancel_downloads, fg_color="transparent", border_width=2,
-            font=ctk.CTkFont(size=14, weight="bold"))
+            buttons, text="Cancel", height=44, width=110,
+            corner_radius=theme_ui.RADIUS_PILL, command=self.cancel_downloads,
+            fg_color="transparent", border_width=1,
+            font=theme_ui.font("body_med"))
         self.retry_button = ctk.CTkButton(
-            buttons, text="Retry failed", height=46, width=140, corner_radius=23,
-            command=self.retry_failed, font=ctk.CTkFont(size=14, weight="bold"))
+            buttons, text="Retry failed", height=44, width=140,
+            corner_radius=theme_ui.RADIUS_PILL, command=self.retry_failed,
+            font=theme_ui.font("body_med"))
         # Playlists need a signed-in user; everything else works app-only.
         self.signin_btn = ctk.CTkButton(
-            buttons, text="Sign in to Spotify", height=46, width=170,
-            corner_radius=23, fg_color="transparent", border_width=2,
-            font=ctk.CTkFont(size=14, weight="bold"),
+            buttons, text="Sign in to Spotify", height=44, width=170,
+            corner_radius=theme_ui.RADIUS_PILL, fg_color="transparent",
+            border_width=1, font=theme_ui.font("body_med"),
             command=self.spotify_sign_in)
         self.signin_btn.pack(side="left", padx=8)
 
         self.dl_progress_lbl = ctk.CTkLabel(buttons, text="",
-                                            font=ctk.CTkFont(size=13))
+                                            font=theme_ui.font("caption"))
         self.dl_progress_lbl.pack(side="right")
         self._sync_signin_button()
 
@@ -1590,12 +1619,18 @@ class App(ctk.CTk):
         self.job_rows = {}
 
         self.log_box = ctk.CTkTextbox(self.dl_frame, corner_radius=15, height=84,
-                                      font=theme_ui.font("mono"))
-        self.log_box.grid(row=4, column=0, padx=36, pady=(6, 22), sticky="nsew")
+                                      font=theme_ui.font("mono"),
+                                      fg_color=self.theme["surface"])
         self.log_box.configure(state="disabled")
+        self._log_shown = False
 
         self._sync_download_buttons()
         self._rebuild_job_rows()
+        # Otherwise the screen opens as two empty boxes filling most of it.
+        self._render_discover_message(
+            "Search for an artist, album or song.\n\n"
+            "Anything you find can be previewed before you decide to keep it, "
+            "and a Spotify link pasted above downloads straight away.")
 
         if self.spotify_error:
             self.url_entry.configure(state="disabled")
@@ -1764,6 +1799,7 @@ class App(ctk.CTk):
             ("library_frame", "bg"), ("queue_list", "surface"),
             ("queue_panel", "surface"), ("suggestions_frame", "surface"),
             ("results_frame", "surface"), ("jobs_frame", "surface"),
+            ("dl_search_row", "surface"),
         ):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -1837,6 +1873,11 @@ class App(ctk.CTk):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.configure(text_color=t["text_secondary"])
+        if getattr(self, "dl_search_icon", None) is not None:
+            ui_widgets.repaint_glyph(self.dl_search_icon, t["text_secondary"],
+                                     t["surface"])
+        if getattr(self, "log_box", None) is not None:
+            self.log_box.configure(fg_color=t["surface"])
         for name in ("download_button", "retry_button", "dl_close_btn"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -3035,6 +3076,12 @@ class App(ctk.CTk):
         if not self._dl_alive():
             print(message)
             return
+        # The log only takes up room once it has something to say; an empty
+        # black panel across the bottom of the screen said nothing.
+        if not getattr(self, "_log_shown", False):
+            self.log_box.grid(row=4, column=0, padx=36, pady=(6, 22),
+                              sticky="nsew")
+            self._log_shown = True
         self.log_box.configure(state="normal")
         self.log_box.insert("end", message + "\n")
         self.log_box.see("end")
@@ -3074,9 +3121,10 @@ class App(ctk.CTk):
             return
         for widget in self.results_frame.winfo_children():
             widget.destroy()
-        ctk.CTkLabel(self.results_frame, text=text,
-                     font=theme_ui.font("body"),
-                     text_color=self.theme["text_secondary"]).pack(pady=24)
+        ctk.CTkLabel(self.results_frame, text=text, justify="center",
+                     wraplength=460, font=theme_ui.font("body"),
+                     text_color=self.theme["text_secondary"]).pack(
+                         pady=64, padx=30)
 
     def _render_discover(self, results):
         if not self._dl_alive():
