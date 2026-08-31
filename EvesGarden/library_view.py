@@ -33,6 +33,16 @@ def plural(n, word):
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
+def ellipsize(text, limit):
+    """Trim to a length with a proper ellipsis.
+
+    Tk labels do not clip: a long album title given a fixed width simply
+    overruns its neighbour instead of being cut off.
+    """
+    text = text or ""
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
 def fmt_time(seconds):
     seconds = int(max(0, seconds or 0))
     return f"{seconds // 60}:{seconds % 60:02d}"
@@ -369,15 +379,26 @@ class LibraryView:
                    self._toggle_like(pth, lbl))
         self._hearts[track["path"]] = heart
 
+        # The album gets its own column. With only a title block on the left
+        # and a duration on the right, the whole middle of every row was
+        # empty; it is also the field you scan for when you are looking for
+        # one track off a particular record. Suppressed inside an album, where
+        # it would repeat the same string down the page.
+        if not (self.filter and self.filter[0] == "album"):
+            ctk.CTkLabel(row, text=ellipsize(track.get("album"), 34),
+                         width=250, anchor="w", font=theme_ui.font("caption"),
+                         text_color=self.theme["text_secondary"]
+                         ).pack(side="right", padx=(14, 22))
+
+
         box = ctk.CTkFrame(row, fg_color="transparent")
         box.pack(side="left", fill="both", expand=True)
-        title = track.get("title") or os.path.splitext(
-            os.path.basename(track["path"]))[0]
+        title = ellipsize(track.get("title") or os.path.splitext(
+            os.path.basename(track["path"]))[0], 52)
         ctk.CTkLabel(box, text=title, anchor="w", justify="left",
                      font=theme_ui.font("heading"),
                      text_color=self.theme["text"]).pack(anchor="w", pady=(9, 0))
-        detail = "  ·  ".join(
-            x for x in (track.get("artist") or "", track.get("album") or "") if x)
+        detail = ellipsize(track.get("artist"), 44)
         ctk.CTkLabel(box, text=detail, anchor="w", justify="left",
                      font=theme_ui.font("caption"),
                      text_color=self.theme["text_secondary"]).pack(anchor="w")

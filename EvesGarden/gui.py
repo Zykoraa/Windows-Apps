@@ -76,6 +76,7 @@ import tkinter as tk
 from PIL import ImageTk
 from library_index import LibraryIndex, SORTS
 from library_view import LibraryView
+import queue as thread_queue
 import dialogs
 import motion
 import ui_widgets
@@ -157,8 +158,9 @@ ctk.CTkFont = _UIFont
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        # Must exist before anything schedules work via _safe_after().
+        # Both must exist before anything schedules work via _safe_after().
         self._closing = False
+        self._ui_calls = thread_queue.Queue()
 
         self.settings = Settings(SETTINGS_PATH)
         self.index = LibraryIndex(INDEX_PATH)
@@ -272,6 +274,7 @@ class App(ctk.CTk):
             self.toggle_visualizer_visibility()
 
         # Start GUI update loops
+        self._pump_ui_calls()
         self.update_progress_loop()
         self.update_visualizer_loop()
         self.setup_overlay = None
@@ -285,18 +288,56 @@ class App(ctk.CTk):
 
 
     def _safe_after(self, delay, callback=None, *args):
-        """Schedule work on the Tk thread from a worker thread.
+        """Schedule work on the Tk thread, from any thread.
 
-        Download, lyric and album-art threads outlive the window during
-        shutdown; calling after() on a destroyed widget raises
-        "main thread is not in main loop" inside those threads.
+        Tk's after() is only safe on the thread that owns the interpreter.
+        Called from a worker it raises "main thread is not in main loop" --
+        and this used to swallow that, so the work was simply dropped. It was
+        not a rare shutdown case either: a cover decoded during startup, while
+        the main thread was still finishing __init__, never reached the bar at
+        all, which is why a resumed track opened with no artwork. Lyrics, list
+        thumbnails and download progress all went through the same door.
+
+        Work handed over from a worker now goes on a queue that the main loop
+        drains, which is the only thread allowed to touch Tk.
         """
         if getattr(self, "_closing", False):
             return None
-        try:
-            return self.after(delay, callback, *args)
-        except Exception:
+        if threading.current_thread() is threading.main_thread():
+            try:
+                return self.after(delay, callback, *args)
+            except Exception:
+                return None
+        if callback is None:
             return None
+        try:
+            self._ui_calls.put((delay, callback, args))
+        except Exception:
+            pass
+        # No cancel token: only main-thread callers schedule cancellable work.
+        return None
+
+    def _pump_ui_calls(self):
+        """Run whatever the worker threads handed over, on the Tk thread."""
+        while True:
+            try:
+                delay, callback, args = self._ui_calls.get_nowait()
+            except thread_queue.Empty:
+                break
+            except Exception:
+                break
+            try:
+                if delay:
+                    self.after(delay, callback, *args)
+                else:
+                    callback(*args)
+            except Exception:
+                traceback.print_exc()
+        if not getattr(self, "_closing", False):
+            try:
+                self.after(25, self._pump_ui_calls)
+            except Exception:
+                pass
 
     def _setup_media_keys(self):
         """Register only the media keys, not a system-wide keyboard hook.
@@ -604,6 +645,19 @@ class App(ctk.CTk):
         self.min_btn = ctk.CTkButton(self.title_bar, text=" 🗕 ", width=40, height=35, corner_radius=0, fg_color="transparent", command=self.minimize_to_tray)
         self.min_btn.pack(side="right")
 
+        # The theme picker used to sit in the library header, where the tabs,
+        # the search box, the sort menu and Add music already wanted more room
+        # than the window has: it was the last thing packed, so it was the one
+        # squeezed, down to a 20px sliver at the right edge. It is an
+        # application setting rather than a library control, so the title bar
+        # is where it belongs anyway.
+        self.theme_dropdown = ctk.CTkOptionMenu(
+            self.title_bar, values=list(THEMES.keys()),
+            command=self.change_theme, corner_radius=13,
+            width=148, height=26, font=theme_ui.font("small"))
+        self.theme_dropdown.set(self.current_theme_name)
+        self.theme_dropdown.pack(side="right", padx=(0, 14), pady=4)
+
         # 2. Main Area (Library)
         self.main_area = ctk.CTkFrame(self, corner_radius=0, fg_color=self.theme["bg"])
         self.main_area.grid(row=1, column=0, sticky="nsew")
@@ -627,11 +681,15 @@ class App(ctk.CTk):
         self.view_tabs.set(self.library_view)
         self.view_tabs.pack(side="left", padx=(0, 12))
 
+        # Requests little and expands into what is left, so the row degrades
+        # by shortening the search box rather than by crushing whatever was
+        # packed last.
         self.lib_search_entry = ctk.CTkEntry(
             self.library_header, placeholder_text="Search title, artist or album",
             border_width=1, corner_radius=theme_ui.RADIUS_PILL, height=36,
-            width=320, font=theme_ui.font("body"))
-        self.lib_search_entry.pack(side="left", padx=(4, 10))
+            width=200, font=theme_ui.font("body"))
+        self.lib_search_entry.pack(side="left", padx=(4, 10), fill="x",
+                                   expand=True)
         self.lib_search_entry.bind("<KeyRelease>", self._on_library_search)
 
         self.sort_dropdown = ctk.CTkOptionMenu(
@@ -646,13 +704,6 @@ class App(ctk.CTk):
             corner_radius=theme_ui.RADIUS_PILL, height=36, width=132,
             font=theme_ui.font("body_med"))
         self.nav_dl_btn.pack(side="left", padx=6)
-
-        self.theme_dropdown = ctk.CTkOptionMenu(
-            self.library_header, values=list(THEMES.keys()),
-            command=self.change_theme, corner_radius=theme_ui.RADIUS_PILL,
-            width=155, height=36, font=theme_ui.font("body"))
-        self.theme_dropdown.set(self.current_theme_name)
-        self.theme_dropdown.pack(side="right", padx=10)
 
         # Only offered when there is actually something to recover.
         self.new_pl_btn = ctk.CTkButton(
@@ -2016,10 +2067,12 @@ class App(ctk.CTk):
             self.current_playlist = [path]
             self.current_index = 0
 
-        full_name = os.path.splitext(os.path.basename(path))[0]
-        self.now_playing_label.configure(
-            text=full_name if len(full_name) <= 50 else full_name[:47] + "...")
-        self.extract_album_art(path)
+        try:
+            row = next((t for t in self.index.tracks() if t["path"] == path),
+                       None)
+        except Exception:
+            row = None
+        self._present_track(path, row)
 
         def load():
             if self.player.load_track(path):
@@ -2484,13 +2537,6 @@ class App(ctk.CTk):
             row = matches[0] if matches else None
         except Exception:
             row = None
-        display = (row or {}).get("title") or full_name
-        filename = display if len(display) <= 46 else display[:43] + "..."
-        self.now_playing_label.configure(text=filename)
-        if hasattr(self, "now_playing_sub"):
-            meta = " · ".join(x for x in ((row or {}).get("artist"),
-                                          (row or {}).get("album")) if x)
-            self.now_playing_sub.configure(text=meta)
         self.time_total.configure(text="0:00")
         self.time_elapsed.configure(text="0:00")
         # A local file is available end to end the moment it opens, so the
@@ -2526,6 +2572,36 @@ class App(ctk.CTk):
         view = getattr(self, "library", None)
         if view is not None:
             view.mark_playing(file_path)
+        self._present_track(file_path, row)
+        self._push_discord(playing=True)
+        self._ensure_cover_url(file_path, row)
+        self.play_btn.set_glyph("pause")
+        threading.Thread(target=self._load_and_play, args=(file_path,), daemon=True).start()
+        # Search lyrics with the full name -- `filename` is truncated to 50
+        # characters with an ellipsis for display, which never matched.
+        self.fetch_lyrics(full_name)
+
+    def _present_track(self, path, row):
+        """Put one track's metadata on every surface that shows it.
+
+        The bottom bar, the full-screen view and the heart were each filled in
+        separately, in two different places -- so resuming on launch produced
+        a bar showing the raw filename, no artist line, no artwork and a heart
+        left over from the previous session. The heart was also being synced
+        before _now_playing_row was updated, so it answered for the track
+        before this one.
+        """
+        full_name = os.path.splitext(os.path.basename(path))[0]
+        display = (row or {}).get("title") or full_name
+        artist = " \u00b7 ".join(x for x in ((row or {}).get("artist"),
+                                             (row or {}).get("album")) if x)
+
+        self.now_playing_label.configure(
+            text=display if len(display) <= 46 else display[:43] + "\u2026")
+        if hasattr(self, "now_playing_sub"):
+            self.now_playing_sub.configure(text=artist)
+
+        self._now_playing_row = row or {"path": path}
         self._sync_now_playing_heart()
 
         bits = []
@@ -2533,22 +2609,9 @@ class App(ctk.CTk):
             bits.append(str(row["year"]))
         if (row or {}).get("duration"):
             bits.append(fmt_time(row["duration"]))
-        self._np_set_track(
-            (row or {}).get("title") or full_name,
-            " \u00b7 ".join(x for x in ((row or {}).get("artist"),
-                                        (row or {}).get("album")) if x),
-            "  \u00b7  ".join(bits))
+        self._np_set_track(display, artist, "  \u00b7  ".join(bits))
 
-        self._now_playing_row = row or {"path": file_path}
-        self._push_discord(playing=True)
-        self._ensure_cover_url(file_path, row)
-
-        self.extract_album_art(file_path)
-        self.play_btn.set_glyph("pause")
-        threading.Thread(target=self._load_and_play, args=(file_path,), daemon=True).start()
-        # Search lyrics with the full name -- `filename` is truncated to 50
-        # characters with an ellipsis for display, which never matched.
-        self.fetch_lyrics(full_name)
+        self.extract_album_art(path)
 
     def _config_dir(self):
         return get_config_dir()
