@@ -147,3 +147,77 @@ class Gapless(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+@unittest.skipUnless(HAS_AUDIO, "needs an audio output device")
+class Crossfade(unittest.TestCase):
+    """The overlap has to keep the level flat and land on the right frame."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="eg-fade-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.first = os.path.join(self.dir, "first.wav")
+        self.second = os.path.join(self.dir, "second.wav")
+        write_tone(self.first, 440)
+        write_tone(self.second, 660)
+        self.engine = PlayerEngine()
+        self.addCleanup(self.engine.stop)
+        self.engine.set_volume(0.0)
+
+    def test_equal_power_keeps_the_level_flat(self):
+        # Two uncorrelated signals crossfaded with linear ramps lose about
+        # 3dB in the middle. Sine/cosine legs should not.
+        import numpy as np
+        engine = self.engine
+        self.assertTrue(engine.load_track(self.first))
+        engine.crossfade = 0.2
+        engine.preload(self.second)
+        self.assertTrue(wait_for(engine.preload_ready))
+
+        total = len(engine.audio_data)
+        engine.current_frame = total - int(0.2 * RATE)
+        self.assertTrue(engine._should_start_fade(total))
+        engine._start_fade(total)
+
+        powers = []
+        while True:
+            chunk = engine._mix_fade_chunk(2048)
+            if chunk is None:
+                break
+            powers.append(float(np.sqrt((chunk ** 2).mean())))
+
+        self.assertGreater(len(powers), 3)
+        # No chunk should sag far below the others.
+        self.assertGreater(min(powers), max(powers) * 0.7,
+                           "the crossfade dips in the middle: %s" % powers)
+
+    def test_fade_hands_over_at_the_right_frame(self):
+        engine = self.engine
+        advanced = []
+        engine.on_track_advanced_callback = advanced.append
+        self.assertTrue(engine.load_track(self.first))
+        engine.crossfade = 0.2
+        engine.preload(self.second)
+        self.assertTrue(wait_for(engine.preload_ready))
+
+        total = len(engine.audio_data)
+        engine.current_frame = total - int(0.2 * RATE)
+        engine._start_fade(total)
+        faded = engine._fade["frames"]
+        while engine._mix_fade_chunk(2048) is not None:
+            pass
+        engine._finish_fade()
+
+        self.assertEqual(advanced, [self.second])
+        # Playback continues in the new track exactly where the fade left it.
+        self.assertEqual(engine.current_frame, faded)
+        self.assertEqual(len(engine.audio_data), int(RATE * TONE_SECONDS))
+
+    def test_zero_crossfade_never_starts_one(self):
+        engine = self.engine
+        self.assertTrue(engine.load_track(self.first))
+        engine.crossfade = 0.0
+        engine.preload(self.second)
+        self.assertTrue(wait_for(engine.preload_ready))
+        engine.current_frame = len(engine.audio_data) - 10
+        self.assertFalse(engine._should_start_fade(len(engine.audio_data)))

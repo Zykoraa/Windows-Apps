@@ -479,6 +479,29 @@ class LibraryIndex:
 
     # ----------------------------------------------------------- playlists
 
+    # ------------------------------------------------------ smart playlists
+
+    def smart_tracks(self, rule, limit=500):
+        """Tracks matching a smart playlist rule.
+
+        The clause is interpolated rather than bound because it is SQL
+        structure, not a value. That is only safe because rules come from
+        smart_playlists.RULES and nowhere else; nothing user-supplied ever
+        reaches here.
+        """
+        return self._query(
+            "SELECT * FROM tracks WHERE %s ORDER BY %s LIMIT ?"
+            % (rule.clause, rule.order),
+            rule.params() + (limit,))
+
+    def smart_summary(self, rule):
+        """How many tracks a rule matches, and how long they run."""
+        rows = self._query(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(duration), 0) AS total, "
+            "MIN(path) AS cover_path FROM tracks WHERE %s" % rule.clause,
+            rule.params())
+        return rows[0] if rows else {"n": 0, "total": 0, "cover_path": None}
+
     def playlists(self):
         """Every playlist with its track count and total length."""
         return self._query(

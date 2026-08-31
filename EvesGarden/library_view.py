@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import customtkinter as ctk
 import motion
+import smart_playlists
 import theme_ui
 import ui_widgets
 
@@ -82,6 +83,7 @@ class LibraryView:
         self.on_menu = None          # right-click: (path, x, y)
         self.playlist_id = None      # set while viewing one playlist
         self.playlist_name = None
+        self.smart = None            # set while viewing one smart playlist
         self._art_pool = ThreadPoolExecutor(max_workers=4,
                                             thread_name_prefix="cover")
 
@@ -97,6 +99,7 @@ class LibraryView:
     def set_view(self, name):
         self.view = name
         self.filter = None
+        self.smart = None
         self.render()
 
     def set_sort(self, name):
@@ -165,6 +168,15 @@ class LibraryView:
         self.crumb_bar.grid_forget()
         self._page_tint(None, None)
         if self.view == "Playlists":
+            if self.smart is not None:
+                rows = self.index.smart_tracks(self.smart)
+                self.crumb_label.configure(text=self.smart.name)
+                self.crumb_bar.grid(row=1, column=0, sticky="ew",
+                                    padx=24, pady=(2, 6))
+                self._render(rows, self._track_row,
+                             ("smart", self.smart.key, len(rows), query),
+                             "track")
+                return
             if self.playlist_id is not None:
                 rows = self.index.playlist_tracks(self.playlist_id)
                 self.crumb_label.configure(text=self.playlist_name or "Playlist")
@@ -174,7 +186,17 @@ class LibraryView:
                 self._render(rows, self._track_row,
                              ("playlist", self.playlist_id, query), "track")
                 return
-            rows = self.index.playlists()
+            # Smart playlists lead: they are the ones whose contents move.
+            rows = []
+            for rule in smart_playlists.RULES:
+                summary = self.index.smart_summary(rule)
+                if not summary["n"]:
+                    continue        # an empty question is just noise
+                rows.append({"smart": rule, "id": rule.key, "name": rule.name,
+                             "hint": rule.hint, "n": summary["n"],
+                             "total": summary["total"],
+                             "cover_path": summary["cover_path"]})
+            rows.extend(self.index.playlists())
             self._render(rows, self._playlist_row, ("playlists", query),
                          "playlist")
             return
@@ -505,12 +527,19 @@ class LibraryView:
         ctk.CTkLabel(box, text=playlist["name"], anchor="w",
                      font=theme_ui.font("heading"),
                      text_color=self.theme["text"]).pack(anchor="w", pady=(14, 0))
-        ctk.CTkLabel(box, text=plural(playlist["n"], "track"), anchor="w",
+        detail = playlist.get("hint") or plural(playlist["n"], "track")
+        if playlist.get("smart"):
+            detail = "%s  ·  %s" % (plural(playlist["n"], "track"), detail)
+        ctk.CTkLabel(box, text=detail, anchor="w",
                      font=theme_ui.font("caption"),
                      text_color=self.theme["text_secondary"]).pack(anchor="w")
 
-        self._clickable(row, lambda pid=playlist["id"], name=playlist["name"]:
-                        self.open_playlist(pid, name))
+        rule = playlist.get("smart")
+        if rule is not None:
+            self._clickable(row, lambda r=rule: self.open_smart(r))
+        else:
+            self._clickable(row, lambda pid=playlist["id"],
+                            name=playlist["name"]: self.open_playlist(pid, name))
 
     def open_playlist(self, playlist_id, name):
         self.playlist_id = playlist_id
@@ -518,9 +547,16 @@ class LibraryView:
         self.invalidate()
         self.render()
 
+    def open_smart(self, rule):
+        self.smart = rule
+        self.playlist_id = None
+        self.invalidate()
+        self.render()
+
     def close_playlist(self):
         self.playlist_id = None
         self.playlist_name = None
+        self.smart = None
         self.invalidate()
         self.render()
 

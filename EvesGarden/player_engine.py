@@ -99,6 +99,10 @@ class PlayerEngine:
 
         # The next track, decoded while this one is still playing.
         self.gapless = True
+        # Seconds of overlap between tracks. Zero means gapless: one stops
+        # exactly where the next starts, which is what an album wants.
+        self.crossfade = 0.0
+        self._fade = None
         self._preload_lock = threading.Lock()
         self._preload_path = None
         self._preloaded = None
@@ -407,6 +411,7 @@ class PlayerEngine:
                 thread.join(timeout=3.0)
         self.thread = None
         self.playing = False
+        self._fade = None
         self.current_frame = 0
         stream, self.stream = self.stream, None
         if stream is not None:
@@ -439,16 +444,27 @@ class PlayerEngine:
                         continue          # waiting on the network
                     chunk = block.astype(np.float32) / 32768.0
                 else:
-                    start = self.current_frame
-                    if start >= total:
-                        if self._advance_in_place():
+                    if self._fade is None and self._should_start_fade(total):
+                        self._start_fade(total)
+
+                    if self._fade is not None:
+                        chunk = self._mix_fade_chunk(self.chunk_size)
+                        if chunk is None:
+                            self._finish_fade()
                             total = len(self.audio_data)
                             continue
-                        finished = True
-                        break
-                    end = min(start + self.chunk_size, total)
-                    chunk = self.audio_data[start:end].astype(np.float32) / 32768.0
-                    self.current_frame = end
+                    else:
+                        start = self.current_frame
+                        if start >= total:
+                            if self._advance_in_place():
+                                total = len(self.audio_data)
+                                continue
+                            finished = True
+                            break
+                        end = min(start + self.chunk_size, total)
+                        chunk = (self.audio_data[start:end].astype(np.float32)
+                                 / 32768.0)
+                        self.current_frame = end
 
                 chunk = self.apply_eq(chunk)
                 self.compute_visualizer(chunk)
@@ -473,6 +489,69 @@ class PlayerEngine:
         if finished and self.on_track_end_callback:
             try:
                 self.on_track_end_callback()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------ crossfade
+
+    def _should_start_fade(self, total):
+        if self.crossfade <= 0 or self.stream is not None:
+            return False
+        if not self.preload_ready():
+            return False
+        remaining = total - self.current_frame
+        return 0 < remaining <= int(self.crossfade * self.sample_rate)
+
+    def _start_fade(self, total):
+        """Begin overlapping the outgoing track with the incoming one."""
+        path, data = self.take_preloaded()
+        if data is None or len(data) == 0 or data.shape[1] != self.channels:
+            return
+        frames = min(int(self.crossfade * self.sample_rate),
+                     total - self.current_frame, len(data))
+        if frames <= 0:
+            return
+        self._fade = {"data": data, "path": path, "frames": frames, "done": 0}
+
+    def _mix_fade_chunk(self, size):
+        """One chunk of the overlap, or None once it is over."""
+        fade = self._fade
+        n = min(size,
+                len(self.audio_data) - self.current_frame,
+                len(fade["data"]) - fade["done"],
+                fade["frames"] - fade["done"])
+        if n <= 0:
+            return None
+
+        outgoing = self.audio_data[
+            self.current_frame:self.current_frame + n].astype(np.float32)
+        incoming = fade["data"][
+            fade["done"]:fade["done"] + n].astype(np.float32)
+        position = ((np.arange(n, dtype=np.float32) + fade["done"])
+                    / float(fade["frames"]))[:, None]
+
+        # Equal power, not linear. Two unrelated pieces of music summed with
+        # linear ramps lose about 3dB in the middle of the crossover, which is
+        # audible as a dip; sine and cosine legs keep the total power flat.
+        mixed = (outgoing * np.cos(position * (np.pi / 2))
+                 + incoming * np.sin(position * (np.pi / 2)))
+
+        self.current_frame += n
+        fade["done"] += n
+        return mixed / 32768.0
+
+    def _finish_fade(self):
+        """Hand the rest of playback over to the track that faded in."""
+        fade, self._fade = self._fade, None
+        if fade is None:
+            return
+        with self._load_lock:
+            self.audio_data = fade["data"]
+            self.current_frame = fade["done"]
+        self.reset_filters()
+        if self.on_track_advanced_callback:
+            try:
+                self.on_track_advanced_callback(fade["path"])
             except Exception:
                 pass
 

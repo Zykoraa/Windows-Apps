@@ -246,6 +246,7 @@ class App(ctk.CTk):
         self.player.on_track_advanced_callback = (
             lambda path: self._safe_after(0, self._on_gapless_advance, path))
         self.player.gapless = bool(self.settings.get("gapless", True))
+        self.player.crossfade = float(self.settings.get("crossfade", 0.0) or 0.0)
 
         self.library_view = self.settings.get("library_view") or "Songs"
         self.library_sort = self.settings.get("library_sort") or "Title"
@@ -599,7 +600,8 @@ class App(ctk.CTk):
         duration = self.player.get_duration()
         if duration <= 0:
             return
-        if not force and duration - self.player.get_position() > self.PRELOAD_LEAD:
+        lead = max(self.PRELOAD_LEAD, self.player.crossfade + 10.0)
+        if not force and duration - self.player.get_position() > lead:
             return
         nxt = self.queue.peek_next(shuffle=self.shuffle, repeat=self.repeat,
                                    current=self._current_path())
@@ -1120,6 +1122,27 @@ class App(ctk.CTk):
             slider.pack(pady=5)
             ctk.CTkLabel(col, text=lbl, font=ctk.CTkFont(size=10)).pack()
             self.eq_sliders.append(slider)
+
+        # Audio settings belong together, and this is the only panel that is
+        # about how playback sounds rather than what is playing.
+        fade_row = ctk.CTkFrame(self.eq_frame, fg_color="transparent")
+        fade_row.pack(fill="x", padx=18, pady=(2, 14))
+        self.crossfade_lbl = ctk.CTkLabel(
+            fade_row, text="Crossfade", anchor="w",
+            font=theme_ui.font("caption"),
+            text_color=self.theme["text_secondary"])
+        self.crossfade_lbl.pack(side="left")
+        self.crossfade_value = ctk.CTkLabel(
+            fade_row, text="off", width=44, anchor="e",
+            font=theme_ui.font("time"),
+            text_color=self.theme["text_secondary"])
+        self.crossfade_value.pack(side="right")
+        self.crossfade_slider = ui_widgets.SeekBar(
+            fade_row, self.theme, command=self.on_crossfade,
+            on_drag=self._show_crossfade, wheel_step=1 / 12.0, width=150)
+        self.crossfade_slider.pack(side="right", padx=10)
+        self.crossfade_slider.set(self.player.crossfade / self.MAX_CROSSFADE)
+        self._show_crossfade(self.crossfade_slider.get())
 
     # The full-screen view is always a dark room, whatever the app theme is.
     # A cover blurred out to fill the screen only works as a ground if it is
@@ -1800,6 +1823,28 @@ class App(ctk.CTk):
             self._sync_download_buttons()
             self._watch_downloads()
 
+    # Twelve seconds is past the point where it stops being a transition and
+    # starts being a mashup.
+    MAX_CROSSFADE = 12.0
+
+    def _show_crossfade(self, value):
+        seconds = round(float(value) * self.MAX_CROSSFADE)
+        self.crossfade_value.configure(
+            text="off" if seconds <= 0 else "%ds" % seconds)
+        return seconds
+
+    def on_crossfade(self, value):
+        """Seconds of overlap between tracks; zero leaves playback gapless."""
+        seconds = self._show_crossfade(value)
+        # Keep the control in step when something other than a drag sets it.
+        if getattr(self, "crossfade_slider", None) is not None:
+            self.crossfade_slider.set(float(value))
+        self.player.crossfade = float(seconds)
+        self.settings.set("crossfade", float(seconds))
+        # A crossfade needs the next track decoded well before the overlap
+        # starts, so widen the lead to match.
+        self._maybe_preload_next(force=seconds > 0)
+
     def toggle_eq(self):
         if self.eq_frame.winfo_ismapped():
             self.eq_frame.place_forget()
@@ -1912,6 +1957,13 @@ class App(ctk.CTk):
 
         if getattr(self, "now_playing_sub", None) is not None:
             self.now_playing_sub.configure(text_color=t["text_secondary"])
+        for name in ("crossfade_lbl", "crossfade_value"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.configure(text_color=t["text_secondary"])
+        if getattr(self, "crossfade_slider", None) is not None:
+            self.crossfade_slider.set_palette(t)
+
         for name in ("now_playing_label", "time_elapsed", "time_total"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -2637,6 +2689,7 @@ class App(ctk.CTk):
     def set_library_view(self, name):
         self.library_view = name
         self.library.playlist_id = None
+        self.library.smart = None
         self.settings.set("library_view", name)
         # The segmented button updates itself when the user clicks it, but not
         # when anything else switches view -- so the palette, a restored
@@ -2654,7 +2707,8 @@ class App(ctk.CTk):
         self.render_library()
 
     def clear_library_filter(self):
-        if self.library.view == "Playlists" and self.library.playlist_id:
+        if self.library.view == "Playlists" and (self.library.playlist_id
+                                                 or self.library.smart):
             self.library.close_playlist()
             self.render_library()
             return

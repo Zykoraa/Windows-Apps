@@ -20,6 +20,7 @@ from library_index import (LibraryIndex, normalise_title, normalise_artist)
 from play_queue import PlayQueue
 import colorsys
 import downloader
+import smart_playlists
 import themes
 
 
@@ -470,6 +471,102 @@ class QueuePeek(unittest.TestCase):
                          [["a", "b", "c", "d", "e"][
                              ["a", "b", "c", "d", "e"].index(chosen) + 1]]
                          if chosen != "e" else [])
+
+
+
+class Smart(unittest.TestCase):
+    """Smart playlists are queries, so the thing to test is what they select.
+
+    Each rule is a WHERE clause interpolated straight into SQL, which is only
+    reasonable while every one of them lives in smart_playlists and is exactly
+    what it claims to be.
+    """
+
+    DAY = 86400.0
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.ix = LibraryIndex(os.path.join(self.dir, "t.db"))
+        self.now = time.time()
+
+    def tearDown(self):
+        self.ix.close()
+
+    def add(self, path, added=0, plays=0, last=None, liked=0, duration=200):
+        with self.ix._lock:
+            self.ix._conn.execute(
+                "INSERT INTO tracks(path, mtime, size, title, artist, album,"
+                " duration, bitrate, added, play_count, last_played, liked)"
+                " VALUES(?,1,1,?,?,'Album',?,192000,?,?,?,?)",
+                (path, path, "Artist", duration,
+                 self.now - added * self.DAY, plays,
+                 None if last is None else self.now - last * self.DAY, liked))
+            self.ix._conn.commit()
+
+    def paths(self, key):
+        rule = smart_playlists.by_key(key)
+        return [r["path"] for r in self.ix.smart_tracks(rule)]
+
+    def test_recently_added_is_a_moving_window(self):
+        self.add("new.mp3", added=3)
+        self.add("old.mp3", added=90)
+        self.assertEqual(self.paths("recent-adds"), ["new.mp3"])
+
+    def test_never_played_means_never(self):
+        self.add("fresh.mp3", plays=0)
+        self.add("once.mp3", plays=1, last=1)
+        self.assertEqual(self.paths("never-played"), ["fresh.mp3"])
+
+    def test_forgotten_favourites_needs_both_halves(self):
+        self.add("liked-stale.mp3", liked=1, plays=4, last=60)
+        self.add("liked-fresh.mp3", liked=1, plays=4, last=2)
+        self.add("unliked-stale.mp3", liked=0, plays=4, last=60)
+        self.assertEqual(self.paths("forgotten"), ["liked-stale.mp3"])
+
+    def test_never_played_liked_tracks_count_as_forgotten(self):
+        # last_played is NULL, which must not silently drop out of the
+        # comparison the way a bare column would.
+        self.add("liked-unplayed.mp3", liked=1, plays=0, last=None)
+        self.assertEqual(self.paths("forgotten"), ["liked-unplayed.mp3"])
+
+    def test_on_repeat_ranks_by_plays(self):
+        self.add("a.mp3", plays=9, last=1)
+        self.add("b.mp3", plays=4, last=1)
+        self.add("c.mp3", plays=1, last=1)
+        self.assertEqual(self.paths("on-repeat"), ["a.mp3", "b.mp3"])
+
+    def test_long_players_uses_duration(self):
+        self.add("short.mp3", duration=200)
+        self.add("epic.mp3", duration=700)
+        self.assertEqual(self.paths("long-players"), ["epic.mp3"])
+
+    def test_summary_matches_the_rows(self):
+        self.add("a.mp3", plays=0, duration=100)
+        self.add("b.mp3", plays=0, duration=150)
+        summary = self.ix.smart_summary(smart_playlists.by_key("never-played"))
+        self.assertEqual(summary["n"], 2)
+        self.assertEqual(summary["total"], 250)
+
+    def test_every_rule_runs_against_an_empty_library(self):
+        for rule in smart_playlists.RULES:
+            self.assertEqual(self.ix.smart_tracks(rule), [], rule.key)
+            self.assertEqual(self.ix.smart_summary(rule)["n"], 0, rule.key)
+
+    def test_keys_are_unique_and_findable(self):
+        keys = [r.key for r in smart_playlists.RULES]
+        self.assertEqual(len(keys), len(set(keys)))
+        for key in keys:
+            self.assertIsNotNone(smart_playlists.by_key(key))
+        self.assertIsNone(smart_playlists.by_key("nope"))
+
+    def test_cutoffs_are_recomputed_per_query(self):
+        # A rule that froze its cutoff at import would drift out of date the
+        # longer the app stayed open.
+        rule = smart_playlists.by_key("recent-adds")
+        first = rule.params()
+        time.sleep(0.01)
+        self.assertGreater(rule.params()[0], first[0])
 
 
 class Scoring(unittest.TestCase):
