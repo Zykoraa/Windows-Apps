@@ -1,9 +1,12 @@
 # Eve's Garden
 
-A Windows music player and downloader. It reads track, album and artwork
-details from Spotify, pulls the audio from YouTube, tags the result properly,
-and plays it back with a 10-band EQ, synced lyrics, 32 visualisers and Discord
-Rich Presence.
+A Windows music player and downloader. It looks up track, album and artwork
+details, pulls the audio from YouTube, tags the result properly, and plays it
+back with gapless playback, a 10-band EQ, synced lyrics, 32 visualisers and
+Discord Rich Presence.
+
+No account or API key is needed to search and download. Connecting Spotify is
+optional and adds your own playlists and liked songs.
 
 ![icon](assets/icon.png)
 
@@ -22,9 +25,9 @@ Windows will likely show a blue "Windows protected your PC" box the first
 time, because the executable is not code-signed. Click **More info** ->
 **Run anyway**.
 
-On first launch the app asks for Spotify credentials -- see [Setup](#setup)
-below. You can skip that and still play music you already have; it is only
-needed for downloading.
+Nothing to configure. Searching, downloading and playback all work on first
+launch. [Connecting Spotify](#setup) is optional -- it adds your own playlists
+and liked songs.
 
 ## What it does
 
@@ -45,10 +48,14 @@ seek, shuffle, repeat, and resume where you left off.
 **Presentation** — 18 themes, 32 visualiser modes with 13 colour palettes,
 synced lyrics, and album-art-derived accent colours with a contrast check.
 
-## Setup
+## Setup (optional)
 
-You need your own free Spotify API credentials. The app asks for them on
-first run and writes them itself:
+Track details come from Apple's iTunes catalogue, which needs no account, so
+none of this is required to download music.
+
+Connecting Spotify adds one thing nothing else can: your own library -- your
+playlists and your liked songs. It takes free credentials of your own, which
+the app asks for and writes itself:
 
 1. Create an app at <https://developer.spotify.com/dashboard> — any name, no
    card required

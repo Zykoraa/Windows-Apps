@@ -123,10 +123,14 @@ jobs:
 
             ## First run
 
-            The app asks for free Spotify credentials so it can look up track
-            and album details. Create an app at
+            Nothing to configure. Searching and downloading work straight
+            away -- track details come from Apple's iTunes catalogue, which
+            needs no account.
+
+            Connecting Spotify is optional, and adds your own library on top:
+            your playlists and your liked songs. Create a free app at
             https://developer.spotify.com/dashboard (any name, no card
             needed) and paste the Client ID and Client Secret into the setup
-            screen. You can skip this and still play music you already have.
+            screen.
 
             Discord Rich Presence needs no setup.
