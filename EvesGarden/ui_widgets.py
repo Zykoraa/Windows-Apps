@@ -855,12 +855,19 @@ def _rounded_mask(size, radius):
     return mask
 
 
-def rounded_cover(art, size, radius=14, pad=52, blur=22, drop=16, opacity=0.62):
-    """Cover art with rounded corners and a soft drop shadow, as RGBA.
+def rounded_cover(art, size, radius=14, pad=52, blur=22, drop=16,
+                  opacity=0.62, rim=40):
+    """Cover art with rounded corners, a drop shadow and a hairline rim.
 
     Returned canvas is `pad` larger on every side so the shadow has somewhere
     to fall; paste it with its own alpha and the shadow lands on whatever is
     behind.
+
+    The rim is not decoration. Plenty of covers are near-black, and against a
+    backdrop derived from that same near-black cover they had no visible edge
+    at all -- the shadow disappears too, because there is nothing for it to
+    fall against. A one-pixel light edge defines the sleeve whatever the
+    artwork does.
     """
     size = int(size)
     cover = art.convert("RGB").resize((size, size), Image.Resampling.LANCZOS)
@@ -880,7 +887,15 @@ def rounded_cover(art, size, radius=14, pad=52, blur=22, drop=16, opacity=0.62):
     alpha = Image.new("L", canvas.size, 0)
     alpha.paste(mask, (pad, pad))
     art_layer.putalpha(alpha)
-    return Image.alpha_composite(canvas, art_layer)
+    plate = Image.alpha_composite(canvas, art_layer)
+
+    if rim:
+        edge = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        ImageDraw.Draw(edge).rounded_rectangle(
+            [(pad, pad), (pad + size - 1, pad + size - 1)],
+            radius=radius, outline=(255, 255, 255, int(rim)), width=1)
+        plate = Image.alpha_composite(plate, edge)
+    return plate
 
 
 def scrim(width, height, colour="#000000", top=0.0, bottom=0.55):

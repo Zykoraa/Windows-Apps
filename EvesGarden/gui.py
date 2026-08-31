@@ -534,7 +534,11 @@ class App(ctk.CTk):
             # visible flicker in the app.
             thumb = ui_widgets.placeholder_art(64, self.theme["surface"],
                                                self.theme["text"])
-            np_art = ui_widgets.placeholder_art(400, self.NP_FLOOR, "#ffffff")
+            # Lifted well off the floor colour: a tile built straight on
+            # NP_FLOOR is near-black on a near-black backdrop, so a track with
+            # no embedded cover showed nothing at all in the full-screen view.
+            np_art = ui_widgets.placeholder_art(
+                400, motion.blend(self.NP_FLOOR, "#ffffff", 0.13), "#ffffff")
             accent = None
 
         # Deliberately no placeholder in between: holding the outgoing cover
@@ -551,13 +555,14 @@ class App(ctk.CTk):
         self._np_tint = (ui_widgets.clamp_luminance(accent, 0.11, self.NP_FLOOR)
                          if accent else self.NP_FLOOR)
         self._np_card = motion.blend(self._np_tint, "#ffffff", 0.11)
+        fade = bool(getattr(self, "np_overlay_visible", False))
         for card in (getattr(self, "np_lyrics_card", None),
                      getattr(self, "np_queue_card", None),
                      getattr(self, "lyrics_scroll", None),
                      getattr(self, "np_queue_list", None)):
             if card is not None:
                 card.configure(fg_color=self._np_card)
-        self._np_redraw_stage(force=True)
+        self._np_redraw_stage(force=True, fade=fade)
 
     def build_ui(self):
         self.grid_rowconfigure(1, weight=1)
@@ -1012,6 +1017,7 @@ class App(ctk.CTk):
 
         self._np_stage_id = self.np_canvas.create_image(0, 0, anchor="nw")
         self._np_stage_photo = None      # Tk holds no reference of its own
+        self._np_stage_pil = None        # kept so the next one can dissolve in
         self._np_stage_key = None
         self._np_tint = self.NP_FLOOR
         self._np_card = "#17171c"
@@ -1136,7 +1142,31 @@ class App(ctk.CTk):
 
         self.np_close_btn.place(x=L["w"] - 50, y=12)
 
-    def _np_redraw_stage(self, force=False):
+    def _paint_stage(self, image):
+        self._np_stage_photo = ImageTk.PhotoImage(image)
+        self.np_canvas.itemconfigure(self._np_stage_id,
+                                     image=self._np_stage_photo)
+        self.np_canvas.tag_lower(self._np_stage_id)
+
+    def _show_stage(self, stage, fade=False):
+        """Put a composed stage on the canvas, dissolving from the last one.
+
+        Two saturated covers cutting straight to each other mid-song is the
+        one moment this view looks cheap. Deliberately few frames: each one
+        is a full-screen blend plus a PhotoImage, which is not cheap, and a
+        slow dissolve reads as intentional where a stuttering fast one does
+        not.
+        """
+        old = self._np_stage_pil
+        self._np_stage_pil = stage
+        if not fade or old is None or old.size != stage.size:
+            self._paint_stage(stage)
+            return
+        motion.animate(self.np_canvas, motion.SLOW,
+                       lambda t: self._paint_stage(Image.blend(old, stage, t)),
+                       easing=motion.linear, fps=26, name="stage")
+
+    def _np_redraw_stage(self, force=False, fade=False):
         """Recompose the backdrop and cover into one image.
 
         Keyed on the size and the cover so a resize that changes nothing (and
@@ -1161,10 +1191,7 @@ class App(ctk.CTk):
                 stage = ui_widgets.compose_stage(
                     art, L["w"], L["h"], L["cover"], L["cover_xy"],
                     tint=self._np_tint)
-            self._np_stage_photo = ImageTk.PhotoImage(stage)
-            self.np_canvas.itemconfigure(self._np_stage_id,
-                                         image=self._np_stage_photo)
-            self.np_canvas.tag_lower(self._np_stage_id)
+            self._show_stage(stage, fade=fade)
             # The close control is a canvas widget, so it cannot be
             # transparent -- but the backdrop is smooth where it sits, so
             # sampling one pixel there hides the seam completely.
@@ -1195,6 +1222,9 @@ class App(ctk.CTk):
         self.np_canvas.itemconfigure(self._np_meta_id, text=meta or "")
         self._np_place()
 
+    def _np_row_hover(self):
+        return motion.blend(self._np_card, "#ffffff", 0.07)
+
     def _render_np_queue(self):
         """The up-next list, inside the full-screen view."""
         if getattr(self, "np_queue_list", None) is None:
@@ -1217,7 +1247,8 @@ class App(ctk.CTk):
                              anchor="w", padx=10, pady=(2, 4))
             for path in upcoming:
                 self._queue_entry(self.np_queue_list, path, True,
-                                  ink=self.NP_INK, dim=self.NP_DIM)
+                                  ink=self.NP_INK, dim=self.NP_DIM,
+                                  hover=self._np_row_hover())
 
         if following:
             ctk.CTkLabel(self.np_queue_list, text="THEN FROM THIS LIST",
@@ -1226,7 +1257,8 @@ class App(ctk.CTk):
                              anchor="w", padx=10, pady=(14, 4))
             for path in following:
                 self._queue_entry(self.np_queue_list, path, False,
-                                  ink=self.NP_INK, dim=self.NP_DIM)
+                                  ink=self.NP_INK, dim=self.NP_DIM,
+                                  hover=self._np_row_hover())
 
         if not upcoming and not following:
             ctk.CTkLabel(self.np_queue_list,
@@ -1284,6 +1316,17 @@ class App(ctk.CTk):
                 label.configure(text_color=self.NP_DIM, fg_color="transparent")
         except Exception:
             pass
+
+    def _seek_to_lyric(self, index):
+        """Jump the playhead to a line the user clicked."""
+        if not (0 <= index < len(self.parsed_lyrics)):
+            return
+        duration = self.player.get_duration() or 0
+        if duration <= 0:
+            return
+        # A shade early, so the first syllable of the line is not clipped.
+        target = max(0.0, self.parsed_lyrics[index][0] - 0.25)
+        self.player.set_progress(min(1.0, target / duration))
 
     def fetch_lyrics(self, query):
         def _fetch():
@@ -1371,6 +1414,10 @@ class App(ctk.CTk):
                                wraplength=wrap, justify="left", anchor="w")
             lbl.grid(row=i + 1, column=0, sticky="ew", padx=2, pady=3,
                      ipadx=14, ipady=9)
+            # Clicking a line jumps to it. The timings are already parsed, so
+            # the lyrics may as well be a second scrub bar.
+            lbl.configure(cursor="hand2")
+            lbl.bind("<Button-1>", lambda _e, n=i: self._seek_to_lyric(n))
             self.lyrics_labels.append(lbl)
 
         bottom = ctk.CTkFrame(self.lyrics_scroll, fg_color="transparent", height=200)
@@ -2122,12 +2169,15 @@ class App(ctk.CTk):
                                                  fg_color="transparent")
         self.queue_list.pack(fill="both", expand=True, padx=8, pady=(0, 12))
 
-    def _queue_entry(self, parent, path, queued, ink=None, dim=None):
+    def _queue_entry(self, parent, path, queued, ink=None, dim=None,
+                     hover=None):
         """One up-next row. Used by the side panel and the full-screen view,
-        which sit on different backgrounds and so pass their own ink."""
+        which sit on different backgrounds and so pass their own colours."""
         ink = ink or self.theme["text"]
         dim = dim or self.theme["text_secondary"]
-        row = ctk.CTkFrame(parent, fg_color="transparent", height=44)
+        hover = hover or self.theme["surface_hover"]
+        row = ctk.CTkFrame(parent, fg_color="transparent", height=44,
+                           corner_radius=8)
         row.pack(fill="x", padx=4, pady=1)
         row.pack_propagate(False)
         meta = self._queue_meta.get(path, {})
@@ -2152,6 +2202,35 @@ class App(ctk.CTk):
         ctk.CTkLabel(box, text=fit(meta.get("artist"), 34), anchor="w",
                      font=theme_ui.font("small"),
                      text_color=dim).pack(anchor="w")
+
+        # The queue was a read-only list; clicking a row now jumps to it,
+        # which is the obvious thing to try and did nothing before.
+        def enter(_e=None):
+            if row.winfo_exists():
+                row.configure(fg_color=hover)
+
+        def leave(_e=None):
+            if row.winfo_exists():
+                row.configure(fg_color="transparent")
+
+        def go(_e=None):
+            self._play_from_queue(path)
+
+        for widget in (row, box, *box.winfo_children()):
+            widget.bind("<Enter>", enter, add="+")
+            widget.bind("<Leave>", leave, add="+")
+            widget.bind("<Button-1>", go, add="+")
+            try:
+                widget.configure(cursor="hand2")
+            except Exception:
+                pass
+
+    def _play_from_queue(self, path):
+        """Play a row from the up-next list, dropping it out of the queue."""
+        self.queue.remove(path)
+        if path in self.current_playlist:
+            self.current_index = self.current_playlist.index(path)
+        self.play_file(path)
 
     def _render_queue(self):
         self._render_np_queue()
