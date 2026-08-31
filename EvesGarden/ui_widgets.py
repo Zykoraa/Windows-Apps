@@ -17,7 +17,7 @@ import math
 import tkinter as tk
 
 import customtkinter as ctk
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 import motion
 import theme_ui
@@ -639,7 +639,15 @@ def _g_volume_high(c, cx, cy, s, col, w):
         _volume_waves(c, cx, cy, s, col, w, 2)
 
 
+def _g_close(c, cx, cy, s, col, w):
+    return [c.create_line(_pts([(7, 7), (17, 17)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND),
+            c.create_line(_pts([(17, 7), (7, 17)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND)]
+
+
 GLYPHS = {
+    "close": _g_close,
     "play": _g_play,
     "pause": _g_pause,
     "prev": _g_prev,
@@ -797,3 +805,111 @@ class GlyphButton(tk.Canvas):
         inside = (0 <= event.x <= self._size and 0 <= event.y <= self._size)
         if was and inside and self.command:
             self.command()
+
+
+# ------------------------------------------------------- now-playing artwork
+
+def _cover_fill(image, width, height):
+    """Scale to cover a box, then centre-crop -- never letterbox, never squash."""
+    width, height = max(1, int(width)), max(1, int(height))
+    sw, sh = image.size
+    scale = max(width / sw, height / sh)
+    box = (max(1, int(sw * scale)), max(1, int(sh * scale)))
+    scaled = image.resize(box, Image.Resampling.BICUBIC)
+    left = (box[0] - width) // 2
+    top = (box[1] - height) // 2
+    return scaled.crop((left, top, left + width, top + height))
+
+
+def blurred_backdrop(art, width, height, darken=0.42, floor="#000000"):
+    """A cover blown up to fill the screen, blurred down to pure colour.
+
+    Blurred at thumbnail scale and then upscaled. Running GaussianBlur over a
+    1300px image costs about a fifth of a second and this reruns on every
+    window resize; over a 260px one it costs nothing, and at this radius the
+    difference does not survive the upscale anyway.
+
+    The result is darkened hard. It is a ground for text to sit on, not a
+    picture -- anything bright enough to read as artwork competes with the
+    cover about to be laid on top of it.
+    """
+    width, height = max(1, int(width)), max(1, int(height))
+    seed_w = 260
+    seed_h = max(1, int(height * seed_w / float(width)))
+    seed = _cover_fill(art.convert("RGB"), seed_w, seed_h)
+    seed = seed.filter(ImageFilter.GaussianBlur(seed_w / 18.0))
+    base = seed.resize((width, height), Image.Resampling.BICUBIC)
+
+    # blend(a, b, t) is a*(1-t) + b*t, so this pulls every pixel toward the
+    # floor colour while keeping its hue. A plain brightness scale washes the
+    # whole thing toward grey instead. It is also one C call rather than a
+    # Python loop over a million pixels, which is what this used to be.
+    solid = Image.new("RGB", (width, height), _rgb(floor))
+    return Image.blend(solid, base, darken)
+
+
+def _rounded_mask(size, radius):
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle([(0, 0), (size[0] - 1, size[1] - 1)],
+                                           radius=radius, fill=255)
+    return mask
+
+
+def rounded_cover(art, size, radius=14, pad=52, blur=22, drop=16, opacity=0.62):
+    """Cover art with rounded corners and a soft drop shadow, as RGBA.
+
+    Returned canvas is `pad` larger on every side so the shadow has somewhere
+    to fall; paste it with its own alpha and the shadow lands on whatever is
+    behind.
+    """
+    size = int(size)
+    cover = art.convert("RGB").resize((size, size), Image.Resampling.LANCZOS)
+    mask = _rounded_mask((size, size), radius)
+
+    canvas = Image.new("RGBA", (size + pad * 2, size + pad * 2), (0, 0, 0, 0))
+
+    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    shade = Image.new("L", canvas.size, 0)
+    shade.paste(mask.point(lambda a: int(a * opacity)), (pad, pad + drop))
+    shadow.putalpha(shade.filter(ImageFilter.GaussianBlur(blur)))
+    canvas = Image.alpha_composite(canvas, shadow)
+
+    art_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    art_layer.paste(cover, (pad, pad))
+    art_layer.putalpha(Image.new("L", canvas.size, 0))
+    alpha = Image.new("L", canvas.size, 0)
+    alpha.paste(mask, (pad, pad))
+    art_layer.putalpha(alpha)
+    return Image.alpha_composite(canvas, art_layer)
+
+
+def scrim(width, height, colour="#000000", top=0.0, bottom=0.55):
+    """A vertical alpha ramp, for holding text off a busy background."""
+    width, height = max(1, int(width)), max(1, int(height))
+    layer = Image.new("RGBA", (1, height), _rgb(colour) + (0,))
+    px = layer.load()
+    r, g, b = _rgb(colour)
+    for y in range(height):
+        f = y / max(1, height - 1)
+        px[0, y] = (r, g, b, int(255 * (top + (bottom - top) * f)))
+    return layer.resize((width, height), Image.Resampling.BILINEAR)
+
+
+def compose_stage(art, width, height, cover_size, cover_xy, tint="#000000",
+                  darken=0.42):
+    """The whole left-hand picture as one image: backdrop plus floating cover.
+
+    Doing this in PIL rather than stacking Tk widgets is what makes the drop
+    shadow possible at all -- Tk has no alpha compositing between widgets, so
+    a shadow can only exist if whatever is behind it is part of the same
+    image.
+    """
+    stage = blurred_backdrop(art, width, height, darken=darken,
+                             floor=tint).convert("RGBA")
+    stage = Image.alpha_composite(stage, scrim(width, height, "#000000",
+                                               0.0, 0.42))
+    plate = rounded_cover(art, cover_size)
+    x = int(cover_xy[0] - (plate.size[0] - cover_size) / 2)
+    y = int(cover_xy[1] - (plate.size[1] - cover_size) / 2)
+    stage.alpha_composite(plate, (x, y))
+    return stage.convert("RGB")

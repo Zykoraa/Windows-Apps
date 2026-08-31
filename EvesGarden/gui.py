@@ -73,6 +73,7 @@ from mutagen.id3 import ID3, APIC
 from PIL import Image
 import io
 import tkinter as tk
+from PIL import ImageTk
 from library_index import LibraryIndex, SORTS
 from library_view import LibraryView
 import dialogs
@@ -192,7 +193,6 @@ class App(ctk.CTk):
         # can be blended onto the one already showing.
         self._thumb_pil = None
         self._np_pil = None
-        self._np_bg = None
         self._lyric_fonts = {}
         self._tray_icon = None
         self._lib_search_timer = None
@@ -534,45 +534,30 @@ class App(ctk.CTk):
             # visible flicker in the app.
             thumb = ui_widgets.placeholder_art(64, self.theme["surface"],
                                                self.theme["text"])
-            np_art = ui_widgets.placeholder_art(400, self.theme["bg"],
-                                                self.theme["text"])
+            np_art = ui_widgets.placeholder_art(400, self.NP_FLOOR, "#ffffff")
             accent = None
 
         # Deliberately no placeholder in between: holding the outgoing cover
         # until the incoming one has decoded, then dissolving, reads better
         # than a blank frame every time the track changes.
         ui_widgets.crossfade(self.album_art_label, self._thumb_pil, thumb, 64)
-        ui_widgets.crossfade(self.np_art_label, self._np_pil, np_art, 400)
+        # The full-screen cover is not a label any more -- it is composited
+        # into the backdrop, so it is redrawn rather than cross-faded.
         self._thumb_pil, self._np_pil = thumb, np_art
 
         self.dynamic_accent = accent or self.theme["accent"]
-        self._tint_now_playing(self._readable_bg(accent))
-
-    def _tint_now_playing(self, target):
-        """Ease the now-playing backdrop across to the new cover's colour.
-
-        Snapping between two saturated album colours was jarring enough to
-        read as a glitch.
-        """
-        start = self._np_bg or self.theme["bg"]
-        self._np_bg = target
-        motion.animate(
-            self.np_overlay, motion.SLOW,
-            lambda t: self.np_overlay.configure(
-                fg_color=motion.blend(start, target, t)),
-            name="tint")
-
-    def _readable_bg(self, accent):
-        """Move a cover colour away from the text colour until it is legible.
-
-        The dominant album colour used to be applied to the overlay as-is, so
-        a pale sleeve gave near-white text on a near-white background. It then
-        always darkened, which is right for the nine dark themes and wrong for
-        Rose Pine Dawn and Nordic Light -- so the direction now follows the
-        theme's own text colour.
-        """
-        return ui_widgets.readable_tint(accent, self.theme["text"],
-                                        self.theme["bg"])
+        # The full-screen view derives its own, much darker, pair: it is a
+        # backdrop to read text off, not a panel colour.
+        self._np_tint = (ui_widgets.clamp_luminance(accent, 0.11, self.NP_FLOOR)
+                         if accent else self.NP_FLOOR)
+        self._np_card = motion.blend(self._np_tint, "#ffffff", 0.11)
+        for card in (getattr(self, "np_lyrics_card", None),
+                     getattr(self, "np_queue_card", None),
+                     getattr(self, "lyrics_scroll", None),
+                     getattr(self, "np_queue_list", None)):
+            if card is not None:
+                card.configure(fg_color=self._np_card)
+        self._np_redraw_stage(force=True)
 
     def build_ui(self):
         self.grid_rowconfigure(1, weight=1)
@@ -843,8 +828,11 @@ class App(ctk.CTk):
             self._slide_out(self.np_overlay)
             self.np_overlay_visible = False
         else:
-            self._slide_in(self.np_overlay)
             self.np_overlay_visible = True
+            self._np_place()
+            self._np_redraw_stage()
+            self._render_np_queue()
+            self._slide_in(self.np_overlay)
 
     # --------------------------------------------------------- overlay motion
 
@@ -977,50 +965,276 @@ class App(ctk.CTk):
             ctk.CTkLabel(col, text=lbl, font=ctk.CTkFont(size=10)).pack()
             self.eq_sliders.append(slider)
 
+    # The full-screen view is always a dark room, whatever the app theme is.
+    # A cover blurred out to fill the screen only works as a ground if it is
+    # dark, and half the palettes here are not; deriving the ink from the
+    # theme would have meant near-white text on a pale card over a dark
+    # backdrop in exactly the themes where it looks worst.
+    NP_INK = "#f2f2f5"
+    NP_DIM = "#a6a6b2"
+    NP_FLOOR = "#0a0a0d"
+    NP_MARGIN = 52
+
+    def _np_theme(self):
+        """The app palette, overridden with the dark-room ink.
+
+        The full-screen view deliberately ignores the theme, so any widget
+        living on it has to be handed the substitute rather than the real one
+        or it paints itself for a background that is not there.
+        """
+        palette = dict(self.theme)
+        palette.update(text=self.NP_INK, text_secondary=self.NP_DIM,
+                       surface_hover="#4c4c58")
+        return palette
+
     def build_now_playing_overlay(self):
+        """The full-screen now playing: cover, lyrics and the queue together.
+
+        All three already existed and none of them shared a screen. The cover
+        and the lyrics sat in two flat columns; the queue was a slide-out on
+        the far side of the app, so seeing what was coming up meant leaving
+        the view you had opened to look at the track.
+
+        The ground is the cover itself, blown up and blurred down to nothing
+        but colour, with the real cover floating on it under a drop shadow.
+        That compositing has to happen in PIL and arrive as a single image:
+        Tk cannot blend one widget over another, so a shadow can only exist
+        if whatever it falls on is part of the same picture. Hence a canvas
+        here rather than the usual stack of frames.
+        """
+        t = self.theme
         self.np_overlay = ctk.CTkFrame(self.main_area, corner_radius=0,
-                                       fg_color=self.theme["bg"])
-        # The art column is fixed and the lyrics take whatever is left. Both
-        # columns used to carry weight=1, which pinned the lyrics pane to half
-        # the window no matter how wide it got.
-        self.np_overlay.grid_columnconfigure(0, weight=0)
-        self.np_overlay.grid_columnconfigure(1, weight=1)
-        self.np_overlay.grid_rowconfigure(0, weight=1)
+                                       fg_color=self.NP_FLOOR)
 
-        left = ctk.CTkFrame(self.np_overlay, fg_color="transparent")
-        left.grid(row=0, column=0, padx=(44, 24), pady=40, sticky="n")
+        self.np_canvas = tk.Canvas(self.np_overlay, highlightthickness=0,
+                                   bd=0, bg=self.NP_FLOOR, takefocus=0)
+        self.np_canvas.pack(fill="both", expand=True)
 
-        self.np_art_label = ctk.CTkLabel(left, text="", width=400, height=400)
-        self.np_art_label.pack()
-        self.np_title_lbl = ctk.CTkLabel(left, text="", wraplength=400,
-                                         justify="center",
-                                         font=ctk.CTkFont(size=20, weight="bold"))
-        self.np_title_lbl.pack(pady=(20, 4))
-        self.np_artist_lbl = ctk.CTkLabel(left, text="", wraplength=400,
-                                          justify="center",
-                                          font=ctk.CTkFont(size=14))
-        self.np_artist_lbl.pack()
-        self.np_close_btn = ctk.CTkButton(left, text="Close", width=120, height=32,
-                                          corner_radius=16,
-                                          command=self.toggle_now_playing_overlay)
-        self.np_close_btn.pack(pady=(24, 0))
+        self._np_stage_id = self.np_canvas.create_image(0, 0, anchor="nw")
+        self._np_stage_photo = None      # Tk holds no reference of its own
+        self._np_stage_key = None
+        self._np_tint = self.NP_FLOOR
+        self._np_card = "#17171c"
+        self._np_resize_job = None
 
-        right = ctk.CTkFrame(self.np_overlay, fg_color=self.theme["bg"])
-        right.grid(row=0, column=1, sticky="nsew", padx=(0, 40), pady=40)
-        self.np_lyrics_pane = right
-        right.grid_rowconfigure(0, weight=1)
-        right.grid_columnconfigure(0, weight=1)
+        self._np_title_id = self.np_canvas.create_text(
+            0, 0, text="", anchor="nw", fill=self.NP_INK, justify="left",
+            font=theme_ui.font("display", size=32))
+        self._np_artist_id = self.np_canvas.create_text(
+            0, 0, text="", anchor="nw", fill=self.NP_INK, justify="left",
+            font=theme_ui.font("body", size=17))
+        self._np_meta_id = self.np_canvas.create_text(
+            0, 0, text="", anchor="nw", fill=self.NP_DIM, justify="left",
+            font=theme_ui.font("small"))
 
-        self.lyrics_scroll = ctk.CTkScrollableFrame(right, fg_color=self.theme["bg"])
-        self.lyrics_scroll.grid(row=0, column=0, sticky="nsew")
+        # Both scrolling panes are opaque cards. Real frosted glass would need
+        # the backdrop behind every pixel of the pane, and a scrollable frame
+        # cannot carry a background image.
+        self.np_lyrics_card = ctk.CTkFrame(self.np_canvas, corner_radius=18,
+                                           width=400, height=400,
+                                           fg_color=self._np_card)
+        self.np_lyrics_card.pack_propagate(False)
+        self.np_lyrics_head = ctk.CTkLabel(
+            self.np_lyrics_card, text="LYRICS", anchor="w",
+            font=theme_ui.font("small"), text_color=self.NP_DIM)
+        self.np_lyrics_head.pack(anchor="w", padx=24, pady=(16, 2))
+        # Not "transparent": a scrollable frame keeps its own canvas, which
+        # goes on painting the default dark background regardless.
+        self.lyrics_scroll = ctk.CTkScrollableFrame(self.np_lyrics_card,
+                                                    fg_color=self._np_card)
+        self.lyrics_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 14))
         self.lyrics_scroll.grid_columnconfigure(0, weight=1)
-        # wraplength was hardcoded at 700px against a column that measured
-        # 434px, so every long line ran off the edge.
         self.lyrics_scroll.bind("<Configure>", self._on_lyrics_resize)
+
+        self.np_queue_card = ctk.CTkFrame(self.np_canvas, corner_radius=18,
+                                          width=292, height=400,
+                                          fg_color=self._np_card)
+        self.np_queue_card.pack_propagate(False)
+        self.np_queue_head = ctk.CTkLabel(
+            self.np_queue_card, text="NEXT UP", anchor="w",
+            font=theme_ui.font("small"), text_color=self.NP_DIM)
+        self.np_queue_head.pack(anchor="w", padx=24, pady=(16, 2))
+        self.np_queue_list = ctk.CTkScrollableFrame(self.np_queue_card,
+                                                    fg_color=self._np_card)
+        self.np_queue_list.pack(fill="both", expand=True, padx=8, pady=(0, 14))
+
+        self.np_close_btn = ui_widgets.GlyphButton(
+            self.np_canvas, self._np_theme(), "close", size=38,
+            command=self.toggle_now_playing_overlay, background=self.NP_FLOOR)
 
         self.lyrics_labels = []
         self._lyrics_wrap = 0
         self._lyric_spacers = []
+
+        self.np_canvas.bind("<Configure>", self._np_on_resize)
+
+    # ------------------------------------------------- full-screen layout
+
+    def _np_layout(self):
+        """Geometry for the canvas size we actually have.
+
+        Falls back to the parent's size because the canvas reports 1x1 until
+        Tk has mapped it, and the stage is composed before the slide starts --
+        without this the overlay animated in as a black rectangle and only
+        acquired its backdrop once the first <Configure> landed.
+        """
+        w = self.np_canvas.winfo_width()
+        h = self.np_canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            w = max(w, self.main_area.winfo_width())
+            h = max(h, self.main_area.winfo_height())
+        w, h = max(1, w), max(1, h)
+        m = self.NP_MARGIN
+        cover = int(min(340, max(160, h - 320), (w - m * 2) * 0.30))
+        top = m
+        # The queue is the first thing to go when there is no room for three
+        # columns; the lyrics then take the whole right-hand side.
+        show_queue = w >= 1080
+        queue_w = 292 if show_queue else 0
+        gap = 26
+        lyr_x = m + cover + 54
+        lyr_w = w - lyr_x - m - (queue_w + gap if show_queue else 0)
+        return {
+            "w": w, "h": h, "cover": cover, "cover_xy": (m, top),
+            "text_x": m, "text_y": top + cover + 28,
+            "lyrics": (lyr_x, top, max(200, lyr_w), max(120, h - top - m)),
+            "queue": (w - m - queue_w, top, queue_w, max(120, h - top - m)),
+            "show_queue": show_queue,
+        }
+
+    def _np_place(self):
+        """Position everything that is cheap to move, without re-rendering."""
+        if getattr(self, "np_canvas", None) is None:
+            return
+        L = self._np_layout()
+        c = self.np_canvas
+        wrap = L["cover"] + 30
+
+        c.coords(self._np_title_id, L["text_x"], L["text_y"])
+        c.itemconfigure(self._np_title_id, width=wrap)
+        box = c.bbox(self._np_title_id)
+        y = (box[3] if box else L["text_y"] + 36) + 6
+
+        c.coords(self._np_artist_id, L["text_x"], y)
+        c.itemconfigure(self._np_artist_id, width=wrap)
+        box = c.bbox(self._np_artist_id)
+        y = (box[3] if box else y + 22) + 8
+
+        c.coords(self._np_meta_id, L["text_x"], y)
+        c.itemconfigure(self._np_meta_id, width=wrap)
+
+        lx, ly, lw, lh = L["lyrics"]
+        self.np_lyrics_card.configure(width=lw, height=lh)
+        self.np_lyrics_card.place(x=lx, y=ly)
+
+        if L["show_queue"]:
+            qx, qy, qw, qh = L["queue"]
+            self.np_queue_card.configure(width=qw, height=qh)
+            self.np_queue_card.place(x=qx, y=qy)
+        else:
+            self.np_queue_card.place_forget()
+
+        self.np_close_btn.place(x=L["w"] - 50, y=12)
+
+    def _np_redraw_stage(self, force=False):
+        """Recompose the backdrop and cover into one image.
+
+        Keyed on the size and the cover so a resize that changes nothing (and
+        Tk sends plenty of those) does not pay for the compositing again.
+        """
+        if getattr(self, "np_canvas", None) is None:
+            return
+        L = self._np_layout()
+        if L["w"] < 60 or L["h"] < 60:
+            return
+        art = self._np_pil
+        key = (id(art), L["w"], L["h"], L["cover"], self._np_tint)
+        if key == self._np_stage_key and not force:
+            return
+        self._np_stage_key = key
+
+        try:
+            if art is None:
+                stage = Image.new("RGB", (L["w"], L["h"]),
+                                  ui_widgets._rgb(self.NP_FLOOR))
+            else:
+                stage = ui_widgets.compose_stage(
+                    art, L["w"], L["h"], L["cover"], L["cover_xy"],
+                    tint=self._np_tint)
+            self._np_stage_photo = ImageTk.PhotoImage(stage)
+            self.np_canvas.itemconfigure(self._np_stage_id,
+                                         image=self._np_stage_photo)
+            self.np_canvas.tag_lower(self._np_stage_id)
+            # The close control is a canvas widget, so it cannot be
+            # transparent -- but the backdrop is smooth where it sits, so
+            # sampling one pixel there hides the seam completely.
+            try:
+                spot = stage.getpixel((min(L["w"] - 1, L["w"] - 31), 31))
+                self.np_close_btn.set_palette(
+                    self._np_theme(), background="#%02x%02x%02x" % spot[:3])
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"now playing stage: {e}")
+
+    def _np_on_resize(self, _event=None):
+        """Reflow immediately, recomposite once the drag settles."""
+        self._np_place()
+        if getattr(self, "_np_resize_job", None):
+            try:
+                self.after_cancel(self._np_resize_job)
+            except Exception:
+                pass
+        self._np_resize_job = self._safe_after(140, self._np_redraw_stage)
+
+    def _np_set_track(self, title, artist, meta):
+        if getattr(self, "np_canvas", None) is None:
+            return
+        self.np_canvas.itemconfigure(self._np_title_id, text=title or "")
+        self.np_canvas.itemconfigure(self._np_artist_id, text=artist or "")
+        self.np_canvas.itemconfigure(self._np_meta_id, text=meta or "")
+        self._np_place()
+
+    def _render_np_queue(self):
+        """The up-next list, inside the full-screen view."""
+        if getattr(self, "np_queue_list", None) is None:
+            return
+        if not getattr(self, "np_overlay_visible", False):
+            return
+        for widget in self.np_queue_list.winfo_children():
+            widget.destroy()
+
+        upcoming = self.queue.upcoming
+        following = self.queue.context_after(25)
+        wanted = set(upcoming) | set(following)
+        self._queue_meta = {tr["path"]: tr for tr in self.index.tracks()
+                            if tr["path"] in wanted}
+
+        if upcoming:
+            ctk.CTkLabel(self.np_queue_list, text="QUEUED", anchor="w",
+                         font=theme_ui.font("small"),
+                         text_color=self.theme["accent"]).pack(
+                             anchor="w", padx=10, pady=(2, 4))
+            for path in upcoming:
+                self._queue_entry(self.np_queue_list, path, True,
+                                  ink=self.NP_INK, dim=self.NP_DIM)
+
+        if following:
+            ctk.CTkLabel(self.np_queue_list, text="THEN FROM THIS LIST",
+                         anchor="w", font=theme_ui.font("small"),
+                         text_color=self.NP_DIM).pack(
+                             anchor="w", padx=10, pady=(14, 4))
+            for path in following:
+                self._queue_entry(self.np_queue_list, path, False,
+                                  ink=self.NP_INK, dim=self.NP_DIM)
+
+        if not upcoming and not following:
+            ctk.CTkLabel(self.np_queue_list,
+                         text="Nothing lined up.\nPlay from a list, or queue a\ntrack from its right-click menu.",
+                         justify="left", anchor="w",
+                         font=theme_ui.font("body"),
+                         text_color=self.NP_DIM).pack(anchor="w", padx=12,
+                                                      pady=18)
 
     def _lyric_wrap_width(self):
         width = self.lyrics_scroll.winfo_width()
@@ -1048,22 +1262,26 @@ class App(ctk.CTk):
         """Paint one line. States: 'active', 'past', 'next'.
 
         The active line used to jump from 21pt to 28pt, which re-flowed every
-        line below it and made the pane lurch on each change. Size is now
-        fixed and emphasis comes from colour plus a highlight pill.
+        line below it and made the pane lurch on each change. Size is fixed
+        and emphasis comes from colour plus a highlight pill.
+
+        Colours are blended against the card rather than the theme background,
+        because the lyrics now sit on a card floating over the cover.
         """
         if not (0 <= index < len(self.lyrics_labels)):
             return
-        t = self.theme
+        card = getattr(self, "_np_card", self.theme["bg"])
         label = self.lyrics_labels[index]
         try:
             if state == "active":
-                label.configure(text_color=t["text"],
-                                fg_color=self._blend(t["bg"], t["accent"], 0.32))
+                label.configure(
+                    text_color=self.NP_INK,
+                    fg_color=self._blend(card, self.theme["accent"], 0.34))
             elif state == "past":
-                label.configure(text_color=self._blend(t["bg"], t["text_secondary"], 0.55),
+                label.configure(text_color=self._blend(card, self.NP_DIM, 0.62),
                                 fg_color="transparent")
             else:
-                label.configure(text_color=t["text_secondary"], fg_color="transparent")
+                label.configure(text_color=self.NP_DIM, fg_color="transparent")
         except Exception:
             pass
 
@@ -1081,8 +1299,11 @@ class App(ctk.CTk):
             lbl.destroy()
         self.lyrics_labels.clear()
 
-        loading_lbl = ctk.CTkLabel(self.lyrics_scroll, text="Searching for lyrics...", font=ctk.CTkFont(size=24, weight="bold"), text_color=self.theme["text_secondary"])
-        loading_lbl.grid(row=0, column=0, pady=20)
+        loading_lbl = ctk.CTkLabel(self.lyrics_scroll,
+                                   text="Looking for lyrics\u2026",
+                                   font=theme_ui.font("title"),
+                                   text_color=self.NP_DIM)
+        loading_lbl.grid(row=0, column=0, pady=28)
         self.lyrics_labels.append(loading_lbl)
 
         import threading
@@ -1100,15 +1321,16 @@ class App(ctk.CTk):
 
         def message(text):
             lbl = ctk.CTkLabel(self.lyrics_scroll, text=text,
-                               font=ctk.CTkFont(size=20, weight="bold"),
-                               text_color=self.theme["text_secondary"],
-                               fg_color="transparent",
+                               font=theme_ui.font("body", size=16),
+                               text_color=self.NP_DIM, justify="left",
+                               fg_color="transparent", anchor="w",
                                wraplength=self._lyric_wrap_width())
-            lbl.grid(row=0, column=0, pady=24, sticky="ew")
+            lbl.grid(row=0, column=0, padx=16, pady=24, sticky="ew")
             self.lyrics_labels.append(lbl)
 
         if not lrc:
-            message("No lyrics found for this track.")
+            message("No lyrics found for this track.\n\nNot every release has a synced "
+                    "transcript; the cover and the queue still work.")
             return
 
         for line in lrc.split("\n"):
@@ -1144,7 +1366,7 @@ class App(ctk.CTk):
         for i, (_t, text) in enumerate(self.parsed_lyrics):
             lbl = ctk.CTkLabel(self.lyrics_scroll, text=text,
                                font=self._lyric_font(21),
-                               text_color=self.theme["text_secondary"],
+                               text_color=self.NP_DIM,
                                fg_color="transparent", corner_radius=12,
                                wraplength=wrap, justify="left", anchor="w")
             lbl.grid(row=i + 1, column=0, sticky="ew", padx=2, pady=3,
@@ -1472,19 +1694,11 @@ class App(ctk.CTk):
             self.cancel_button.configure(border_color=t["accent"],
                                          hover_color=t["surface_hover"],
                                          text_color=t["text"])
-        for name in ("np_lyrics_pane", "lyrics_scroll"):
-            widget = getattr(self, name, None)
-            if widget is not None:
-                widget.configure(fg_color=t["bg"])
-        for name in ("np_title_lbl", "np_artist_lbl"):
-            widget = getattr(self, name, None)
-            if widget is not None:
-                widget.configure(text_color=t["text"] if name.endswith("title_lbl")
-                                 else t["text_secondary"])
+        # The full-screen view keeps its own dark palette on purpose, so a
+        # theme change only has to reach its one accent-coloured control.
         if getattr(self, "np_close_btn", None) is not None:
-            self.np_close_btn.configure(fg_color=t["accent"],
-                                        hover_color=t["accent_hover"],
-                                        text_color=t["bg"])
+            self.np_close_btn.set_palette(self._np_theme(),
+                                          background=self.NP_FLOOR)
         if getattr(self, "viz_palette_dropdown", None) is not None:
             self.viz_palette_dropdown.configure(
                 fg_color=t["surface"], button_color=t["surface"],
@@ -1908,12 +2122,20 @@ class App(ctk.CTk):
                                                  fg_color="transparent")
         self.queue_list.pack(fill="both", expand=True, padx=8, pady=(0, 12))
 
-    def _queue_entry(self, path, queued):
-        row = ctk.CTkFrame(self.queue_list, fg_color="transparent", height=44)
+    def _queue_entry(self, parent, path, queued, ink=None, dim=None):
+        """One up-next row. Used by the side panel and the full-screen view,
+        which sit on different backgrounds and so pass their own ink."""
+        ink = ink or self.theme["text"]
+        dim = dim or self.theme["text_secondary"]
+        row = ctk.CTkFrame(parent, fg_color="transparent", height=44)
         row.pack(fill="x", padx=4, pady=1)
         row.pack_propagate(False)
         meta = self._queue_meta.get(path, {})
         title = meta.get("title") or os.path.basename(path)
+
+        def fit(text, n=30):
+            text = text or ""
+            return text if len(text) <= n else text[:n - 1].rstrip() + "…"
 
         if queued:
             ctk.CTkButton(row, text="✕", width=26, height=26,
@@ -1924,14 +2146,15 @@ class App(ctk.CTk):
 
         box = ctk.CTkFrame(row, fg_color="transparent")
         box.pack(side="left", fill="both", expand=True)
-        ctk.CTkLabel(box, text=title[:32], anchor="w",
+        ctk.CTkLabel(box, text=fit(title), anchor="w",
                      font=theme_ui.font("body_med"),
-                     text_color=self.theme["text"]).pack(anchor="w", pady=(5, 0))
-        ctk.CTkLabel(box, text=(meta.get("artist") or "")[:32], anchor="w",
+                     text_color=ink).pack(anchor="w", pady=(5, 0))
+        ctk.CTkLabel(box, text=fit(meta.get("artist"), 34), anchor="w",
                      font=theme_ui.font("small"),
-                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+                     text_color=dim).pack(anchor="w")
 
     def _render_queue(self):
+        self._render_np_queue()
         if getattr(self, "queue_panel", None) is None or not self.queue_visible:
             return
         for widget in self.queue_list.winfo_children():
@@ -1950,7 +2173,7 @@ class App(ctk.CTk):
                          text_color=self.theme["accent"]).pack(
                              anchor="w", padx=8, pady=(4, 2))
             for path in upcoming:
-                self._queue_entry(path, True)
+                self._queue_entry(self.queue_list, path, True)
 
         if following:
             ctk.CTkLabel(self.queue_list, text="THEN FROM THIS LIST", anchor="w",
@@ -1958,7 +2181,7 @@ class App(ctk.CTk):
                          text_color=self.theme["text_secondary"]).pack(
                              anchor="w", padx=8, pady=(12, 2))
             for path in following:
-                self._queue_entry(path, False)
+                self._queue_entry(self.queue_list, path, False)
 
         if not upcoming and not following:
             ctk.CTkLabel(self.queue_list, text="Nothing queued.",
@@ -2226,12 +2449,16 @@ class App(ctk.CTk):
             view.mark_playing(file_path)
         self._sync_now_playing_heart()
 
-        if hasattr(self, "np_title_lbl"):
-            self.np_title_lbl.configure(
-                text=(row or {}).get("title") or full_name)
-            self.np_artist_lbl.configure(
-                text=" \u00b7 ".join(x for x in ((row or {}).get("artist"),
-                                                 (row or {}).get("album")) if x))
+        bits = []
+        if (row or {}).get("year"):
+            bits.append(str(row["year"]))
+        if (row or {}).get("duration"):
+            bits.append(fmt_time(row["duration"]))
+        self._np_set_track(
+            (row or {}).get("title") or full_name,
+            " \u00b7 ".join(x for x in ((row or {}).get("artist"),
+                                        (row or {}).get("album")) if x),
+            "  \u00b7  ".join(bits))
 
         self._now_playing_row = row or {"path": file_path}
         self._push_discord(playing=True)
