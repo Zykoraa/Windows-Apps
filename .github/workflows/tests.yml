@@ -1,0 +1,54 @@
+name: Tests
+
+# The only other workflow here builds a release, and it fires on v* tags. So
+# until now nothing ran the test suite at all: it was green whenever somebody
+# remembered to type the command, and silent otherwise.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "EvesGarden/**"
+      - ".github/workflows/tests.yml"
+  pull_request:
+    paths:
+      - "EvesGarden/**"
+      - ".github/workflows/tests.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    # Windows on purpose. The app is Windows-only -- media keys, the tray
+    # icon and the frameless window all go through ctypes.windll -- so there
+    # is nothing to gain from proving it works somewhere it never runs.
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: EvesGarden/requirements.txt
+
+      - name: Install dependencies
+        working-directory: EvesGarden
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte-compile everything
+        working-directory: EvesGarden
+        # Catches syntax errors in modules no test imports, which is most of
+        # the UI.
+        run: python -m compileall -q .
+
+      - name: Run the test suite
+        working-directory: EvesGarden
+        # test_core is pure logic and always runs. test_smoke opens a real
+        # window and test_gapless opens a real audio device; both skip
+        # themselves when the runner has neither, so this stays honest rather
+        # than pretending to cover more than it did.
+        run: python -m unittest discover -s tests -v

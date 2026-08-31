@@ -285,9 +285,10 @@ class App(ctk.CTk):
         self.update_progress_loop()
         self.update_visualizer_loop()
         self.setup_overlay = None
-        if self.spotify_error:
-            # Nothing configured yet: walk the user through it rather than
-            # leaving a dead Download button and an error in a log file.
+        if self.spotify_error and not self.settings.get("setup_seen"):
+            # Offered once, not on every launch until credentials exist. That
+            # was reasonable while the app could do nothing without them.
+            self.settings.set("setup_seen", True)
             self._safe_after(450, lambda: self.open_setup(first_run=True))
 
         self._safe_after(300, self._resume_last_track)
@@ -2985,20 +2986,28 @@ class App(ctk.CTk):
                             fg_color=t["surface"])
         card.place(relx=0.5, rely=0.5, anchor="center")
 
-        ctk.CTkLabel(card, text="Connect Spotify",
-                     font=ctk.CTkFont(size=24, weight="bold"),
+        ctk.CTkLabel(card, text="Connect Spotify  (optional)",
+                     font=theme_ui.font("display", size=24),
                      text_color=t["text"]).pack(padx=44, pady=(32, 6))
+        # This used to say the app "needs" a Spotify developer app. It did,
+        # once: the downloader was disabled without one. It now searches and
+        # downloads through a source that needs no account, so saying so would
+        # be untrue -- and putting a wall of setup steps in front of somebody
+        # who does not need them is worse than untrue.
         ctk.CTkLabel(
             card, justify="left", wraplength=520, text_color=t["text_secondary"],
-            font=ctk.CTkFont(size=13),
-            text=("Eve's Garden reads track and album details from Spotify. "
-                  "It needs a free developer app of your own -- takes about a "
-                  "minute, and no card is required.\n\n"
+            font=theme_ui.font("body"),
+            text=("Searching and downloading already work. Track details come "
+                  "from " + getattr(getattr(self, "catalogue", None), "name",
+                                    "Apple") + ", which needs no account.\n\n"
+                  "Connecting Spotify adds your own library on top: your "
+                  "playlists and your liked songs. It is a free developer app "
+                  "of your own, takes about a minute, and needs no card.\n\n"
                   "1.  Open the dashboard below and sign in.\n"
                   "2.  Create app  ->  give it any name, tick the terms.\n"
                   "3.  In the app's Settings, add this Redirect URI:\n"
                   "        " + spotify_auth.redirect_uri() + "\n"
-                  "     (needed later to download playlists)\n"
+                  "     (needed to download your playlists)\n"
                   "4.  Copy the Client ID and Client Secret into the boxes.")
         ).pack(padx=44, pady=(0, 14), anchor="w")
 
