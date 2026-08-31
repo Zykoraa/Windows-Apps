@@ -115,26 +115,11 @@ def fmt_time(seconds):
     return f"{seconds // 60}:{seconds % 60:02d}"
 from player_engine import PlayerEngine
 
-THEMES = {
-    "Spotify Classic": {"bg": "#121212", "surface": "#181818", "surface_hover": "#282828", "accent": "#1DB954", "accent_hover": "#1ED760", "text": "#FFFFFF", "text_secondary": "#B3B3B3"},
-    "Catppuccin Mocha": {"bg": "#1e1e2e", "surface": "#181825", "surface_hover": "#313244", "accent": "#cba6f7", "accent_hover": "#b4befe", "text": "#cdd6f4", "text_secondary": "#bac2de"},
-    "Osaka Forest": {"bg": "#2b3339", "surface": "#323d43", "surface_hover": "#3a454a", "accent": "#a7c080", "accent_hover": "#b8d090", "text": "#d3c6aa", "text_secondary": "#9da9a0"},
-    "Dracula": {"bg": "#282a36", "surface": "#44475a", "surface_hover": "#6272a4", "accent": "#bd93f9", "accent_hover": "#ff79c6", "text": "#f8f8f2", "text_secondary": "#8be9fd"},
-    "Nord": {"bg": "#2e3440", "surface": "#3b4252", "surface_hover": "#434c5e", "accent": "#88c0d0", "accent_hover": "#8fbcbb", "text": "#eceff4", "text_secondary": "#d8dee9"},
-    "Tokyo Night": {"bg": "#1a1b26", "surface": "#24283b", "surface_hover": "#2f3549", "accent": "#7aa2f7", "accent_hover": "#9ece6a", "text": "#c0caf5", "text_secondary": "#787c99"},
-    "Gruvbox": {"bg": "#282828", "surface": "#3c3836", "surface_hover": "#504945", "accent": "#fabd2f", "accent_hover": "#fe8019", "text": "#ebdbb2", "text_secondary": "#a89984"},
-    "Rose Pine": {"bg": "#191724", "surface": "#1f1d2e", "surface_hover": "#26233a", "accent": "#ebbcba", "accent_hover": "#f6c177", "text": "#e0def4", "text_secondary": "#908caa"},
-    "Everforest": {"bg": "#272e33", "surface": "#2e383c", "surface_hover": "#374145", "accent": "#a7c080", "accent_hover": "#dbbc7f", "text": "#d3c6aa", "text_secondary": "#859289"},
-    "Solarized": {"bg": "#002b36", "surface": "#073642", "surface_hover": "#0d4a5a", "accent": "#2aa198", "accent_hover": "#b58900", "text": "#eee8d5", "text_secondary": "#93a1a1"},
-    "Synthwave": {"bg": "#1a1327", "surface": "#241b35", "surface_hover": "#32264a", "accent": "#ff2e97", "accent_hover": "#00e5ff", "text": "#f7f2ff", "text_secondary": "#a08cc4"},
-    "Monokai": {"bg": "#221f22", "surface": "#2d2a2e", "surface_hover": "#403e41", "accent": "#a9dc76", "accent_hover": "#ffd866", "text": "#fcfcfa", "text_secondary": "#939293"},
-    "Kanagawa": {"bg": "#1f1f28", "surface": "#2a2a37", "surface_hover": "#363646", "accent": "#7e9cd8", "accent_hover": "#e6c384", "text": "#dcd7ba", "text_secondary": "#727169"},
-    "Ayu Mirage": {"bg": "#1f2430", "surface": "#232834", "surface_hover": "#2d3441", "accent": "#ffcc66", "accent_hover": "#73d0ff", "text": "#cbccc6", "text_secondary": "#707a8c"},
-    "Deep Ocean": {"bg": "#0b1622", "surface": "#12212e", "surface_hover": "#1b2f40", "accent": "#4dd0e1", "accent_hover": "#80deea", "text": "#e3f2fd", "text_secondary": "#7292a8"},
-    "Ember": {"bg": "#1c1614", "surface": "#26201d", "surface_hover": "#342b26", "accent": "#ff7043", "accent_hover": "#ffab40", "text": "#f5ece7", "text_secondary": "#a38d81"},
-    "Rose Pine Dawn": {"bg": "#faf4ed", "surface": "#fffaf3", "surface_hover": "#f2e9e1", "accent": "#d7827e", "accent_hover": "#ea9d34", "text": "#575279", "text_secondary": "#797593"},
-    "Nordic Light": {"bg": "#eceff4", "surface": "#e5e9f0", "surface_hover": "#d8dee9", "accent": "#5e81ac", "accent_hover": "#81a1c1", "text": "#2e3440", "text_secondary": "#4c566a"}
-}
+# Eighteen hand-written tables of seven colours each disagreed with one
+# another in ways that showed; they are derived from three authored colours
+# apiece now. See themes.py for what was wrong and which rule replaced it.
+import themes
+from themes import THEMES
 
 ctk.set_appearance_mode("Dark")
 ctk.ThemeManager.theme["CTkFont"]["family"] = "JetBrainsMono NF"
@@ -781,7 +766,13 @@ class App(ctk.CTk):
                                         font=theme_ui.font("title"))
         self.crumb_label.pack(side="left", padx=14)
 
-        self.library_frame = ctk.CTkScrollableFrame(self.main_area, fg_color="transparent")
+        # Not "transparent": a scrollable frame keeps its own canvas, and a
+        # transparent one paints it with whatever colour it detected when it
+        # was built. After a theme change the 2px gaps between rows still
+        # showed the previous theme, which read as a dark rule under every
+        # row.
+        self.library_frame = ctk.CTkScrollableFrame(
+            self.main_area, fg_color=self.theme["bg"])
         self.library_frame.grid(row=2, column=0, sticky="nsew", padx=20, pady=(4, 6))
 
         self.library_status = ctk.CTkLabel(self.main_area, text="", anchor="w",
@@ -1553,8 +1544,9 @@ class App(ctk.CTk):
         self.url_entry.bind("<Return>", lambda e: self.start_download())
 
         self.search_timer = None
-        self.suggestions_frame = ctk.CTkScrollableFrame(self.dl_frame, height=210,
-                                                        corner_radius=15)
+        self.suggestions_frame = ctk.CTkScrollableFrame(
+            self.dl_frame, height=210, corner_radius=15,
+            fg_color=self.theme["surface"])
 
         buttons = ctk.CTkFrame(self.dl_frame, fg_color="transparent")
         buttons.grid(row=2, column=0, padx=36, pady=(2, 8), sticky="ew")
@@ -1588,14 +1580,16 @@ class App(ctk.CTk):
         # Search results: preview straight from here, download only what you
         # decide to keep.
         self.results_frame = ctk.CTkScrollableFrame(
-            self.dl_frame, corner_radius=theme_ui.RADIUS, label_text="Results")
+            self.dl_frame, corner_radius=theme_ui.RADIUS, label_text="Results",
+            fg_color=self.theme["surface"])
         self.results_frame.grid(row=3, column=0, padx=36, pady=(6, 6),
                                 sticky="nsew")
 
         # Per-track state, so a failure no longer scrolls out of the log and
         # disappears with no record of what broke.
         self.jobs_frame = ctk.CTkScrollableFrame(self.dl_frame, corner_radius=15,
-                                                 label_text="Queue")
+                                                 label_text="Queue",
+                                                 fg_color=self.theme["surface"])
         self.job_rows = {}
 
         self.log_box = ctk.CTkTextbox(self.dl_frame, corner_radius=15, height=84,
@@ -1737,9 +1731,16 @@ class App(ctk.CTk):
         self.settings.set("eq_gains", gains)
 
     def change_theme(self, choice):
+        if choice not in THEMES:
+            return
         self.current_theme_name = choice
         self.theme = THEMES[choice]
         self.settings.set("theme", choice)
+        # The dropdown updates itself when the user picks from it, but not
+        # when something else calls this, which left it naming a theme that
+        # was no longer on screen.
+        if getattr(self, "theme_dropdown", None) is not None:
+            self.theme_dropdown.set(choice)
         self.apply_theme()
 
     def apply_theme(self):
@@ -1749,11 +1750,23 @@ class App(ctk.CTk):
         title bar, transport buttons, overlays and sliders on the old palette.
         """
         t = self.theme
+        # CustomTkinter picks its own defaults from the appearance mode, and
+        # any widget we do not colour explicitly falls back to them. Pinned to
+        # "Dark", the two light themes drew a dark frame behind every
+        # transparent widget -- every row in the library had a black box round
+        # it.
+        ctk.set_appearance_mode(
+            "Light" if themes.luminance(t["bg"]) > 0.5 else "Dark")
         self.configure(fg_color=t["bg"])
 
         for name, key in (
             ("main_area", "bg"), ("title_bar", "surface"), ("bottom_bar", "surface"),
-            ("eq_frame", "surface"), ("np_overlay", "bg"), ("viz_overlay", "bg"),
+            ("eq_frame", "surface"), ("viz_overlay", "bg"),
+            # Scrolling frames have to be repainted by name: they own a canvas
+            # that keeps whatever colour it was built with.
+            ("library_frame", "bg"), ("queue_list", "surface"),
+            ("queue_panel", "surface"), ("suggestions_frame", "surface"),
+            ("results_frame", "surface"), ("jobs_frame", "surface"),
         ):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -2268,7 +2281,7 @@ class App(ctk.CTk):
                       fg_color="transparent", border_width=1,
                       command=self.queue.clear).pack(side="right")
         self.queue_list = ctk.CTkScrollableFrame(self.queue_panel,
-                                                 fg_color="transparent")
+                                                 fg_color=t["surface"])
         self.queue_list.pack(fill="both", expand=True, padx=8, pady=(0, 12))
 
     def _queue_entry(self, parent, path, queued, ink=None, dim=None,

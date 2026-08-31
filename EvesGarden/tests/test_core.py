@@ -18,7 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from library_index import (LibraryIndex, normalise_title, normalise_artist)
 from play_queue import PlayQueue
+import colorsys
 import downloader
+import themes
 
 
 class TitleNormalisation(unittest.TestCase):
@@ -271,6 +273,72 @@ class OrphanNaming(unittest.TestCase):
         self.assertEqual(stem, "Newcomers Club - David")
         self.assertEqual(downloader.sanitize_filename(stem) + ".mp3",
                          "Newcomers Club - David.mp3")
+
+
+
+class Themes(unittest.TestCase):
+    """Every palette obeys the same rules, because they are all derived.
+
+    The hand-written tables these replaced failed on all three counts: eleven
+    of eighteen paired an accent with a hover colour from a different hue
+    family, two put `surface` on the wrong side of `bg`, and the emphasis of
+    secondary text ranged from 8:1 to 3:1 depending on which theme you picked.
+    """
+
+    def test_every_theme_is_consistent(self):
+        for name, theme in themes.THEMES.items():
+            self.assertEqual(themes.problems(theme), [], name)
+
+    def test_hover_keeps_the_accent_hue(self):
+        for name, theme in themes.THEMES.items():
+            accent = colorsys.rgb_to_hsv(*_unit(theme["accent"]))
+            hover = colorsys.rgb_to_hsv(*_unit(theme["accent_hover"]))
+            if accent[1] < 0.15:
+                continue                    # a grey accent has no hue to keep
+            gap = abs(accent[0] - hover[0]) * 360
+            gap = min(gap, 360 - gap)
+            self.assertLess(gap, 25, "%s shifts hue by %.0f degrees"
+                            % (name, gap))
+
+    def test_secondary_emphasis_is_uniform(self):
+        ratios = [themes.contrast(t["text_secondary"], t["bg"])
+                  for t in themes.THEMES.values()]
+        self.assertLess(max(ratios) - min(ratios), 0.5,
+                        "secondary text carries different weight per theme")
+        for r in ratios:
+            self.assertGreaterEqual(round(r, 1), themes.SECONDARY_TARGET)
+
+    def test_elevation_is_ordered(self):
+        for name, t in themes.THEMES.items():
+            steps = [themes.luminance(t[k])
+                     for k in ("bg", "surface", "surface_hover")]
+            ordered = steps == sorted(steps) or steps == sorted(steps,
+                                                                reverse=True)
+            self.assertTrue(ordered, "%s: %s" % (name, steps))
+
+    def test_light_themes_are_still_light(self):
+        # Deriving everything from the ink must not quietly flip a theme.
+        for name in ("Rose Pine Dawn", "Nordic Light"):
+            t = themes.THEMES[name]
+            self.assertGreater(themes.luminance(t["bg"]), 0.5, name)
+            self.assertLess(themes.luminance(t["text"]), 0.5, name)
+
+    def test_build_is_pure(self):
+        first = themes.build("#101010", "#ff0000", "#ffffff")
+        second = themes.build("#101010", "#ff0000", "#ffffff")
+        self.assertEqual(first, second)
+        self.assertEqual(set(first), set(themes.KEYS))
+
+    def test_problems_catches_a_bad_palette(self):
+        broken = dict(themes.THEMES["Nord"])
+        broken["accent_hover"] = "#ffd866"      # a gold hover on a blue accent
+        broken["surface"] = broken["bg"]        # and no elevation at all
+        found = themes.problems(broken)
+        self.assertTrue(any("indistinguishable" in p for p in found), found)
+
+
+def _unit(value):
+    return tuple(int(value[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
 
 
 class Scoring(unittest.TestCase):

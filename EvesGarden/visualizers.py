@@ -88,7 +88,8 @@ class Frame:
     """Everything a mode needs to draw one frame."""
 
     __slots__ = ("canvas", "bands", "accent", "width", "height",
-                 "cx", "cy", "n", "avg", "now", "bar_width", "_palette")
+                 "cx", "cy", "n", "avg", "now", "bar_width", "_palette",
+                 "_ring")
 
     def __init__(self, canvas, bands, accent, width, height, now, palette):
         self.canvas = canvas
@@ -103,6 +104,7 @@ class Frame:
         self.now = now
         self.bar_width = width / self.n if self.n else width
         self._palette = PALETTES.get(palette, PALETTES["Accent"])
+        self._ring = None
 
     def colour(self, t=0.0):
         """Colour at position t (0..1) through the palette."""
@@ -113,6 +115,43 @@ class Frame:
 
     def band_colour(self, i):
         return self.colour(i / max(1, self.n - 1))
+
+    # ------------------------------------------------------ radial helpers
+
+    @property
+    def radius(self):
+        """Usable radius for anything drawn around the centre.
+
+        Modes used to hard-code radii -- 30, 50, 100 -- picked against the
+        full-screen canvas. On any other size they either collapsed into a
+        blob at the middle or ran off the edge.
+        """
+        return min(self.width, self.height) / 2 * 0.88
+
+    @property
+    def ring(self):
+        """The spectrum mirrored, for anything drawn round a circle.
+
+        Mapping band index straight onto angle gave every radial mode a
+        lopsided fan: the low bands are loud and the high bands quiet, so one
+        side was long spikes and the other side nothing. Mirroring makes the
+        figure symmetric, which is what these were drawn to look like, and it
+        puts the bass at the top and bottom rather than all down one side.
+        """
+        if self._ring is None:
+            half = list(self.bands)
+            self._ring = half + half[::-1]
+        return self._ring
+
+    def ring_colour(self, i):
+        """Palette position for a mirrored ring, symmetric about the centre."""
+        n = len(self.ring)
+        return self.colour(1 - abs(1 - 2 * i / max(1, n - 1)))
+
+    @staticmethod
+    def px(value, floor=1):
+        """A canvas width or radius as a sane integer."""
+        return max(floor, int(round(value)))
 
 
 def draw(canvas, mode, bands, accent, width, height, now, palette="Accent"):
@@ -149,13 +188,20 @@ def _mirrored(f):
 
 @visualizer("Circular")
 def _circular(f):
-    max_r = min(f.width, f.height) / 2 - 20
-    for i, energy in enumerate(f.bands):
-        angle = i * (2 * math.pi / f.n)
-        r = 50 + energy * max_r
-        f.canvas.create_line(f.cx, f.cy, f.cx + math.cos(angle) * r,
-                             f.cy + math.sin(angle) * r,
-                             fill=f.band_colour(i), width=4)
+    """Bars radiating from an inner ring, mirrored so the figure is even."""
+    ring = f.ring
+    n = len(ring)
+    inner = f.radius * 0.32
+    span = f.radius - inner
+    width = f.px(2 * math.pi * inner / n * 0.85)
+    for i, energy in enumerate(ring):
+        angle = i * (2 * math.pi / n) - math.pi / 2
+        ca, sa = math.cos(angle), math.sin(angle)
+        r = inner + energy * span
+        f.canvas.create_line(f.cx + ca * inner, f.cy + sa * inner,
+                             f.cx + ca * r, f.cy + sa * r,
+                             fill=f.ring_colour(i), width=width,
+                             capstyle="round")
 
 
 @visualizer("Waveform")
@@ -183,107 +229,154 @@ def _particles(f):
 
 @visualizer("Pulse")
 def _pulse(f):
-    span = min(f.width, f.height)
-    r = 100 + f.avg * span / 2
-    f.canvas.create_oval(f.cx - r, f.cy - r, f.cx + r, f.cy + r,
-                         outline=f.colour(0.8), width=max(2, f.avg * 20))
-    r2 = 50 + f.avg * span / 3
-    f.canvas.create_oval(f.cx - r2, f.cy - r2, f.cx + r2, f.cy + r2,
-                         outline=f.colour(0.3), width=max(1, f.avg * 10))
+    """Concentric rings breathing with the overall level."""
+    for weight, tone in ((1.0, 0.9), (0.68, 0.6), (0.4, 0.32)):
+        r = f.radius * weight * (0.30 + 0.70 * f.avg)
+        if r < 2:
+            continue
+        f.canvas.create_oval(f.cx - r, f.cy - r, f.cx + r, f.cy + r,
+                             outline=f.colour(tone),
+                             width=f.px(2 + f.avg * f.radius * 0.05))
 
 
 @visualizer("Radar")
 def _radar(f):
-    t = f.now * 2
-    max_r = min(f.width, f.height) / 2
-    for i, energy in enumerate(f.bands):
-        angle = i * (2 * math.pi / f.n) + t
-        r = energy * max_r
-        f.canvas.create_line(f.cx, f.cy, f.cx + math.cos(angle) * r,
-                             f.cy + math.sin(angle) * r,
-                             fill=f.band_colour(i), width=2)
+    """A rotating polar plot of the spectrum, with a sweep line."""
+    ring = f.ring
+    n = len(ring)
+    spin = f.now * 0.9
+    f.canvas.create_oval(f.cx - f.radius, f.cy - f.radius,
+                         f.cx + f.radius, f.cy + f.radius,
+                         outline=f.colour(0.15), width=1)
+    points = []
+    for i, energy in enumerate(ring):
+        angle = i * (2 * math.pi / n) + spin
+        r = f.radius * (0.12 + 0.88 * energy)
+        points.extend([f.cx + math.cos(angle) * r,
+                       f.cy + math.sin(angle) * r])
+    if len(points) >= 6:
+        f.canvas.create_polygon(points, fill="", outline=f.colour(0.75),
+                                width=f.px(2), smooth=True)
+    f.canvas.create_line(f.cx, f.cy,
+                         f.cx + math.cos(spin) * f.radius,
+                         f.cy + math.sin(spin) * f.radius,
+                         fill=f.colour(1.0), width=f.px(2))
 
 
 @visualizer("Starburst")
 def _starburst(f):
-    max_r = min(f.width, f.height) / 2
-    for i, energy in enumerate(f.bands):
-        angle = i * (2 * math.pi / f.n)
-        r_in = 30 + energy * 50
-        r_out = r_in + energy * max_r
-        f.canvas.create_line(f.cx + math.cos(angle) * r_in,
-                             f.cy + math.sin(angle) * r_in,
-                             f.cx + math.cos(angle) * r_out,
-                             f.cy + math.sin(angle) * r_out,
-                             fill=f.band_colour(i), width=max(1, int(energy * 5)))
+    """Spikes out from a ring, with a shorter set pointing back in."""
+    ring = f.ring
+    n = len(ring)
+    inner = f.radius * 0.30
+    for i, energy in enumerate(ring):
+        angle = i * (2 * math.pi / n) - math.pi / 2
+        ca, sa = math.cos(angle), math.sin(angle)
+        out = inner + energy * (f.radius - inner)
+        back = inner - energy * inner * 0.55
+        f.canvas.create_line(f.cx + ca * back, f.cy + sa * back,
+                             f.cx + ca * out, f.cy + sa * out,
+                             fill=f.ring_colour(i),
+                             width=f.px(1 + energy * 3), capstyle="round")
 
 
 @visualizer("Galaxy")
 def _galaxy(f):
-    span = min(f.width, f.height)
-    for i, energy in enumerate(f.bands):
-        angle = i * (2 * math.pi / f.n) + f.now * (0.5 + energy)
-        r = 10 + i * span / 2 / f.n + energy * 100
-        x = f.cx + math.cos(angle) * r
-        y = f.cy + math.sin(angle) * r
-        sz = max(2, energy * 15)
-        f.canvas.create_oval(x - sz, y - sz, x + sz, y + sz,
-                             fill=f.band_colour(i), outline="")
+    """Two spiral arms on a tilted disc, sized by the spectrum."""
+    ring = f.ring
+    n = len(ring)
+    for arm in (0.0, math.pi):
+        for i, energy in enumerate(ring):
+            t = i / n
+            angle = arm + t * 2.4 * 2 * math.pi + f.now * 0.35
+            r = f.radius * (0.08 + 0.92 * t)
+            x = f.cx + math.cos(angle) * r
+            y = f.cy + math.sin(angle) * r * 0.62
+            size = f.px(1 + energy * 6)
+            f.canvas.create_oval(x - size, y - size, x + size, y + size,
+                                 fill=f.ring_colour(i), outline="")
 
 
 @visualizer("Fire")
 def _fire(f):
+    """Flames across the whole width, height following each band."""
     for i, energy in enumerate(f.bands):
         x = i * f.bar_width + f.bar_width / 2
-        flame_h = energy * f.height
-        for _ in range(int(energy * 10)):
-            fx = x + random.uniform(-15, 15)
-            fy = f.height - random.uniform(0, flame_h)
-            sz = random.uniform(2, 8)
-            f.canvas.create_oval(fx - sz, fy - sz, fx + sz, fy + sz,
-                                 fill=f.colour(1 - (fy / f.height)), outline="")
+        flame = energy * f.height * 0.95
+        for _ in range(max(1, int(energy * 9))):
+            spread = f.bar_width * 1.4
+            climb = random.random() ** 0.6
+            fx = x + random.uniform(-spread, spread)
+            fy = f.height - climb * flame
+            size = max(1.5, (1 - climb) * f.bar_width * 0.9 + 1)
+            f.canvas.create_oval(fx - size, fy - size, fx + size, fy + size,
+                                 fill=f.colour(climb), outline="")
 
 
 @visualizer("Matrix")
 def _matrix(f):
+    """Rain: each column falls at its own band's pace, in fading dashes.
+
+    This drew a bar per band before, which made it a slightly taller copy of
+    Standard Bars rather than a mode of its own.
+    """
+    dash = max(4.0, f.height / 26)
     for i, energy in enumerate(f.bands):
         x = i * f.bar_width + f.bar_width / 2
-        y = (1 - energy) * f.height
-        f.canvas.create_line(x, y, x, y + energy * 200,
-                             fill=f.band_colour(i), width=4)
+        speed = 40 + energy * 320
+        head = ((f.now * speed) + i * 61) % (f.height + dash * 8)
+        trail = int(3 + energy * 9)
+        for k in range(trail):
+            y = head - k * dash * 1.6
+            if y < -dash or y > f.height:
+                continue
+            f.canvas.create_line(x, y, x, y - dash * 0.7,
+                                 fill=f.colour(1 - k / trail),
+                                 width=f.px(f.bar_width * 0.4))
 
 
 @visualizer("Hexagon")
 def _hexagon(f):
-    radius = min(f.width, f.height) / 3
+    """A hex frame with bars standing off each edge, along its normal."""
+    r = f.radius * 0.62
+    per = max(1, f.n // 6)
     for h in range(6):
-        a1, a2 = h * math.pi / 3, (h + 1) * math.pi / 3
-        x1, y1 = f.cx + math.cos(a1) * radius, f.cy + math.sin(a1) * radius
-        x2, y2 = f.cx + math.cos(a2) * radius, f.cy + math.sin(a2) * radius
-        f.canvas.create_line(x1, y1, x2, y2, fill=f.colour(h / 5), width=2)
-        for i, energy in enumerate(f.bands):
-            if i % 6 != h:
-                continue
-            t = (i // 6) / max(1, f.n // 6)
-            px, py = x1 + (x2 - x1) * t, y1 + (y2 - y1) * t
-            dx, dy = math.cos(a1 + math.pi / 6), math.sin(a1 + math.pi / 6)
-            f.canvas.create_line(px, py, px + dx * energy * 100,
-                                 py + dy * energy * 100,
-                                 fill=f.band_colour(i), width=3)
+        a1 = h * math.pi / 3 - math.pi / 2
+        a2 = (h + 1) * math.pi / 3 - math.pi / 2
+        x1, y1 = f.cx + math.cos(a1) * r, f.cy + math.sin(a1) * r
+        x2, y2 = f.cx + math.cos(a2) * r, f.cy + math.sin(a2) * r
+        f.canvas.create_line(x1, y1, x2, y2, fill=f.colour(0.25),
+                             width=f.px(2))
+        mx, my = (x1 + x2) / 2 - f.cx, (y1 + y2) / 2 - f.cy
+        length = math.hypot(mx, my) or 1.0
+        nx, ny = mx / length, my / length
+        for k in range(per):
+            index = (h * per + k) % f.n
+            energy = f.bands[index]
+            t = (k + 0.5) / per
+            px_, py_ = x1 + (x2 - x1) * t, y1 + (y2 - y1) * t
+            reach = energy * (f.radius - r) * 0.95
+            f.canvas.create_line(px_, py_, px_ + nx * reach, py_ + ny * reach,
+                                 fill=f.band_colour(index), width=f.px(3),
+                                 capstyle="round")
 
 
 @visualizer("Hyperspace")
 def _hyperspace(f):
-    t = f.now * 5
-    limit = min(f.width, f.height) / 2
-    for i, energy in enumerate(f.bands):
-        angle = i * (2 * math.pi / f.n)
-        dist = (t * (i + 1) * 10) % limit
-        x = f.cx + math.cos(angle) * dist
-        y = f.cy + math.sin(angle) * dist
-        sz = max(1, (dist / 100) * energy * 10)
-        f.canvas.create_oval(x - sz, y - sz, x + sz, y + sz,
-                             fill=f.colour(dist / limit), outline="")
+    """Streaks pulled out from the centre, faster where the band is loud."""
+    ring = f.ring
+    n = len(ring)
+    for i, energy in enumerate(ring):
+        angle = i * (2 * math.pi / n)
+        phase = ((f.now * (0.25 + energy * 1.4)) + i * 0.137) % 1.0
+        r1 = f.radius * phase
+        r0 = max(0.0, r1 - f.radius * (0.06 + energy * 0.22))
+        ca, sa = math.cos(angle), math.sin(angle)
+        f.canvas.create_line(f.cx + ca * r0, f.cy + sa * r0,
+                             f.cx + ca * r1, f.cy + sa * r1,
+                             fill=f.colour(phase),
+                             width=f.px(1 + phase * energy * 4),
+                             capstyle="round")
 
 
 @visualizer("Infinity")
@@ -312,15 +405,19 @@ def _ekg(f):
 
 @visualizer("Vortex")
 def _vortex(f):
-    t = f.now * 3
-    step = min(f.width, f.height) / 2 / f.n
-    for i, energy in enumerate(f.bands):
-        angle = i * 0.5 + t
-        r = i * step + energy * 50
-        x = f.cx + math.cos(angle) * r
-        y = f.cy + math.sin(angle) * r
-        f.canvas.create_oval(x - 2, y - 2, x + 2, y + 2,
-                             fill=f.band_colour(i), outline="")
+    """A spiral drawn as one continuous ribbon rather than loose dots."""
+    ring = f.ring
+    n = len(ring)
+    points = []
+    for i, energy in enumerate(ring):
+        t = i / n
+        angle = t * 5.2 * math.pi + f.now * 1.1
+        r = f.radius * (0.06 + 0.94 * t) * (0.72 + 0.28 * energy)
+        points.extend([f.cx + math.cos(angle) * r,
+                       f.cy + math.sin(angle) * r])
+    if len(points) >= 6:
+        f.canvas.create_line(*points, fill=f.colour(0.7), width=f.px(2),
+                             smooth=True, capstyle="round")
 
 
 # --------------------------------------------------------------- new modes
@@ -396,17 +493,19 @@ def _helix(f):
 def _kaleidoscope(f):
     """One wedge of bars, mirrored around the centre."""
     wedges = 8
-    span = min(f.width, f.height) / 2 - 10
+    inner = f.radius * 0.16
     for w in range(wedges):
         base = w * 2 * math.pi / wedges + f.now * 0.25
         flip = -1 if w % 2 else 1
         for i, energy in enumerate(f.bands):
-            a = base + flip * (i / f.n) * (2 * math.pi / wedges)
-            r0 = span * 0.18
-            r1 = r0 + energy * span * 0.78
-            f.canvas.create_line(f.cx + math.cos(a) * r0, f.cy + math.sin(a) * r0,
-                                 f.cx + math.cos(a) * r1, f.cy + math.sin(a) * r1,
-                                 fill=f.band_colour(i), width=3)
+            angle = base + flip * (i / f.n) * (2 * math.pi / wedges)
+            r1 = inner + energy * (f.radius - inner)
+            f.canvas.create_line(f.cx + math.cos(angle) * inner,
+                                 f.cy + math.sin(angle) * inner,
+                                 f.cx + math.cos(angle) * r1,
+                                 f.cy + math.sin(angle) * r1,
+                                 fill=f.band_colour(i), width=f.px(3),
+                                 capstyle="round")
 
 
 @visualizer("Rainfall")
@@ -425,21 +524,32 @@ def _rainfall(f):
 
 @visualizer("Constellation")
 def _constellation(f):
-    """Points on a slow orbit, linked when they drift close together."""
-    pts = []
-    span = min(f.width, f.height) * 0.42
-    for i, energy in enumerate(f.bands):
-        a = i * (2 * math.pi / f.n) + f.now * 0.22
-        r = span * (0.35 + 0.65 * energy)
-        pts.append((f.cx + math.cos(a) * r, f.cy + math.sin(a) * r, energy, i))
-    for i, (x1, y1, e1, bi) in enumerate(pts):
-        for x2, y2, _e2, _bj in pts[i + 1:]:
-            if math.hypot(x2 - x1, y2 - y1) < span * 0.55:
-                f.canvas.create_line(x1, y1, x2, y2, fill=f.colour(0.3), width=1)
-    for x, y, e, bi in pts:
-        sz = 2 + e * 9
-        f.canvas.create_oval(x - sz, y - sz, x + sz, y + sz,
-                             fill=f.band_colour(bi), outline="")
+    """Points on a slow orbit, linked to the neighbours they drift near."""
+    ring = f.ring
+    n = len(ring)
+    # Sparse on purpose. One point per band drew a dotted outline of a circle,
+    # which reads as a smudge rather than as stars.
+    stars = 26
+    points = []
+    for s in range(stars):
+        i = int(s * n / stars)
+        energy = ring[i]
+        angle = s * (2 * math.pi / stars) + f.now * 0.22
+        r = f.radius * (0.32 + 0.68 * energy)
+        points.append((f.cx + math.cos(angle) * r,
+                       f.cy + math.sin(angle) * r, energy, i))
+    near = f.radius * 0.42
+    # Only the next few neighbours: every pair is quadratic, and the ring is
+    # twice as long as the band list it came from.
+    for i, (x1, y1, _e, _b) in enumerate(points):
+        for x2, y2, _e2, _b2 in points[i + 1:i + 3]:
+            if math.hypot(x2 - x1, y2 - y1) < near:
+                f.canvas.create_line(x1, y1, x2, y2, fill=f.colour(0.25),
+                                     width=1)
+    for x, y, energy, i in points:
+        size = f.px(1.5 + energy * 7)
+        f.canvas.create_oval(x - size, y - size, x + size, y + size,
+                             fill=f.ring_colour(i), outline="")
 
 
 @visualizer("Tunnel")
@@ -459,17 +569,30 @@ def _tunnel(f):
 
 @visualizer("Bloom")
 def _bloom(f):
-    """Petals opening from the centre -- one per band."""
-    span = min(f.width, f.height) * 0.42
-    for i, energy in enumerate(f.bands):
-        a = i * (2 * math.pi / f.n) + f.now * 0.18
-        reach = span * (0.25 + energy * 0.9)
-        w = reach * 0.30
-        tipx, tipy = f.cx + math.cos(a) * reach, f.cy + math.sin(a) * reach
-        lx, ly = f.cx + math.cos(a + 0.5) * w, f.cy + math.sin(a + 0.5) * w
-        rx, ry = f.cx + math.cos(a - 0.5) * w, f.cy + math.sin(a - 0.5) * w
-        f.canvas.create_polygon([f.cx, f.cy, lx, ly, tipx, tipy, rx, ry],
-                                fill=f.band_colour(i), outline="", smooth=True)
+    """Petals opening from the centre -- one per band, mirrored."""
+    ring = f.ring
+    n = len(ring)
+    # Sampled, not one petal per band: ninety-six of them overlapped into a
+    # single blob, which is the opposite of a flower.
+    petals = 15
+    for p in range(petals):
+        i = int(p * n / petals)
+        energy = ring[i]
+        angle = p * (2 * math.pi / petals) + f.now * 0.18
+        reach = f.radius * (0.30 + energy * 0.70)
+        # A fixed base width, not one scaled by reach: petals sized off their
+        # own length buried every short one inside its neighbours, so the
+        # flower came out as a spiky blob.
+        w = f.radius * 0.20
+        tip_x = f.cx + math.cos(angle) * reach
+        tip_y = f.cy + math.sin(angle) * reach
+        spread = math.pi / petals
+        lx = f.cx + math.cos(angle + spread) * w
+        ly = f.cy + math.sin(angle + spread) * w
+        rx = f.cx + math.cos(angle - spread) * w
+        ry = f.cy + math.sin(angle - spread) * w
+        f.canvas.create_polygon([f.cx, f.cy, lx, ly, tip_x, tip_y, rx, ry],
+                                fill=f.ring_colour(i), outline="", smooth=True)
 
 
 @visualizer("Grid Pulse")
@@ -477,15 +600,17 @@ def _grid(f):
     """A cell matrix lighting up column by column with the spectrum."""
     rows = 8
     cell_h = f.height / rows
+    # Fixed 3px gaps ate the whole cell once the columns got narrow, which
+    # left the mode rendering as a field of hairlines.
+    gap_x = min(3.0, f.bar_width * 0.22)
+    gap_y = min(3.0, cell_h * 0.18)
     for i, energy in enumerate(f.bands):
-        lit = int(energy * rows + 0.5)
-        for r in range(rows):
-            if r >= lit:
-                continue
-            y1 = f.height - (r + 1) * cell_h + 3
-            y2 = f.height - r * cell_h - 3
-            x0 = i * f.bar_width + 3
-            f.canvas.create_rectangle(x0, y1, x0 + f.bar_width - 6, y2,
+        x0 = i * f.bar_width + gap_x
+        x1 = x0 + f.bar_width - gap_x * 2
+        for r in range(int(energy * rows + 0.5)):
+            y1 = f.height - (r + 1) * cell_h + gap_y
+            y2 = f.height - r * cell_h - gap_y
+            f.canvas.create_rectangle(x0, y1, x1, y2,
                                       fill=f.colour(r / max(1, rows - 1)),
                                       outline="")
 
@@ -540,17 +665,18 @@ def _lissajous(f):
 
 @visualizer("Comet Trail")
 def _comet(f):
-    """A head orbiting with a fading tail behind it."""
-    span = min(f.width, f.height) * 0.36
-    tail = 26
+    """A head on a wide orbit with a fading tail behind it."""
+    tail = 34
+    rx, ry = f.width * 0.38, f.height * 0.36
     for k in range(tail):
-        t = f.now * 1.5 - k * 0.045
+        # A wider step: at 0.05 radians the whole tail covered an eighth of
+        # the orbit and the dots simply overlapped into a lump.
+        t = f.now * 1.1 - k * 0.11
         energy = f.bands[(k * 3) % f.n]
-        r = span * (0.85 + energy * 0.5)
-        x = f.cx + math.cos(t) * r
-        y = f.cy + math.sin(t * 1.3) * r * 0.75
-        sz = (tail - k) / tail * (4 + energy * 12)
-        f.canvas.create_oval(x - sz, y - sz, x + sz, y + sz,
+        x = f.cx + math.cos(t) * rx * (0.85 + energy * 0.3)
+        y = f.cy + math.sin(t * 1.4) * ry * (0.85 + energy * 0.3)
+        size = (tail - k) / tail * (2 + energy * 7) + 1
+        f.canvas.create_oval(x - size, y - size, x + size, y + size,
                              fill=f.colour(1 - k / tail), outline="")
 
 
@@ -571,10 +697,12 @@ def _wall(f):
 @visualizer("Sunburst")
 def _sunburst(f):
     """Wedges radiating from the centre, sized by band."""
-    span = min(f.width, f.height) / 2 - 8
-    step = 360 / f.n
-    for i, energy in enumerate(f.bands):
-        r = span * (0.22 + energy * 0.78)
+    ring = f.ring
+    n = len(ring)
+    step = 360.0 / n
+    for i, energy in enumerate(ring):
+        r = f.radius * (0.22 + energy * 0.78)
         f.canvas.create_arc(f.cx - r, f.cy - r, f.cx + r, f.cy + r,
-                            start=i * step + f.now * 8, extent=step * 0.82,
-                            fill=f.band_colour(i), outline="", style="pieslice")
+                            start=i * step + f.now * 8, extent=step * 0.86,
+                            fill=f.ring_colour(i), outline="",
+                            style="pieslice")
