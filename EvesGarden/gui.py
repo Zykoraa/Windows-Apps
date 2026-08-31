@@ -222,7 +222,7 @@ class App(ctk.CTk):
         self._refresh_user_client()
 
         self.queue = PlayQueue(
-            on_change=lambda: self._safe_after(0, self._render_queue))
+            on_change=lambda: self._safe_after(0, self._queue_changed))
         self.queue_visible = False
         self._queue_meta = {}
 
@@ -241,6 +241,11 @@ class App(ctk.CTk):
         # Deliberately not wiring visualizer_callback: the engine exposes
         # smoothed_bands and the UI samples it on its own clock.
         self.player.on_track_end_callback = self.on_track_end
+        # Fires on the audio thread when the engine rolls into the preloaded
+        # track by itself, so it has to be handed straight to the UI thread.
+        self.player.on_track_advanced_callback = (
+            lambda path: self._safe_after(0, self._on_gapless_advance, path))
+        self.player.gapless = bool(self.settings.get("gapless", True))
 
         self.library_view = self.settings.get("library_view") or "Songs"
         self.library_sort = self.settings.get("library_sort") or "Title"
@@ -359,6 +364,7 @@ class App(ctk.CTk):
 
     def stop_playback(self):
         self.player.stop()
+        self.player.clear_preload()
         self.play_btn.set_glyph("play")
         self.progress_slider.set(0.0)
         self.progress_slider.set_buffered(0.0)
@@ -564,6 +570,57 @@ class App(ctk.CTk):
 
     def on_track_end(self):
         self._safe_after(0, self.play_next)
+
+    # ------------------------------------------------------------- gapless
+
+    # Far enough ahead to absorb a slow decode, late enough that skipping
+    # through a list does not decode a track per skip.
+    PRELOAD_LEAD = 25.0
+
+    def _queue_changed(self):
+        self._render_queue()
+        # Whatever was decoded ahead may no longer be what plays next.
+        self._maybe_preload_next(force=True)
+
+    def _current_path(self):
+        if 0 <= self.current_index < len(self.current_playlist):
+            return self.current_playlist[self.current_index]
+        return None
+
+    def _maybe_preload_next(self, force=False):
+        """Decode the next track shortly before this one runs out.
+
+        Not from the start of it: a decode costs a few hundred milliseconds
+        and tens of megabytes, and most of that would be thrown away every
+        time somebody skips through a list.
+        """
+        if not self.player.gapless or self.player.stream is not None:
+            return
+        duration = self.player.get_duration()
+        if duration <= 0:
+            return
+        if not force and duration - self.player.get_position() > self.PRELOAD_LEAD:
+            return
+        nxt = self.queue.peek_next(shuffle=self.shuffle, repeat=self.repeat,
+                                   current=self._current_path())
+        if nxt:
+            self.player.preload(nxt)
+
+    def _on_gapless_advance(self, path):
+        """The engine moved to the next track without stopping the stream.
+
+        Everything play_file does apart from the loading, which has already
+        happened -- calling play_file here would stop the stream and put back
+        the gap this exists to remove. The queue still has to be consumed,
+        and it hands back the same track because peek_next committed to it.
+        """
+        if not path:
+            return
+        self.queue.next_path(shuffle=self.shuffle, repeat=self.repeat,
+                             current=self._current_path())
+        if path in self.current_playlist:
+            self.current_index = self.current_playlist.index(path)
+        self._begin_track(path)
 
     def extract_album_art(self, file_path):
         """Decode cover art on a worker thread.
@@ -2670,6 +2727,18 @@ class App(ctk.CTk):
         self.play_file(file_path)
 
     def play_file(self, file_path):
+        """Show a track and start decoding it."""
+        self._begin_track(file_path)
+        threading.Thread(target=self._load_and_play, args=(file_path,),
+                         daemon=True).start()
+
+    def _begin_track(self, file_path):
+        """Everything about starting a track except the audio.
+
+        Split out because gapless advance needs all of this and none of the
+        loading: the engine has already switched buffers by the time it says
+        so.
+        """
         full_name = os.path.splitext(os.path.basename(file_path))[0]
         try:
             matches = [t for t in self.index.tracks() if t["path"] == file_path]
@@ -2715,7 +2784,6 @@ class App(ctk.CTk):
         self._push_discord(playing=True)
         self._ensure_cover_url(file_path, row)
         self.play_btn.set_glyph("pause")
-        threading.Thread(target=self._load_and_play, args=(file_path,), daemon=True).start()
         # Search lyrics with the full name -- `filename` is truncated to 50
         # characters with an ellipsis for display, which never matched.
         self.fetch_lyrics(full_name)
@@ -3070,6 +3138,7 @@ class App(ctk.CTk):
 
             current_time = self.player.get_position()
             self.time_elapsed.configure(text=fmt_time(current_time))
+            self._maybe_preload_next()
 
             # Re-push every ~15s so Discord's progress bar tracks seeks.
             self._discord_tick += 1

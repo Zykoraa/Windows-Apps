@@ -400,6 +400,78 @@ class Suggestions(unittest.TestCase):
             self.seed(), [{"name": "no id"}]), [])
 
 
+
+class QueuePeek(unittest.TestCase):
+    """peek_next has to commit, or preloading is worse than useless.
+
+    The player decodes the next track before the current one ends. If asking
+    "what is next" a second time could answer differently -- which it can with
+    shuffle on -- then the track that was decoded is not the track that plays,
+    and the gap comes back with a wasted decode on top.
+    """
+
+    def queue(self, paths=("a", "b", "c", "d", "e"), start="a"):
+        q = PlayQueue()
+        q.set_context(list(paths), start=start)
+        return q
+
+    def test_peek_does_not_consume(self):
+        q = self.queue()
+        q.add(["x"])
+        self.assertEqual(q.peek_next(current="a"), "x")
+        self.assertEqual(q.upcoming, ["x"], "peek ate the queued track")
+        self.assertEqual(q.next_path(current="a"), "x")
+        self.assertEqual(q.upcoming, [])
+
+    def test_peek_is_stable_under_shuffle(self):
+        q = self.queue()
+        first = q.peek_next(shuffle=True, current="a")
+        for _ in range(20):
+            self.assertEqual(q.peek_next(shuffle=True, current="a"), first)
+        self.assertEqual(q.next_path(shuffle=True, current="a"), first)
+
+    def test_next_matches_the_peek_in_order(self):
+        q = self.queue()
+        self.assertEqual(q.peek_next(current="a"), "b")
+        self.assertEqual(q.next_path(current="a"), "b")
+        self.assertEqual(q.peek_next(current="b"), "c")
+        self.assertEqual(q.next_path(current="b"), "c")
+
+    def test_queueing_something_invalidates_the_peek(self):
+        q = self.queue()
+        self.assertEqual(q.peek_next(current="a"), "b")
+        q.add(["late"], next_up=True)
+        self.assertEqual(q.peek_next(current="a"), "late")
+        self.assertEqual(q.next_path(current="a"), "late")
+
+    def test_changing_shuffle_invalidates_the_peek(self):
+        q = self.queue()
+        self.assertEqual(q.peek_next(current="a"), "b")
+        # A different question deserves a fresh answer.
+        again = q.peek_next(shuffle=True, current="a")
+        self.assertEqual(q.next_path(shuffle=True, current="a"), again)
+
+    def test_repeat_peeks_the_same_track(self):
+        q = self.queue()
+        self.assertEqual(q.peek_next(repeat=True, current="c"), "c")
+        self.assertEqual(q.next_path(repeat=True, current="c"), "c")
+
+    def test_peek_on_an_empty_queue(self):
+        q = PlayQueue()
+        self.assertIsNone(q.peek_next(current=None))
+        self.assertIsNone(q.next_path(current=None))
+
+    def test_context_cursor_follows_a_peeked_shuffle(self):
+        q = self.queue()
+        chosen = q.peek_next(shuffle=True, current="a")
+        q.next_path(shuffle=True, current="a")
+        # The next hop should continue from where shuffle landed.
+        self.assertEqual(q.context_after(1),
+                         [["a", "b", "c", "d", "e"][
+                             ["a", "b", "c", "d", "e"].index(chosen) + 1]]
+                         if chosen != "e" else [])
+
+
 class Scoring(unittest.TestCase):
     """The YouTube candidate ranking that decides which version you get."""
 

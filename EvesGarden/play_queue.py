@@ -21,12 +21,21 @@ class PlayQueue:
         self._context = []       # the list you were browsing
         self._context_index = -1
         self.history = []
+        # What peek_next() last committed to, as (source, path, args). The
+        # decision has to be made once and remembered: with shuffle on, asking
+        # twice gives two different answers, so the track that gets preloaded
+        # would not be the track that plays.
+        self._peeked = None
 
     # ------------------------------------------------------------- mutation
+
+    def _forget_peek(self):
+        self._peeked = None
 
     def set_context(self, paths, start=None):
         """Replace the browsing list, optionally starting at one track."""
         with self._lock:
+            self._forget_peek()
             self._context = list(paths)
             self._context_index = (
                 self._context.index(start)
@@ -38,6 +47,7 @@ class PlayQueue:
         if isinstance(paths, str):
             paths = [paths]
         with self._lock:
+            self._forget_peek()
             if next_up:
                 self._explicit[0:0] = list(paths)
             else:
@@ -46,6 +56,7 @@ class PlayQueue:
 
     def remove(self, path):
         with self._lock:
+            self._forget_peek()
             if path in self._explicit:
                 self._explicit.remove(path)
         self._changed()
@@ -53,6 +64,7 @@ class PlayQueue:
     def move(self, path, delta):
         """Nudge a queued track up or down."""
         with self._lock:
+            self._forget_peek()
             if path not in self._explicit:
                 return
             i = self._explicit.index(path)
@@ -63,38 +75,67 @@ class PlayQueue:
 
     def clear(self):
         with self._lock:
+            self._forget_peek()
             self._explicit.clear()
         self._changed()
 
     # ------------------------------------------------------------ traversal
 
+    def _decide(self, shuffle, repeat, current):
+        """What plays next, as (source, path), touching nothing.
+
+        Split out from next_path so the same answer can be handed to a
+        preloader without consuming anything.
+        """
+        if self._explicit:
+            return ("queue", self._explicit[0])
+        if not self._context:
+            return ("none", None)
+        if repeat and current:
+            return ("repeat", current)
+        if shuffle:
+            if len(self._context) == 1:
+                return ("shuffle", self._context[0])
+            choice = current
+            while choice == current:
+                choice = random.choice(self._context)
+            return ("shuffle", choice)
+        index = self._context_index + 1
+        if index >= len(self._context):
+            index = 0
+        return ("context", self._context[index])
+
+    def peek_next(self, shuffle=False, repeat=False, current=None):
+        """What next_path() will return, without consuming it.
+
+        The answer is committed, so the player can decode that track ahead of
+        time and be certain it is the one that will play.
+        """
+        args = (shuffle, repeat, current)
+        with self._lock:
+            if self._peeked is None or self._peeked[2] != args:
+                self._peeked = self._decide(*args) + (args,)
+            return self._peeked[1]
+
     def next_path(self, shuffle=False, repeat=False, current=None):
         """What to play next, consuming the explicit queue first."""
+        args = (shuffle, repeat, current)
         with self._lock:
             if current:
                 self.history.append(current)
                 del self.history[:-100]
 
-            if self._explicit:
-                return self._explicit.pop(0)
+            if self._peeked is not None and self._peeked[2] == args:
+                source, path = self._peeked[0], self._peeked[1]
+            else:
+                source, path = self._decide(*args)
+            self._peeked = None
 
-            if not self._context:
-                return None
-            if repeat and current:
-                return current
-            if shuffle:
-                if len(self._context) == 1:
-                    return self._context[0]
-                choice = current
-                while choice == current:
-                    choice = random.choice(self._context)
-                self._context_index = self._context.index(choice)
-                return choice
-
-            self._context_index += 1
-            if self._context_index >= len(self._context):
-                self._context_index = 0
-            return self._context[self._context_index]
+            if source == "queue" and path in self._explicit:
+                self._explicit.remove(path)
+            elif source in ("shuffle", "context") and path in self._context:
+                self._context_index = self._context.index(path)
+            return path
 
     def previous_path(self):
         """Step back through what actually played, not the list order."""

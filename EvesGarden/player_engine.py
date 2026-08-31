@@ -76,6 +76,10 @@ class PlayerEngine:
         self.eq_gains = [1.0] * 10
         self.visualizer_callback = None
         self.on_track_end_callback = None
+        # Fired from the audio thread when one track rolls into the next
+        # without the stream stopping. The listener must marshal to its own
+        # thread; nothing here is safe to touch a UI from.
+        self.on_track_advanced_callback = None
         # The UI polls smoothed_bands from its own thread. The audio thread
         # must never call into Tk: doing so made it block on the Tcl lock
         # every chunk, which starved playback down to a few percent of
@@ -92,6 +96,12 @@ class PlayerEngine:
         self._stop_flag = threading.Event()
         self._load_lock = threading.Lock()
         self._load_generation = 0
+
+        # The next track, decoded while this one is still playing.
+        self.gapless = True
+        self._preload_lock = threading.Lock()
+        self._preload_path = None
+        self._preloaded = None
 
         self._eq_active = False
         self._filters = []
@@ -176,6 +186,88 @@ class PlayerEngine:
                 continue
         return 44100, 2
 
+    @staticmethod
+    def _ensure_ffmpeg():
+        """Point pydub at the bundled binaries."""
+        base_path = (
+            sys._MEIPASS if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__))
+        )
+        bin_path = os.path.join(base_path, "bin")
+        if bin_path not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + bin_path
+        AudioSegment.converter = os.path.join(bin_path, "ffmpeg.exe")
+        AudioSegment.ffprobe = os.path.join(bin_path, "ffprobe.exe")
+
+    def _decode(self, file_path, rate, chans):
+        """A file as int16 samples at the given format, or None."""
+        self._ensure_ffmpeg()
+        try:
+            audio = AudioSegment.from_file(file_path)
+        except Exception as e:
+            self.last_error = f"Could not decode {os.path.basename(file_path)}: {e}"
+            return None
+        audio = audio.set_frame_rate(rate).set_channels(chans).set_sample_width(2)
+        samples = np.frombuffer(audio.raw_data, dtype=np.int16)
+        usable = (samples.size // chans) * chans
+        # Kept as int16: converting a whole track to float32 up front doubled
+        # peak memory for no benefit, since playback converts one small chunk
+        # at a time anyway.
+        return samples[:usable].reshape((-1, chans))
+
+    # --------------------------------------------------------- preloading
+
+    def preload(self, file_path):
+        """Decode the track that plays next, while this one is still going.
+
+        The gap between two tracks is the decode plus a PortAudio stream
+        being closed and reopened. Having the samples ready lets the playback
+        loop switch buffers between two chunk writes, so neither cost is
+        paid.
+        """
+        if not file_path or not self.gapless:
+            return
+        with self._preload_lock:
+            if self._preload_path == file_path:
+                return                  # already decoded, or in flight
+            self._preload_path = file_path
+            self._preloaded = None
+        rate, chans = self.sample_rate, self.channels
+        threading.Thread(target=self._preload_worker,
+                         args=(file_path, rate, chans), daemon=True).start()
+
+    def _preload_worker(self, file_path, rate, chans):
+        data = self._decode(file_path, rate, chans)
+        with self._preload_lock:
+            # A different track was requested while this one decoded.
+            if self._preload_path == file_path:
+                self._preloaded = data
+
+    def clear_preload(self):
+        with self._preload_lock:
+            self._preload_path = None
+            self._preloaded = None
+
+    def preloaded_path(self):
+        with self._preload_lock:
+            return self._preload_path
+
+    def preload_ready(self):
+        """True once the next track's samples are decoded and waiting."""
+        with self._preload_lock:
+            return self._preloaded is not None
+
+    def take_preloaded(self, file_path=None):
+        """Claim the preloaded samples, as (path, data)."""
+        with self._preload_lock:
+            if self._preloaded is None:
+                return None, None
+            if file_path is not None and self._preload_path != file_path:
+                return None, None
+            path, data = self._preload_path, self._preloaded
+            self._preload_path, self._preloaded = None, None
+            return path, data
+
     def load_track(self, file_path):
         """Decode a file into memory. Safe to call while another load is running."""
         with self._load_lock:
@@ -186,39 +278,22 @@ class PlayerEngine:
         self.last_error = None
         self.smoothed_bands = np.zeros(NUM_VIS_BANDS)
 
-        base_path = (
-            sys._MEIPASS if getattr(sys, "frozen", False)
-            else os.path.dirname(os.path.abspath(__file__))
-        )
-        bin_path = os.path.join(base_path, "bin")
-        if bin_path not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + bin_path
-
-        AudioSegment.converter = os.path.join(bin_path, "ffmpeg.exe")
-        AudioSegment.ffprobe = os.path.join(bin_path, "ffprobe.exe")
-
         rate, chans = self._pick_output_format()
 
-        try:
-            audio = AudioSegment.from_file(file_path)
-        except Exception as e:
-            self.last_error = f"Could not decode {os.path.basename(file_path)}: {e}"
+        # If this is the track that was preloaded, the decode is already done,
+        # which also makes pressing next instant rather than merely gapless.
+        _path, data = self.take_preloaded(file_path)
+        if data is None:
+            data = self._decode(file_path, rate, chans)
+        if data is None:
             self.audio_data = None
             return False
-
-        audio = audio.set_frame_rate(rate).set_channels(chans).set_sample_width(2)
 
         # A newer load started while this one was decoding -- discard ours.
         with self._load_lock:
             if generation != self._load_generation:
                 return False
-
-            samples = np.frombuffer(audio.raw_data, dtype=np.int16)
-            usable = (samples.size // chans) * chans
-            # Kept as int16: converting the whole track to float32 up front
-            # doubled peak memory for no benefit, since playback converts
-            # one small chunk at a time anyway.
-            self.audio_data = samples[:usable].reshape((-1, chans))
+            self.audio_data = data
             self.sample_rate = rate
             self.channels = chans
             self.current_frame = 0
@@ -366,6 +441,9 @@ class PlayerEngine:
                 else:
                     start = self.current_frame
                     if start >= total:
+                        if self._advance_in_place():
+                            total = len(self.audio_data)
+                            continue
                         finished = True
                         break
                     end = min(start + self.chunk_size, total)
@@ -397,6 +475,32 @@ class PlayerEngine:
                 self.on_track_end_callback()
             except Exception:
                 pass
+
+    def _advance_in_place(self):
+        """Roll into the preloaded track without stopping the stream.
+
+        Only when the sample format matches what the open stream was built
+        for; anything else needs a new stream, which is the gap this exists
+        to avoid.
+        """
+        if not self.gapless or self.stream is not None:
+            return False
+        path, data = self.take_preloaded()
+        if data is None or len(data) == 0 or data.shape[1] != self.channels:
+            return False
+
+        with self._load_lock:
+            self.audio_data = data
+            self.current_frame = 0
+        # A new track should not inherit the filter tails of the last one.
+        self.reset_filters()
+
+        if self.on_track_advanced_callback:
+            try:
+                self.on_track_advanced_callback(path)
+            except Exception:
+                pass
+        return True
 
     # ------------------------------------------------------------- position
 
