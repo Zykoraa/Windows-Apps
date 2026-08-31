@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 import motion
 import theme_ui
+import themes
 
 _placeholders = {}
 _gradients = {}
@@ -85,24 +86,36 @@ def lift_luminance(hex_colour, floor=0.62, fallback="#e8e8e8"):
         lum = luminance(hex_colour)
         if lum >= floor:
             return hex_colour
-        return blend(hex_colour, "#ffffff",
-                     min(0.85, (floor - lum) / max(0.05, 1.0 - lum)))
+        # motion.blend, not a bare blend: this module has no blend of its
+        # own, and the only caller sat inside a try, so a light theme
+        # silently got no page tint at all rather than an error.
+        return motion.blend(hex_colour, "#ffffff",
+                            min(0.85, (floor - lum) / max(0.05, 1.0 - lum)))
     except (ValueError, IndexError):
         return fallback
 
 
-def readable_tint(hex_colour, ink, fallback):
-    """Push a cover colour away from the text colour until they contrast.
+def readable_tint(hex_colour, ink, fallback, target=4.5):
+    """Push a colour away from the ink until text on it is legible.
 
-    Which direction depends on the theme: nine of the palettes are dark with
-    light text, but Rose Pine Dawn and Nordic Light are the other way round,
-    and darkening a tint for them produced dark-on-dark.
+    Which way depends on the theme: nine of the palettes are dark with light
+    text, but Rose Pine Dawn and Nordic Light are the other way round, and
+    darkening a tint for those produced dark on dark.
+
+    It steps until it actually reaches the contrast target rather than
+    trusting a fixed luminance floor. A mid-tone accent against mid-tone ink
+    -- Rose Pine Dawn's rose on its indigo -- cleared the floor while still
+    only managing 2.85:1, which is not readable.
     """
     if not hex_colour:
         return fallback
-    if luminance(ink) >= 0.5:
-        return clamp_luminance(hex_colour, 0.32, fallback)
-    return lift_luminance(hex_colour, 0.62, fallback)
+    toward = "#000000" if themes.luminance(ink) >= 0.5 else "#ffffff"
+    candidate = hex_colour
+    for step in range(21):
+        candidate = motion.blend(hex_colour, toward, step / 20.0)
+        if themes.contrast(candidate, ink) >= target:
+            return candidate
+    return candidate
 
 
 def _rgb(hex_colour):
@@ -306,6 +319,15 @@ class SeekBar(tk.Canvas):
         self.itemconfigure(self._buf_id, fill=self._c_buffer)
         self.itemconfigure(self._fill_id, fill=theme["accent"])
         self.itemconfigure(self._tick_id, fill=self._c_tick)
+        # Drop the item's reference before the cached sprites go. Tk goes on
+        # pointing at a PhotoImage that Python has already collected, and
+        # every later itemconfigure on the knob then raises "image ...
+        # doesn't exist" -- which aborted apply_theme halfway through and
+        # fired ten times a second while a track was playing.
+        try:
+            self.itemconfigure(self._knob_id, image="", state="hidden")
+        except Exception:
+            pass
         self._knob_cache = {}
         self.itemconfigure(self._bubble_id, fill=theme["surface_hover"])
         self.itemconfigure(self._bubble_txt, fill=theme["text"])

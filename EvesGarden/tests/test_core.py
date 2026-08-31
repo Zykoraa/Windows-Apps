@@ -23,6 +23,7 @@ import downloader
 import metadata
 import smart_playlists
 import themes
+import ui_widgets
 
 
 class TitleNormalisation(unittest.TestCase):
@@ -715,6 +716,53 @@ class KeylessDownload(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["skipped"])
         self.assertIs(result["metadata"], meta)
+
+
+
+class ReadableTint(unittest.TestCase):
+    """Cover colours pushed until text on them is legible.
+
+    Both directions matter and only one of them was ever exercised: the
+    light-theme branch called a blend() this module does not have, and its
+    only caller sat inside a try, so the two light themes silently got no
+    page tint for weeks rather than an error. Running it over every palette
+    is what catches that.
+    """
+
+    TARGET = 4.5
+
+    def test_every_theme_gets_a_legible_tint(self):
+        for name, theme in themes.THEMES.items():
+            tint = ui_widgets.readable_tint(theme["accent"], theme["text"],
+                                            theme["surface_hover"])
+            self.assertGreaterEqual(
+                round(themes.contrast(tint, theme["text"]), 2), self.TARGET,
+                "%s: %s on %s" % (name, tint, theme["text"]))
+
+    def test_it_moves_away_from_the_ink_not_always_darker(self):
+        # Light ink -> the tint must end up darker; dark ink -> lighter.
+        dark = ui_widgets.readable_tint("#d7827e", "#ffffff", "#000000")
+        light = ui_widgets.readable_tint("#d7827e", "#575279", "#ffffff")
+        self.assertLess(themes.luminance(dark), themes.luminance("#d7827e"))
+        self.assertGreater(themes.luminance(light), themes.luminance("#d7827e"))
+
+    def test_a_colour_that_already_reads_is_left_alone(self):
+        self.assertEqual(ui_widgets.readable_tint("#000000", "#ffffff", "#111"),
+                         "#000000")
+
+    def test_missing_colour_falls_back(self):
+        self.assertEqual(ui_widgets.readable_tint(None, "#ffffff", "#123456"),
+                         "#123456")
+
+    def test_luminance_helpers_run_both_ways(self):
+        # Both were reachable only through readable_tint, and one of them
+        # raised NameError the moment it was.
+        self.assertIsInstance(ui_widgets.clamp_luminance("#ffffff"), str)
+        self.assertIsInstance(ui_widgets.lift_luminance("#000000"), str)
+        self.assertLess(themes.luminance(ui_widgets.clamp_luminance("#ffffff")),
+                        1.0)
+        self.assertGreater(themes.luminance(ui_widgets.lift_luminance("#000000")),
+                           0.0)
 
 
 class Scoring(unittest.TestCase):

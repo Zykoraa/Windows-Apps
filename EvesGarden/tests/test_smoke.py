@@ -143,6 +143,21 @@ class SurfaceWalk:
         palette.close()
         yield 200
 
+        # Hover the seek bar first. Its knob is a cached image, and a theme
+        # change drops that cache -- but only a bar that has been hovered has
+        # ever assigned one, so without this the walk switched themes with
+        # nothing to invalidate and sailed past a real crash.
+        self.mark("hover the seek bar and leave again")
+        bar = app.progress_slider
+        bar._hover = True
+        bar._hover_x = 40
+        bar._redraw()          # assigns the knob sprite
+        yield 120
+        bar._hover = False
+        bar._hover_x = None
+        bar._redraw()          # hides it again, still holding the reference
+        yield 120
+
         # Both directions: the light themes are the ones that break, and
         # switching back has its own repaint path.
         for name in ("Rose Pine Dawn", "Nordic Light", "Spotify Classic",

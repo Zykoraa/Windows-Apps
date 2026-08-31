@@ -885,7 +885,10 @@ class App(ctk.CTk):
         self.now_playing_sub.pack(anchor="w")
 
         self.controls_frame = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
-        self.controls_frame.grid(row=0, column=1, pady=5)
+        # The seek bar keeps 20px above its track clear for the scrub
+        # readout, so an evenly padded transport ends up sitting high with a
+        # band of nothing under it. Pushed down and closed up against the bar.
+        self.controls_frame.grid(row=0, column=1, pady=(12, 0))
 
         # These were text: U+1F500 SHUFFLE, U+23EE PREVIOUS TRACK and so on.
         # Windows has no font that covers that range, so each one rendered as
@@ -1928,7 +1931,25 @@ class App(ctk.CTk):
         if hasattr(self, 'lib_search_entry'):
             self.lib_search_entry.configure(fg_color=t["bg"], text_color=t["text"])
 
-        for name in ("theme_dropdown", "viz_dropdown", "preset_dropdown"):
+        if getattr(self, "view_tabs", None) is not None:
+            # A segmented button has one text colour for both states, so the
+            # selected fill has to stay readable against it -- readable_tint
+            # moves the accent away from the ink until it does, which is the
+            # same rule the album page headers use.
+            self.view_tabs.configure(
+                fg_color=t["surface"],
+                selected_color=ui_widgets.readable_tint(
+                    t["accent"], t["text"], t["surface_hover"]),
+                selected_hover_color=t["surface_hover"],
+                unselected_color=t["surface"],
+                unselected_hover_color=t["surface_hover"],
+                text_color=t["text"])
+        if getattr(self, "lib_search_entry", None) is not None:
+            self.lib_search_entry.configure(border_color=t["surface_hover"],
+                                            placeholder_text_color=t["text_secondary"])
+
+        for name in ("theme_dropdown", "viz_dropdown", "preset_dropdown",
+                     "sort_dropdown"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.configure(fg_color=t["surface"], button_color=t["surface"],
