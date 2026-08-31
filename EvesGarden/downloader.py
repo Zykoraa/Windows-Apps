@@ -2,6 +2,7 @@ import argparse
 import os
 import re
 import sys
+import time
 import requests
 import yt_dlp
 import spotipy
@@ -583,8 +584,35 @@ def download_many(sp, track_urls, output_dir, jobs=3, log_callback=print,
     return results
 
 
+# What yt-dlp writes to while a download is still running, and leaves behind
+# when it is interrupted. These are incomplete by definition.
+PARTIAL_SUFFIXES = (".part", ".ytdl", ".temp", ".tmp", ".download",
+                    ".crdownload")
+
+# A download in flight has exactly the same magic bytes as an abandoned one,
+# so age is the only thing separating them.
+PARTIAL_GRACE_SECONDS = 120
+
+
+def is_partial_download(name):
+    """True for a file yt-dlp is still writing, or gave up on."""
+    lowered = os.path.basename(name).lower()
+    if lowered.endswith(PARTIAL_SUFFIXES):
+        return True
+    # Fragmented downloads: "Artist - Title.webm.part-Frag12"
+    return ".part-frag" in lowered
+
+
 def find_orphaned_downloads(library_dir):
-    """Raw streams an earlier failed postprocess left behind, by magic bytes."""
+    """Raw streams an earlier failed postprocess left behind, by magic bytes.
+
+    Partials are excluded. A ".part" file is a truncated stream that still
+    starts with valid EBML, so it passed the magic-byte check and got
+    converted -- which is where "Newcomers Club - David.webm.part.mp3" came
+    from: 113 seconds of a 258-second track, indexed as its own song. Picking
+    one up mid-download would also have pulled the file out from under
+    yt-dlp.
+    """
     orphans = []
     try:
         names = sorted(os.listdir(library_dir))
@@ -596,6 +624,13 @@ def find_orphaned_downloads(library_dir):
         if not os.path.isfile(path):
             continue
         if os.path.splitext(name)[1].lower() in (".mp3", ".json"):
+            continue
+        if is_partial_download(name):
+            continue
+        try:
+            if time.time() - os.path.getmtime(path) < PARTIAL_GRACE_SECONDS:
+                continue        # still being written
+        except OSError:
             continue
         try:
             with open(path, "rb") as f:
@@ -630,7 +665,11 @@ def repair_library(sp, library_dir, log_callback=print):
     log_callback(f"Found {len(orphans)} unconverted download(s). Repairing...")
     repaired = 0
     for path in orphans:
-        stem = os.path.basename(path)
+        # The extension has to come off. Using the whole basename produced
+        # names like "Artist - Title.webm.mp3", made the "already exists"
+        # check below compare against a name that could never match, and left
+        # the Spotify lookup searching for a title ending in ".webm".
+        stem = os.path.splitext(os.path.basename(path))[0]
         out = os.path.join(library_dir, sanitize_filename(stem) + ".mp3")
         if os.path.exists(out):
             log_callback(f"  = {os.path.basename(out)} exists -- discarding raw file")

@@ -8,7 +8,9 @@ misbehave rather than by anything automated.
 """
 
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 
@@ -193,6 +195,82 @@ class Index(unittest.TestCase):
         albums = self.ix.albums()
         self.assertEqual(len(albums), 1)
         self.assertEqual(albums[0]["n"], 2)
+
+
+
+# Magic bytes the orphan scan matches on: EBML (webm) and ISO base media.
+WEBM_HEAD = b"\x1a\x45\xdf\xa3" + b"\x00" * 8
+M4A_HEAD = b"\x00\x00\x00\x18" + b"ftyp" + b"M4A "
+
+
+class OrphanedDownloads(unittest.TestCase):
+    """A partial download must never be mistaken for a recoverable stream.
+
+    A truncated ".part" file still begins with valid EBML, so it passed the
+    magic-byte check and got converted -- which is how 113 seconds of a
+    258-second track ended up in the library as a song in its own right.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="eg-orphan-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def write(self, name, head=WEBM_HEAD, age=3600):
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as fh:
+            fh.write(head + b"\x00" * 64)
+        stamp = time.time() - age
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_finds_a_real_orphan(self):
+        path = self.write("Artist - Title.webm")
+        self.assertEqual(downloader.find_orphaned_downloads(self.dir), [path])
+
+    def test_finds_m4a_orphan(self):
+        path = self.write("Artist - Title.m4a", head=M4A_HEAD)
+        self.assertEqual(downloader.find_orphaned_downloads(self.dir), [path])
+
+    def test_skips_partials(self):
+        for name in ("Artist - Title.webm.part",
+                     "Artist - Title.webm.ytdl",
+                     "Artist - Title.webm.part-Frag12",
+                     "Artist - Title.m4a.temp",
+                     "Artist - Title.webm.download"):
+            self.write(name)
+        self.assertEqual(downloader.find_orphaned_downloads(self.dir), [])
+
+    def test_skips_downloads_still_in_flight(self):
+        # Byte-identical to an abandoned stream; only its age says otherwise.
+        self.write("Artist - Title.webm", age=5)
+        self.assertEqual(downloader.find_orphaned_downloads(self.dir), [])
+
+    def test_ignores_finished_library_files(self):
+        self.write("Artist - Title.mp3")
+        self.write("recent.json")
+        self.assertEqual(downloader.find_orphaned_downloads(self.dir), [])
+
+    def test_partial_detection(self):
+        for name in ("a.webm.part", "a.m4a.ytdl", "A.WEBM.PART",
+                     "a.webm.part-Frag3", "a.opus.temp", "a.mp4.crdownload"):
+            self.assertTrue(downloader.is_partial_download(name), name)
+        for name in ("a.webm", "a.m4a", "a.mp3", "Partial Eclipse.webm"):
+            self.assertFalse(downloader.is_partial_download(name), name)
+
+
+class OrphanNaming(unittest.TestCase):
+    """A recovered MP3 is named from the stem, not the whole filename."""
+
+    def test_stem_drops_the_source_extension(self):
+        # repair_library used os.path.basename(path), so a recovered
+        # "Artist - Title.webm" was written as "Artist - Title.webm.mp3", the
+        # "already exists" check compared a name that could never match, and
+        # the Spotify re-tag searched for a title ending in ".webm".
+        source = os.path.join("lib", "Newcomers Club - David.webm")
+        stem = os.path.splitext(os.path.basename(source))[0]
+        self.assertEqual(stem, "Newcomers Club - David")
+        self.assertEqual(downloader.sanitize_filename(stem) + ".mp3",
+                         "Newcomers Club - David.mp3")
 
 
 class Scoring(unittest.TestCase):
