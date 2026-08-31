@@ -341,6 +341,65 @@ def _unit(value):
     return tuple(int(value[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
 
 
+
+class Suggestions(unittest.TestCase):
+    """What the app offers you next, once Spotify closed the good endpoints.
+
+    /v1/recommendations answers 404 for newly registered apps, and artist
+    top-tracks and related-artists answer 403 for app-only credentials, so
+    suggestions are drawn from a plain search instead. That makes the
+    filtering the whole of the value: a search for an artist returns the same
+    song four times over as single, album cut, live version and remaster.
+    """
+
+    def seed(self, name="Gravity", track_id="seed"):
+        return {"id": track_id, "name": name}
+
+    def track(self, name, track_id, url="https://open.spotify.com/track/x"):
+        entry = {"id": track_id, "name": name, "artists": [{"name": "A"}]}
+        if url:
+            entry["external_urls"] = {"spotify": url}
+        return entry
+
+    def test_drops_the_seed_itself(self):
+        picked = downloader.pick_suggestions(
+            self.seed(), [self.track("Gravity", "seed"),
+                          self.track("New Light", "b")])
+        self.assertEqual([t["id"] for t in picked], ["b"])
+
+    def test_drops_other_cuts_of_the_seed(self):
+        # Same recording, different release: not a suggestion.
+        picked = downloader.pick_suggestions(
+            self.seed(), [self.track("Gravity - Live", "b"),
+                          self.track("Gravity (Remastered 2011)", "c"),
+                          self.track("Slow Dancing", "d")])
+        self.assertEqual([t["id"] for t in picked], ["d"])
+
+    def test_drops_repeats_within_the_pool(self):
+        picked = downloader.pick_suggestions(
+            self.seed(), [self.track("New Light", "b"),
+                          self.track("New Light - Radio Edit", "c"),
+                          self.track("Waiting", "d")])
+        self.assertEqual([t["id"] for t in picked], ["b", "d"])
+
+    def test_skips_entries_with_nothing_to_open(self):
+        picked = downloader.pick_suggestions(
+            self.seed(), [self.track("New Light", "b", url=None),
+                          self.track("Waiting", "c")])
+        self.assertEqual([t["id"] for t in picked], ["c"])
+
+    def test_respects_the_limit(self):
+        pool = [self.track("Song %d" % i, str(i)) for i in range(20)]
+        self.assertEqual(len(downloader.pick_suggestions(self.seed(), pool,
+                                                         limit=5)), 5)
+
+    def test_survives_nothing_to_choose_from(self):
+        self.assertEqual(downloader.pick_suggestions(self.seed(), None), [])
+        self.assertEqual(downloader.pick_suggestions(self.seed(), []), [])
+        self.assertEqual(downloader.pick_suggestions(
+            self.seed(), [{"name": "no id"}]), [])
+
+
 class Scoring(unittest.TestCase):
     """The YouTube candidate ranking that decides which version you get."""
 

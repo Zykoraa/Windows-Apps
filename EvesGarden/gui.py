@@ -185,6 +185,7 @@ class App(ctk.CTk):
 
         self.player = PlayerEngine()
         self._seeking = False
+        self._viz_idle = False
         # Covers are kept as PIL images, not just CTkImages, so the next one
         # can be blended onto the one already showing.
         self._thumb_pil = None
@@ -1807,6 +1808,7 @@ class App(ctk.CTk):
 
         if hasattr(self, 'canvas'):
             self.canvas.configure(bg=t["bg"])
+            self._viz_idle = False        # the idle text needs repainting
         if getattr(self, "brand_word", None) is not None:
             self.brand_word.configure(text_color=t["text"])
         if getattr(self, "brand_mark", None) is not None:
@@ -1923,6 +1925,7 @@ class App(ctk.CTk):
         # Skip the per-chunk FFT entirely while the overlay is hidden.
         self.player.visualizer_enabled = self.visualizer_visible
         self.settings.set("visualizer_visible", self.visualizer_visible)
+        self._viz_idle = False
         if self.visualizer_visible:
             self._slide_in(self.viz_overlay)
             self.viz_dropdown.set(VIZ_MODES[self.visualizer_mode])
@@ -1978,9 +1981,37 @@ class App(ctk.CTk):
 
     def update_visualizer_loop(self):
         """Redraw at ~30 fps from the Tk thread, reading the engine's state."""
-        if self.visualizer_visible and self.player.playing and not self.player.paused:
-            self._draw_bands(self.player.smoothed_bands.tolist())
+        if self.visualizer_visible:
+            if self.player.playing and not self.player.paused:
+                self._viz_idle = False
+                self._draw_bands(self.player.smoothed_bands.tolist())
+            elif not self._viz_idle:
+                self._viz_idle = True
+                self._draw_idle_visualizer()
         self._safe_after(33, self.update_visualizer_loop)
+
+    def _draw_idle_visualizer(self):
+        """Something to look at when there are no bands to draw.
+
+        The loop only drew while audio was running, so opening the visualiser
+        with nothing playing left the last frame frozen on screen, or on a
+        fresh launch a black rectangle with two dropdowns floating in the
+        corner and no indication of what it was for.
+        """
+        canvas = getattr(self, "canvas", None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        canvas.delete("all")
+        canvas.create_text(width / 2, height / 2 - 14, text="Nothing playing",
+                           fill=self.theme["text"],
+                           font=theme_ui.font("title"))
+        canvas.create_text(width / 2, height / 2 + 16,
+                           text="Start a track and the spectrum appears here.",
+                           fill=self.theme["text_secondary"],
+                           font=theme_ui.font("body"))
 
     def set_appwindow(self):
         hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
@@ -3299,7 +3330,11 @@ class App(ctk.CTk):
                 self._safe_after(0, self.suggestions_frame.place_forget)
                 return
 
-            self._safe_after(0, self.show_suggestions, None, tracks, "Suggested Based on Now Playing")
+            # Named for what it can actually deliver. Spotify closed the
+            # endpoints that made real recommendations possible, so calling
+            # these "suggested for you" would be overselling a search.
+            self._safe_after(0, self.show_suggestions, None, tracks,
+                             f"More from {artist}")
         except Exception as e:
             print(f"Recommendation error: {e}")
             self._safe_after(0, self.suggestions_frame.place_forget)
@@ -3329,7 +3364,7 @@ class App(ctk.CTk):
                 name = track['name']
                 art = ", ".join(a['name'] for a in track['artists'])
                 url = track['external_urls']['spotify']
-                btn_text = f"🎵 {name} - {art}"
+                btn_text = f"{name}  ·  {art}"
                 btn = ctk.CTkButton(self.suggestions_frame, text=btn_text, anchor="w", fg_color="transparent",
                                     text_color=self.theme["text"], hover_color=self.theme["surface_hover"], corner_radius=8,
                                     command=lambda u=url, t=btn_text: self.select_suggestion(u, t))
@@ -3340,7 +3375,7 @@ class App(ctk.CTk):
             for artist in artists[:3]: # Only show top 3 artists to save space
                 name = artist['name']
                 url = artist['external_urls']['spotify']
-                btn = ctk.CTkButton(self.suggestions_frame, text=f"👤 {name}", anchor="w", fg_color="transparent",
+                btn = ctk.CTkButton(self.suggestions_frame, text=name, anchor="w", fg_color="transparent",
                                     text_color=self.theme["text"], hover_color=self.theme["surface_hover"], corner_radius=8,
                                     command=lambda u=url, t=name, aid=artist['id']: self.select_artist(u, t, aid))
                 btn.pack(fill="x", padx=5, pady=2)

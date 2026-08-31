@@ -129,50 +129,77 @@ def get_artist_albums(sp, artist_id):
     return unique_albums
 
 
-def get_related_tracks(sp, seed_track_id, limit=5):
-    """Suggest similar tracks.
+def pick_suggestions(seed, candidates, limit=5):
+    """Choose suggestions from a candidate pool, dropping repeats.
 
-    Spotify retired /v1/recommendations for new apps (it now returns 404), so
-    this derives suggestions from the seed artist's top tracks and related
-    artists instead.
+    Kept pure and separate from the fetching so the interesting half -- not
+    offering somebody the remaster of the song they are already listening to
+    -- can be tested without a network.
+    """
+    from library_index import normalise_title
+
+    seen_ids = {seed.get("id")}
+    seen_titles = {normalise_title(seed.get("name") or "")}
+    out = []
+    for track in candidates or []:
+        track_id = track.get("id")
+        if not track_id or track_id in seen_ids:
+            continue
+        if not (track.get("external_urls") or {}).get("spotify"):
+            continue                     # nothing to open or download
+        title = normalise_title(track.get("name") or "")
+        if not title or title in seen_titles:
+            continue                     # a live cut or remaster of one above
+        seen_ids.add(track_id)
+        seen_titles.add(title)
+        out.append(track)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def get_related_tracks(sp, seed_track_id, limit=5):
+    """More by the artist you are listening to.
+
+    This was three fallbacks deep and every one of them has since closed.
+    Spotify retired /v1/recommendations for newly registered apps -- it
+    answers 404 -- and in late 2024 moved artist top-tracks and
+    related-artists behind extended quota, so both answer 403 for the
+    app-only credentials this uses. The whole function was dead, and because
+    it runs on a worker whose exceptions are swallowed, it failed silently.
+
+    What is left open is /search (including its artist: field),
+    /artists/{id}/albums and /albums/{id}/tracks, so the suggestions are now
+    honestly what those can support: more of the same artist. The caller
+    labels them that way rather than calling them recommendations.
     """
     seed = sp.track(seed_track_id)
-    artist_id = seed["artists"][0]["id"]
-    seen = {seed["id"]}
-    out = []
+    artist = (seed.get("artists") or [{}])[0]
+    candidates = []
 
-    def take(tracks):
-        for t in tracks:
-            if t["id"] not in seen:
-                seen.add(t["id"])
-                out.append(t)
-            if len(out) >= limit:
-                return True
-        return False
-
-    try:
-        if take(sp.artist_top_tracks(artist_id)["tracks"]):
-            return out
-    except Exception:
-        pass
-
-    try:
-        for rel in sp.artist_related_artists(artist_id)["artists"][:5]:
-            if take(sp.artist_top_tracks(rel["id"])["tracks"][:3]):
-                return out
-    except Exception:
-        pass
-
-    if len(out) < limit:
+    name = (artist.get("name") or "").replace('"', "")
+    if name:
         try:
-            genres = sp.artist(artist_id).get("genres") or []
-            if genres:
-                res = sp.search(q=f'genre:"{genres[0]}"', type="track", limit=limit * 2)
-                take(res["tracks"]["items"])
+            candidates.extend(sp.search(q='artist:"%s"' % name, type="track",
+                                        limit=10)["tracks"]["items"])
         except Exception:
             pass
 
-    return out[:limit]
+    # Top up from the back catalogue: search alone leans hard on whatever is
+    # popular right now, so it tends to return the same handful of singles.
+    if artist.get("id") and len(candidates) < limit * 4:
+        try:
+            albums = sp.artist_albums(artist["id"], album_type="album",
+                                      limit=4)["items"]
+            for album in albums:
+                candidates.extend(
+                    sp.album_tracks(album["id"], limit=10)["items"])
+                if len(candidates) >= limit * 6:
+                    break
+        except Exception:
+            pass
+
+    return pick_suggestions(seed, candidates, limit)
 
 
 # Spotify's own editorial and algorithmic playlists -- Discover Weekly, Daily
