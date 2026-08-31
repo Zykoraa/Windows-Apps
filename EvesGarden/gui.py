@@ -322,7 +322,7 @@ class App(ctk.CTk):
 
     def stop_playback(self):
         self.player.stop()
-        self.play_btn.configure(text="\u25b6")
+        self.play_btn.set_glyph("play")
         self.progress_slider.set(0.0)
         self.progress_slider.set_buffered(0.0)
         if getattr(self, "discord", None):
@@ -418,18 +418,17 @@ class App(ctk.CTk):
     def toggle_play_pause(self):
         if self.player.playing and not self.player.paused:
             self.player.pause()
-            self.play_btn.configure(text="▶")
+            self.play_btn.set_glyph("play")
             self._push_discord(playing=False)
         else:
             self.player.play()
-            self.play_btn.configure(text="⏸")
+            self.play_btn.set_glyph("pause")
             self._push_discord(playing=True)
 
     def toggle_shuffle(self):
         self.shuffle = not self.shuffle
         self.settings.set("shuffle", self.shuffle)
-        color = self.theme["accent"] if self.shuffle else self.theme["text"]
-        self.shuffle_btn.configure(text_color=color)
+        self.shuffle_btn.set_active(self.shuffle)
 
         # current_index is -1 until something plays, and the playlist can be
         # empty; indexing it unguarded raised IndexError on the first click.
@@ -453,15 +452,14 @@ class App(ctk.CTk):
     def toggle_repeat(self):
         self.repeat = not self.repeat
         self.settings.set("repeat", self.repeat)
-        color = self.theme["accent"] if self.repeat else self.theme["text"]
-        self.repeat_btn.configure(text_color=color)
+        self.repeat_btn.set_active(self.repeat)
 
     def play_next(self):
         """Anything queued by hand wins; otherwise continue through the list."""
         nxt = self._queue_next()
         if not nxt:
             self.player.stop()
-            self.play_btn.configure(text="▶")
+            self.play_btn.set_glyph("play")
             return
         if nxt in self.current_playlist:
             self.current_index = self.current_playlist.index(nxt)
@@ -739,16 +737,23 @@ class App(ctk.CTk):
         self.controls_frame = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         self.controls_frame.grid(row=0, column=1, pady=5)
 
-        self.shuffle_btn = ctk.CTkButton(self.controls_frame, text="🔀", width=40, height=40, corner_radius=20, command=self.toggle_shuffle, fg_color="transparent", text_color=self.theme["text"])
-        self.shuffle_btn.pack(side="left", padx=5)
-        self.prev_btn = ctk.CTkButton(self.controls_frame, text="⏮", width=40, height=40, corner_radius=20, command=self.play_prev, fg_color="transparent", hover_color=self.theme["surface_hover"])
-        self.prev_btn.pack(side="left", padx=5)
-        self.play_btn = ctk.CTkButton(self.controls_frame, text="▶", width=50, height=50, corner_radius=25, command=self.toggle_play_pause, font=ctk.CTkFont(size=18))
-        self.play_btn.pack(side="left", padx=5)
-        self.next_btn = ctk.CTkButton(self.controls_frame, text="⏭", width=40, height=40, corner_radius=20, command=self.play_next, fg_color="transparent", hover_color=self.theme["surface_hover"])
-        self.next_btn.pack(side="left", padx=5)
-        self.repeat_btn = ctk.CTkButton(self.controls_frame, text="🔁", width=40, height=40, corner_radius=20, command=self.toggle_repeat, fg_color="transparent", text_color=self.theme["text"])
-        self.repeat_btn.pack(side="left", padx=5)
+        # These were text: U+1F500 SHUFFLE, U+23EE PREVIOUS TRACK and so on.
+        # Windows has no font that covers that range, so each one rendered as
+        # a boxed fallback and the transport read as four grey rectangles.
+        for name, glyph, cmd, primary in (
+            ("shuffle_btn", "shuffle", self.toggle_shuffle, False),
+            ("prev_btn", "prev", self.play_prev, False),
+            ("play_btn", "play", self.toggle_play_pause, True),
+            ("next_btn", "next", self.play_next, False),
+            ("repeat_btn", "repeat", self.toggle_repeat, False),
+        ):
+            button = ui_widgets.GlyphButton(
+                self.controls_frame, self.theme, glyph, command=cmd,
+                primary=primary, size=50 if primary else 40)
+            button.pack(side="left", padx=5)
+            setattr(self, name, button)
+        self.shuffle_btn.set_active(self.shuffle)
+        self.repeat_btn.set_active(self.repeat)
 
         self.progress_row = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         self.progress_row.grid(row=1, column=1, sticky="ew", pady=(0, 10))
@@ -792,8 +797,11 @@ class App(ctk.CTk):
         self.volume_frame = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         self.volume_frame.grid(row=1, column=2, columnspan=2, sticky="e",
                                padx=(10, 20), pady=(0, 10))
-        self.volume_icon = ctk.CTkLabel(self.volume_frame, text="\U0001F50A",
-                                        font=ctk.CTkFont(size=13), width=18)
+        # Clicking the speaker now mutes -- it was a static label, and mute
+        # was only reachable from the keyboard.
+        self.volume_icon = ui_widgets.GlyphButton(
+            self.volume_frame, self.theme, "volume_high", size=28,
+            command=self._toggle_mute, glyph_scale=0.68, stroke=1.8)
         self.volume_icon.pack(side="left", padx=(0, 6))
         self.volume_slider = ui_widgets.SeekBar(
             self.volume_frame, self.theme, command=self.on_volume,
@@ -1400,26 +1408,28 @@ class App(ctk.CTk):
                                  dropdown_hover_color=t["surface_hover"],
                                  text_color=t["text"])
 
-        for name in ("nav_dl_btn", "play_btn", "eq_toggle_btn", "viz_toggle_btn",
+        for name in ("nav_dl_btn", "eq_toggle_btn", "viz_toggle_btn",
                      "repair_btn", "dedupe_btn", "new_pl_btn", "queue_btn"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.configure(fg_color=t["accent"], hover_color=t["accent_hover"],
                                  text_color=t["bg"])
 
-        for name in ("prev_btn", "next_btn", "min_btn"):
+        if getattr(self, "min_btn", None) is not None:
+            self.min_btn.configure(hover_color=t["surface_hover"],
+                                   text_color=t["text"])
+
+        # The transport paints itself, so a theme change is a repaint rather
+        # than a text-colour swap.
+        for name in ("shuffle_btn", "prev_btn", "play_btn", "next_btn",
+                     "repeat_btn", "volume_icon"):
             widget = getattr(self, name, None)
             if widget is not None:
-                widget.configure(hover_color=t["surface_hover"], text_color=t["text"])
-
-        if hasattr(self, 'shuffle_btn'):
-            self.shuffle_btn.configure(
-                hover_color=t["surface_hover"],
-                text_color=t["accent"] if self.shuffle else t["text"])
-        if hasattr(self, 'repeat_btn'):
-            self.repeat_btn.configure(
-                hover_color=t["surface_hover"],
-                text_color=t["accent"] if self.repeat else t["text"])
+                widget.set_palette(t)
+        if getattr(self, "shuffle_btn", None) is not None:
+            self.shuffle_btn.set_active(self.shuffle)
+        if getattr(self, "repeat_btn", None) is not None:
+            self.repeat_btn.set_active(self.repeat)
 
         for name in ("progress_slider", "volume_slider"):
             widget = getattr(self, name, None)
@@ -1428,7 +1438,7 @@ class App(ctk.CTk):
 
         if getattr(self, "now_playing_sub", None) is not None:
             self.now_playing_sub.configure(text_color=t["text_secondary"])
-        for name in ("now_playing_label", "time_elapsed", "time_total", "volume_icon"):
+        for name in ("now_playing_label", "time_elapsed", "time_total"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.configure(text_color=t["text"])
@@ -1759,7 +1769,7 @@ class App(ctk.CTk):
         threading.Thread(target=load, daemon=True).start()
 
     def _show_resumed(self):
-        self.play_btn.configure(text="\u25b6")   # paused: press play to continue
+        self.play_btn.set_glyph("play")          # paused: press play to continue
         self.progress_slider.set(self.player.get_progress())
         self.time_elapsed.configure(text=fmt_time(self.player.get_position()))
         self.time_total.configure(text=fmt_time(self.player.get_duration()))
@@ -2225,7 +2235,7 @@ class App(ctk.CTk):
         self._ensure_cover_url(file_path, row)
 
         self.extract_album_art(file_path)
-        self.play_btn.configure(text="⏸")
+        self.play_btn.set_glyph("pause")
         threading.Thread(target=self._load_and_play, args=(file_path,), daemon=True).start()
         # Search lyrics with the full name -- `filename` is truncated to 50
         # characters with an ellipsis for display, which never matched.
@@ -2512,9 +2522,9 @@ class App(ctk.CTk):
     def on_volume(self, value):
         self.player.set_volume(value)
         self.settings.set("volume", float(value))
-        self.volume_icon.configure(
-            text="\U0001F507" if value < 0.01 else ("\U0001F509" if value < 0.5 else "\U0001F50A")
-        )
+        self.volume_icon.set_glyph(
+            "mute" if value < 0.01
+            else ("volume_low" if value < 0.5 else "volume_high"))
 
     def _lyric_font(self, size):
         """Cache fonts: building a CTkFont per tick leaked Tk font objects."""
@@ -2725,7 +2735,7 @@ class App(ctk.CTk):
             self._preview_failed(track, self.player.last_error or "stream failed")
             return
         self.player.play()
-        self.play_btn.configure(text="\u23f8")
+        self.play_btn.set_glyph("pause")
         if button is not None:
             try:
                 button.configure(text="\u25b6  Preview", state="normal")

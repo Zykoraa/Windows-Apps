@@ -13,6 +13,7 @@ hundred rows of flicker as you scroll. A placeholder tile of the right size,
 painted immediately, turns that into a fill.
 """
 
+import math
 import tkinter as tk
 
 import customtkinter as ctk
@@ -505,3 +506,294 @@ class SeekBar(tk.Canvas):
         if self.command:
             self.command(self._value)
         return "break"
+
+
+# -------------------------------------------------------------- glyph shapes
+
+# Everything below is drawn in a 24x24 box and scaled to the widget, so one
+# set of coordinates serves a 40px transport button and a 50px play button.
+GLYPH_BOX = 24.0
+
+
+def _pts(points, cx, cy, s):
+    """Map 24x24 viewbox points onto canvas coordinates."""
+    out = []
+    for x, y in points:
+        out.append(cx + (x - 12) * s)
+        out.append(cy + (y - 12) * s)
+    return out
+
+
+def _g_play(c, cx, cy, s, col, w):
+    return [c.create_polygon(_pts([(8.5, 5), (19.5, 12), (8.5, 19)], cx, cy, s),
+                             fill=col, outline=col, width=w * 0.7,
+                             joinstyle=tk.ROUND)]
+
+
+def _g_pause(c, cx, cy, s, col, w):
+    return [c.create_line(_pts([(9, 5.5), (9, 18.5)], cx, cy, s), fill=col,
+                          width=w * 1.7, capstyle=tk.ROUND),
+            c.create_line(_pts([(15, 5.5), (15, 18.5)], cx, cy, s), fill=col,
+                          width=w * 1.7, capstyle=tk.ROUND)]
+
+
+def _g_prev(c, cx, cy, s, col, w):
+    return [c.create_line(_pts([(6, 5.5), (6, 18.5)], cx, cy, s), fill=col,
+                          width=w * 1.4, capstyle=tk.ROUND),
+            c.create_polygon(_pts([(19, 5.5), (19, 18.5), (8.5, 12)], cx, cy, s),
+                             fill=col, outline=col, width=w * 0.7,
+                             joinstyle=tk.ROUND)]
+
+
+def _g_next(c, cx, cy, s, col, w):
+    return [c.create_polygon(_pts([(5, 5.5), (5, 18.5), (15.5, 12)], cx, cy, s),
+                             fill=col, outline=col, width=w * 0.7,
+                             joinstyle=tk.ROUND),
+            c.create_line(_pts([(18, 5.5), (18, 18.5)], cx, cy, s), fill=col,
+                          width=w * 1.4, capstyle=tk.ROUND)]
+
+
+def _g_shuffle(c, cx, cy, s, col, w):
+    head = (w * 2.4, w * 2.8, w * 1.2)
+    return [c.create_line(_pts([(3.5, 7.5), (7.5, 7.5), (16.5, 16.5),
+                                (20.5, 16.5)], cx, cy, s),
+                          fill=col, width=w, capstyle=tk.ROUND,
+                          joinstyle=tk.ROUND, arrow=tk.LAST, arrowshape=head),
+            c.create_line(_pts([(3.5, 16.5), (7.5, 16.5), (16.5, 7.5),
+                                (20.5, 7.5)], cx, cy, s),
+                          fill=col, width=w, capstyle=tk.ROUND,
+                          joinstyle=tk.ROUND, arrow=tk.LAST, arrowshape=head)]
+
+
+def _g_repeat(c, cx, cy, s, col, w):
+    """A ring with a gap, drawn as a polyline so Tk orients the arrowhead.
+
+    Two earlier attempts placed a triangle by hand: against a smoothed rounded
+    rectangle the corners collapsed into a lump, and against an arc the head
+    either buried itself in the stroke or spilled across the gap. Handing the
+    curve to create_line and asking for arrow=LAST puts the head on the
+    tangent, which is the one thing that makes it read as a loop.
+    """
+    r = 6.9
+    steps = 28
+    # Ends at 90 degrees -- the top -- travelling clockwise, so the head
+    # points right, into a gap that sits between one and two o'clock.
+    a0, sweep = 416.0, -326.0
+    pts = []
+    for i in range(steps + 1):
+        a = math.radians(a0 + sweep * i / steps)
+        pts.append((12 + r * math.cos(a), 12 - r * math.sin(a)))
+    head = (w * 2.3, w * 2.7, w * 1.25)
+    return [c.create_line(_pts(pts, cx, cy, s), fill=col, width=w,
+                          capstyle=tk.ROUND, joinstyle=tk.ROUND,
+                          smooth=True, arrow=tk.LAST, arrowshape=head)]
+
+
+def _g_repeat_one(c, cx, cy, s, col, w):
+    """As repeat, with a 1 inside.
+
+    The digit is stroked rather than set in a font: at this size the ring's
+    interior is about thirteen pixels across, and a real glyph small enough to
+    fit inside it was not legible.
+    """
+    items = _g_repeat(c, cx, cy, s, col, w)
+    items.append(c.create_line(
+        _pts([(10.8, 10.5), (12.1, 9.3), (12.1, 15.0)], cx, cy, s),
+        fill=col, width=w * 0.9, capstyle=tk.ROUND, joinstyle=tk.ROUND))
+    return items
+
+
+def _volume_cone(c, cx, cy, s, col, w):
+    return c.create_polygon(
+        _pts([(3.5, 9.5), (7, 9.5), (11, 5.5), (11, 18.5), (7, 14.5),
+              (3.5, 14.5)], cx, cy, s),
+        fill=col, outline=col, width=w * 0.6, joinstyle=tk.ROUND)
+
+
+def _g_mute(c, cx, cy, s, col, w):
+    return [_volume_cone(c, cx, cy, s, col, w),
+            c.create_line(_pts([(14, 9.5), (19.5, 15)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND),
+            c.create_line(_pts([(19.5, 9.5), (14, 15)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND)]
+
+
+def _volume_waves(c, cx, cy, s, col, w, count):
+    items = []
+    for i in range(count):
+        r = (4.2 + i * 3.4) * s
+        ox = cx - 1.5 * s
+        items.append(c.create_arc(ox - r, cy - r, ox + r, cy + r,
+                                  start=-52, extent=104, style=tk.ARC,
+                                  outline=col, width=w))
+    return items
+
+
+def _g_volume_low(c, cx, cy, s, col, w):
+    return [_volume_cone(c, cx, cy, s, col, w)] + \
+        _volume_waves(c, cx, cy, s, col, w, 1)
+
+
+def _g_volume_high(c, cx, cy, s, col, w):
+    return [_volume_cone(c, cx, cy, s, col, w)] + \
+        _volume_waves(c, cx, cy, s, col, w, 2)
+
+
+GLYPHS = {
+    "play": _g_play,
+    "pause": _g_pause,
+    "prev": _g_prev,
+    "next": _g_next,
+    "shuffle": _g_shuffle,
+    "repeat": _g_repeat,
+    "repeat_one": _g_repeat_one,
+    "mute": _g_mute,
+    "volume_low": _g_volume_low,
+    "volume_high": _g_volume_high,
+}
+
+
+class GlyphButton(tk.Canvas):
+    """A transport control drawn as vectors rather than as a font glyph.
+
+    The bar used text: U+1F500 SHUFFLE, U+23EE PREVIOUS TRACK, U+1F501 REPEAT.
+    That is a bet that the user's font stack covers those code points, and on
+    Windows it does not -- the fallback draws each one as a boxed outline, so
+    the transport read as four grey rectangles either side of the play button.
+
+    Drawing them takes the font out of the equation. It also turns hover and
+    active into properties of the widget rather than a text-colour swap, so
+    the controls can carry a hierarchy: the play button is filled and primary,
+    everything else sits back in the secondary text colour until you point at
+    it, and shuffle/repeat light up in the accent when they are on.
+    """
+
+    def __init__(self, parent, theme, glyph, size=40, command=None,
+                 primary=False, background=None, glyph_scale=None,
+                 stroke=None, **kwargs):
+        self.theme = theme
+        self._glyph = glyph
+        self.command = command
+        self.primary = primary
+        self._size = size
+        self._scale = glyph_scale or (0.46 if primary else 0.58)
+        self._stroke = stroke or (2.4 if primary else 2.0)
+
+        self._active = False
+        self._hover = 0.0
+        self._pressed = False
+        self._items = []
+        self._disc = None
+
+        super().__init__(parent, width=size, height=size, highlightthickness=0,
+                         bd=0, takefocus=0, **kwargs)
+        self.set_palette(theme, background)
+
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.configure(cursor="hand2")
+
+    # ------------------------------------------------------------- palette
+
+    def set_palette(self, theme, background=None):
+        self.theme = theme
+        self._bg = background or theme["surface"]
+        self.configure(bg=self._bg)
+        self._redraw()
+
+    def set_glyph(self, glyph):
+        if glyph == self._glyph:
+            return
+        self._glyph = glyph
+        self._redraw()
+
+    def set_active(self, active):
+        active = bool(active)
+        if active == self._active:
+            return
+        self._active = active
+        self._redraw()
+
+    # --------------------------------------------------------------- paint
+
+    def _colours(self):
+        """Ink and disc for the current hover / active state.
+
+        Hover lightens toward the theme's *text* colour, not toward
+        accent_hover. In these palettes accent_hover is a second accent rather
+        than a lighter first one -- Tokyo Night pairs blue with green,
+        Synthwave pink with cyan -- so using it here made the control change
+        hue under the cursor, which read as a glitch. Blending toward the text
+        colour raises contrast in the dark themes and the two light ones
+        alike.
+        """
+        t = self.theme
+        lift = 0.18 * self._hover
+        if self.primary:
+            return t["bg"], motion.blend(t["accent"], t["text"], lift)
+        if self._active:
+            ink = motion.blend(t["accent"], t["text"], lift)
+        else:
+            ink = motion.blend(t["text_secondary"], t["text"], self._hover)
+        return ink, motion.blend(self._bg, t["surface_hover"], self._hover)
+
+    def _redraw(self):
+        for item in self._items:
+            self.delete(item)
+        self._items = []
+        if self._disc is not None:
+            self.delete(self._disc)
+            self._disc = None
+
+        ink, disc = self._colours()
+        c = self._size / 2.0
+        # The whole control dips slightly while held, which is the only
+        # feedback a canvas can give without a border.
+        press = 0.94 if self._pressed else 1.0
+
+        if self.primary:
+            r = (self._size / 2.0 - 1) * (1 + 0.04 * self._hover) * press
+            self._disc = self.create_oval(c - r, c - r, c + r, c + r,
+                                          fill=disc, outline=disc)
+        elif self._hover > 0.01:
+            r = (self._size / 2.0 - 2) * press
+            self._disc = self.create_oval(c - r, c - r, c + r, c + r,
+                                          fill=disc, outline=disc)
+
+        draw = GLYPHS.get(self._glyph)
+        if draw is None:
+            return
+        s = self._size * self._scale / GLYPH_BOX * press
+        self._items = draw(self, c, c, s, ink, self._stroke * press)
+
+    def _animate_hover(self, target):
+        start = self._hover
+
+        def step(t):
+            self._hover = start + (target - start) * t
+            self._redraw()
+
+        motion.animate(self, motion.FAST, step, name="hover")
+
+    # -------------------------------------------------------------- events
+
+    def _on_enter(self, _event=None):
+        self._animate_hover(1.0)
+
+    def _on_leave(self, _event=None):
+        self._pressed = False
+        self._animate_hover(0.0)
+
+    def _on_press(self, _event=None):
+        self._pressed = True
+        self._redraw()
+
+    def _on_release(self, event):
+        was = self._pressed
+        self._pressed = False
+        self._redraw()
+        inside = (0 <= event.x <= self._size and 0 <= event.y <= self._size)
+        if was and inside and self.command:
+            self.command()
