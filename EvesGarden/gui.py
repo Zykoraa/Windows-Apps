@@ -75,6 +75,7 @@ import io
 import tkinter as tk
 from library_index import LibraryIndex, SORTS
 from library_view import LibraryView
+import dialogs
 import motion
 import ui_widgets
 import recycle
@@ -2030,8 +2031,10 @@ class App(ctk.CTk):
 
     def prompt_new_playlist(self, paths=()):
         """Ask for a name, create the playlist, and drop any tracks in."""
-        dialog = ctk.CTkInputDialog(text="Name your playlist", title="New playlist")
-        name = dialog.get_input()
+        name = dialogs.prompt_text(
+            self, self.theme, "New playlist", "Name your playlist",
+            placeholder="Late night, Gym, Everything Sob Rock...",
+            confirm="Create")
         if not name:
             return
         playlist_id = self.index.create_playlist(name)
@@ -2898,16 +2901,19 @@ class App(ctk.CTk):
             self._safe_after(0, self.log, f"Failed to fetch albums: {e}")
 
     def show_album_selector(self, artist_name, albums):
-        dialog = ctk.CTkToplevel(self)
-        dialog.title(f"Albums by {artist_name}")
-        dialog.geometry("500x650")
-        dialog.attributes("-topmost", True)
-        dialog.configure(fg_color=self.theme["bg"])
+        dialog = dialogs.ModalDialog(
+            self, self.theme, f"Albums by {artist_name}", size=(520, 660),
+            body_pad=(18, 16))
+        # Not modal: the downloads it starts report into the window behind it.
+        panel = dialog.body
 
-        ctk.CTkLabel(dialog, text=f"Select Albums or Tracks to Download", font=ctk.CTkFont(size=20, weight="bold"), text_color=self.theme["text"]).pack(pady=(20, 10))
+        ctk.CTkLabel(panel, text="Select albums or tracks to download",
+                     font=theme_ui.font("title"), anchor="w",
+                     text_color=self.theme["text"]).pack(fill="x", pady=(0, 12))
 
-        scroll = ctk.CTkScrollableFrame(dialog, fg_color=self.theme["surface"], corner_radius=15)
-        scroll.pack(fill="both", expand=True, padx=20, pady=10)
+        scroll = ctk.CTkScrollableFrame(panel, fg_color=self.theme["surface"],
+                                        corner_radius=theme_ui.RADIUS)
+        scroll.pack(fill="both", expand=True)
 
         vars_dict = {}
 
@@ -2957,13 +2963,18 @@ class App(ctk.CTk):
 
         def download_selected():
             selected_urls = [url for url, var in vars_dict.items() if var.get()]
-            dialog.destroy()
+            dialog.close()
             if selected_urls:
                 threading.Thread(target=self.download_selected_items, args=(selected_urls,), daemon=True).start()
 
-        ctk.CTkButton(dialog, text="Download Selected", height=45, corner_radius=25,
-                      fg_color=self.theme["accent"], text_color=self.theme["bg"], hover_color=self.theme["accent_hover"],
-                      command=download_selected).pack(pady=20, padx=20, fill="x")
+        ctk.CTkButton(panel, text="Download selected", height=44,
+                      corner_radius=theme_ui.RADIUS_PILL,
+                      font=theme_ui.font("body_med"),
+                      fg_color=self.theme["accent"],
+                      text_color=self.theme["bg"],
+                      hover_color=self.theme["accent_hover"],
+                      command=download_selected).pack(fill="x", pady=(14, 0))
+        dialog.present()
 
     def _fetch_and_show_tracks(self, album_url, frame, vars_dict):
         try:
