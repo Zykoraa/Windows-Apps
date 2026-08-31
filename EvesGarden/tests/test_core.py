@@ -20,6 +20,7 @@ from library_index import (LibraryIndex, normalise_title, normalise_artist)
 from play_queue import PlayQueue
 import colorsys
 import downloader
+import metadata
 import smart_playlists
 import themes
 
@@ -567,6 +568,153 @@ class Smart(unittest.TestCase):
         first = rule.params()
         time.sleep(0.01)
         self.assertGreater(rule.params()[0], first[0])
+
+
+
+ITUNES_ITEM = {
+    "trackId": 12345, "trackName": "Gravity", "artistName": "John Mayer",
+    "collectionName": "Continuum", "collectionArtistName": "John Mayer",
+    "releaseDate": "2006-09-12T07:00:00Z", "trackTimeMillis": 245773,
+    "trackNumber": 4, "discNumber": 1,
+    "trackViewUrl": "https://music.apple.com/track/12345",
+    "artworkUrl100": "https://example.test/a/100x100bb.jpg",
+}
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+class FakeSession:
+    """Counts calls, so the cache can be shown to actually cache."""
+
+    def __init__(self, payload=None, explode=False):
+        self.payload = payload if payload is not None else {"results": []}
+        self.explode = explode
+        self.calls = 0
+
+    def get(self, url, params=None, timeout=None):
+        self.calls += 1
+        if self.explode:
+            raise IOError("no network")
+        return FakeResponse(self.payload)
+
+
+class Keyless(unittest.TestCase):
+    """The provider that needs no account, so the app works before setup.
+
+    Spotify supplies the whole tag set and needs a registered application to
+    do it; this has to supply the same fields from an endpoint that needs
+    nothing, or the no-setup path produces a library with no albums or years.
+    """
+
+    def provider(self, results=(ITUNES_ITEM,), explode=False):
+        session = FakeSession({"results": list(results)}, explode=explode)
+        return metadata.ITunesProvider(session=session), session
+
+    def test_maps_a_result_into_the_shared_shape(self):
+        p, _ = self.provider()
+        track = p.search("gravity")[0]
+        self.assertEqual(track["source"], "itunes")
+        self.assertEqual(track["title"], "Gravity")
+        self.assertEqual(track["artist"], "John Mayer")
+        self.assertEqual(track["artists"], ["John Mayer"])
+        self.assertEqual(track["album"], "Continuum")
+        self.assertEqual(track["year"], "2006")
+        self.assertEqual(track["duration_ms"], 245773)
+        self.assertAlmostEqual(track["duration"], 245.773, places=2)
+
+    def test_supplies_every_field_the_tagger_writes(self):
+        p, _ = self.provider()
+        info = p.track_info(p.search("gravity")[0])
+        # Exactly the keys apply_metadata reads; a missing one silently
+        # produces a file with no album or no track number.
+        for key in ("name", "artists", "album", "album_artist", "cover_url",
+                    "track_number", "disc_number", "release_date",
+                    "duration_ms"):
+            self.assertIn(key, info)
+            self.assertIsNotNone(info[key], key)
+        self.assertEqual(info["track_number"], 4)
+        self.assertEqual(info["release_date"], "2006")
+
+    def test_asks_for_artwork_bigger_than_a_thumbnail(self):
+        p, _ = self.provider()
+        info = p.track_info(p.search("gravity")[0])
+        self.assertIn("600x600", info["cover_url"])
+
+    def test_skips_results_that_are_not_tracks(self):
+        p, _ = self.provider(results=[{"trackName": "No artist"},
+                                      {"artistName": "No title"},
+                                      ITUNES_ITEM])
+        self.assertEqual(len(p.search("x")), 1)
+
+    def test_repeat_searches_do_not_hit_the_network_again(self):
+        p, session = self.provider()
+        p.search("gravity")
+        p.search("gravity")
+        self.assertEqual(session.calls, 1)
+
+    def test_an_empty_query_never_asks(self):
+        p, session = self.provider()
+        self.assertEqual(p.search("   "), [])
+        self.assertEqual(session.calls, 0)
+
+    def test_a_dead_network_is_an_empty_answer_not_a_crash(self):
+        p, _ = self.provider(explode=True)
+        self.assertEqual(p.search("gravity"), [])
+        self.assertIsNone(p.lookup("gravity"))
+
+    def test_spotify_items_reshape_to_the_same_thing(self):
+        spotify_item = {
+            "id": "abc", "name": "Gravity", "duration_ms": 245773,
+            "artists": [{"name": "John Mayer"}],
+            "external_urls": {"spotify": "https://open.spotify.com/track/abc"},
+            "album": {"name": "Continuum", "release_date": "2006-09-12",
+                      "images": [{"url": "big"}, {"url": "small"}]},
+        }
+        track = metadata.as_spotify_track(spotify_item)
+        itunes, _ = self.provider()
+        self.assertEqual(set(track) - {"source"},
+                         set(itunes.search("gravity")[0])
+                         - {"source", "track_number", "disc_number",
+                            "album_artist"})
+
+
+class KeylessDownload(unittest.TestCase):
+    """process_track has to accept resolved metadata, not just a URL.
+
+    An iTunes result has no Spotify URL to look up, so if the pipeline could
+    only start from one, the no-account path would stop at the download.
+    """
+
+    def test_a_metadata_dict_skips_the_spotify_lookup(self):
+        import shutil
+        import tempfile
+
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, True)
+        meta = {"name": "Song", "artists": ["Band"], "album": "Album",
+                "duration_ms": 180000}
+        # Pre-create the file so the "already have it" path returns before
+        # any network work, while still proving sp was never touched.
+        open(os.path.join(out, "Band - Song.mp3"), "wb").close()
+
+        class Exploding:
+            def __getattr__(self, name):
+                raise AssertionError("Spotify was consulted for a dict")
+
+        result = downloader.process_track(Exploding(), meta, out,
+                                          log_callback=lambda m: None)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["skipped"])
+        self.assertIs(result["metadata"], meta)
 
 
 class Scoring(unittest.TestCase):

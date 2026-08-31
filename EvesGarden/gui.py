@@ -78,6 +78,7 @@ from library_index import LibraryIndex, SORTS
 from library_view import LibraryView
 import queue as thread_queue
 import dialogs
+import metadata
 import palette
 import motion
 import ui_widgets
@@ -226,7 +227,12 @@ class App(ctk.CTk):
         self.queue_visible = False
         self._queue_meta = {}
 
-        self.discover = Discover(self.sp, _base_ydl_opts, _score_candidate)
+        # Needs no account, so search and download work before -- or
+        # without -- any Spotify setup. Spotify stays preferred where it is
+        # configured; this is the floor.
+        self.catalogue = metadata.ITunesProvider()
+        self.discover = Discover(self.sp, _base_ydl_opts, _score_candidate,
+                                 fallback=self.catalogue)
         self.discover_results = []
         self._discover_timer = None
         self._streaming_track = None
@@ -1714,14 +1720,18 @@ class App(ctk.CTk):
             "and a Spotify link pasted above downloads straight away.")
 
         if self.spotify_error:
-            self.url_entry.configure(state="disabled")
-            self.download_button.configure(state="disabled")
-            self.log(self.spotify_error)
+            # Searching and downloading no longer need an account, so this is
+            # an invitation rather than a wall. It used to disable the search
+            # box and the download button, which left the whole screen inert.
+            self.dl_hint.configure(
+                text="Searching %s. Connect Spotify for your own playlists."
+                     % self.catalogue.name)
             self.setup_prompt_btn = ctk.CTkButton(
-                self.dl_frame, text="Set up Spotify access", height=42,
-                corner_radius=21, font=ctk.CTkFont(size=14, weight="bold"),
-                command=self.open_setup)
-            self.setup_prompt_btn.grid(row=2, column=0, padx=36, pady=(0, 8))
+                self.dl_frame, text="Set up Spotify access", height=40,
+                corner_radius=theme_ui.RADIUS_PILL,
+                font=theme_ui.font("body_med"), command=self.open_setup)
+            self.setup_prompt_btn.grid(row=2, column=0, padx=36, pady=(0, 8),
+                                       sticky="e")
 
     STATE_STYLE = {
         QUEUED:    ("\u25cb", "text_secondary"),
@@ -3252,7 +3262,7 @@ class App(ctk.CTk):
 
     def run_discover_search(self):
         query = self.url_entry.get().strip()
-        if not query or "http" in query or not self.sp:
+        if not query or "http" in query:
             return
         self._render_discover_message("Searching...")
 
@@ -3401,8 +3411,17 @@ class App(ctk.CTk):
 
     def download_discovered(self, track):
         """Keep a previewed track: download and tag it properly."""
-        self._start_batch([track["url"]],
-                          labels={track["url"]: f"{track['artist']} - {track['title']}"})
+        label = f"{track['artist']} - {track['title']}"
+        if track.get("source") == "itunes":
+            # There is no Spotify URL to look up, so the metadata that came
+            # back with the search result goes down the pipeline instead. The
+            # key is only an identity for the job list.
+            key = track.get("url") or track["id"]
+            self._start_batch(
+                [key], labels={key: label},
+                meta={key: metadata.ITunesProvider.track_info(track)})
+            return
+        self._start_batch([track["url"]], labels={track["url"]: label})
 
     def on_key_release(self, event):
         if self.search_timer:
@@ -3660,7 +3679,7 @@ class App(ctk.CTk):
 
         self._start_batch(track_urls)
 
-    def _start_batch(self, track_urls, labels=None):
+    def _start_batch(self, track_urls, labels=None, meta=None):
         if not track_urls:
             self._gui_log("Nothing to download.")
             return
@@ -3668,7 +3687,7 @@ class App(ctk.CTk):
             track_urls, LIBRARY_DIR,
             jobs=int(self.settings.get("download_jobs") or 3),
             quality=self.settings.get("download_quality"),
-            labels=labels,
+            labels=labels, meta=meta,
         )
         if not started:
             self._gui_log("A download is already running.")
@@ -3685,6 +3704,12 @@ class App(ctk.CTk):
         self._sync_download_buttons()
         self.load_library()
 
+
+    def _spotify_required(self, what):
+        """Tell the user what is missing instead of doing nothing."""
+        self._gui_log("%s needs a Spotify connection. %s"
+                      % (what, self.spotify_error or
+                         "Use Set up Spotify access."))
 
     def start_download(self):
         url = self.url_entry.get().strip()

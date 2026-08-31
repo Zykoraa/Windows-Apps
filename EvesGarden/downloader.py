@@ -549,17 +549,24 @@ def sanitize_filename(filename):
     return cleaned or "untitled"
 
 
-def process_track(sp, track_url, output_dir, log_callback=print, quality="192"):
-    """Download one Spotify track. Returns a result dict.
+def process_track(sp, track, output_dir, log_callback=print, quality="192"):
+    """Download one track. Returns a result dict.
+
+    `track` is either a Spotify URL to look up, or a metadata dict that has
+    already been resolved -- which is how tracks found through a provider
+    that has no Spotify URL to give (iTunes) reach the same pipeline.
 
     The dict always carries `ok`, so callers can count real successes; the
     previous version returned metadata even when the download had failed.
     """
-    try:
-        metadata = get_spotify_track_info(sp, track_url)
-    except Exception as e:
-        log_callback(f"  x Could not read track metadata: {e}")
-        return {"ok": False, "error": str(e), "metadata": None}
+    if isinstance(track, dict):
+        metadata = track
+    else:
+        try:
+            metadata = get_spotify_track_info(sp, track)
+        except Exception as e:
+            log_callback(f"  x Could not read track metadata: {e}")
+            return {"ok": False, "error": str(e), "metadata": None}
 
     label = f"{', '.join(metadata['artists'])} - {metadata['name']}"
     safe_filename = sanitize_filename(label)

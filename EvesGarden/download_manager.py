@@ -21,11 +21,16 @@ TERMINAL = (DONE, SKIPPED, FAILED, CANCELLED)
 
 
 class Job:
-    __slots__ = ("url", "label", "state", "error", "path", "started", "finished")
+    __slots__ = ("url", "label", "meta", "state", "error", "path", "started",
+                 "finished")
 
-    def __init__(self, url, label=None):
+    def __init__(self, url, label=None, meta=None):
         self.url = url
         self.label = label or url
+        # Metadata resolved before the batch started. Tracks from a provider
+        # with no Spotify URL arrive this way; the url is then only an
+        # identity for the job list.
+        self.meta = meta
         self.state = QUEUED
         self.error = None
         self.path = None
@@ -89,13 +94,15 @@ class DownloadManager:
 
     # ----------------------------------------------------------- control
 
-    def start(self, urls, out_dir, jobs=3, quality="192", labels=None):
+    def start(self, urls, out_dir, jobs=3, quality="192", labels=None,
+              meta=None):
         """Queue `urls` and begin. Returns False if a batch is already running."""
         if self.running:
             return False
         labels = labels or {}
+        meta = meta or {}
         with self._lock:
-            self.jobs = [Job(u, labels.get(u)) for u in urls]
+            self.jobs = [Job(u, labels.get(u), meta.get(u)) for u in urls]
         self._cancel.clear()
         self._thread = threading.Thread(
             target=self._run, args=(out_dir, jobs, quality), daemon=True
@@ -172,8 +179,8 @@ class DownloadManager:
 
         try:
             result = self._process_track(
-                self._sp, job.url, out_dir,
-                log_callback=self._log, quality=quality,
+                self._sp, job.meta if job.meta is not None else job.url,
+                out_dir, log_callback=self._log, quality=quality,
             )
         except Exception as e:
             result = {"ok": False, "error": f"{type(e).__name__}: {e}"}

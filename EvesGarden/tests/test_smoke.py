@@ -32,6 +32,29 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WALK_TIMEOUT_MS = 90_000
 
 
+class OfflineCatalogue:
+    """Stands in for the keyless metadata provider.
+
+    The palette searches a provider on a worker thread, and since that gained
+    a fallback needing no account it became a live network call -- which made
+    this test depend on Apple's servers being up, and land its results at an
+    unpredictable moment. Canned results exercise the same code path without
+    either problem. No cover_url, so no artwork fetch either.
+    """
+
+    name = "Offline"
+
+    @staticmethod
+    def search(query, limit=25):
+        return [{"source": "offline", "id": "offline:%d" % i,
+                 "title": "Result %d for %s" % (i, query),
+                 "artists": ["Someone"], "artist": "Someone",
+                 "album": "An Album", "year": "2020", "duration": 180.0,
+                 "duration_ms": 180000, "url": "", "cover_url": None,
+                 "cover_large": None}
+                for i in range(min(3, limit))]
+
+
 def _has_display():
     try:
         import tkinter
@@ -216,6 +239,8 @@ class Smoke(unittest.TestCase):
         try:
             app = gui.App()
             app.geometry("1280x800+40+40")
+            app.discover.fallback = OfflineCatalogue()
+            app.catalogue = OfflineCatalogue()
             walk = SurfaceWalk(gui, app)
             walk.run()
             noise = sys.stderr.getvalue()

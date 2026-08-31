@@ -20,8 +20,11 @@ MAX_RESULTS = 25
 
 
 class Discover:
-    def __init__(self, sp, ydl_opts_factory, score_fn):
+    def __init__(self, sp, ydl_opts_factory, score_fn, fallback=None):
         self.sp = sp
+        # Used when Spotify is not configured, or does not answer. It needs no
+        # credentials, so the app is useful before any setup is done.
+        self.fallback = fallback
         self._ydl_opts = ydl_opts_factory
         self._score = score_fn
         self._stream_cache = {}
@@ -39,9 +42,31 @@ class Discover:
     # ---------------------------------------------------------------- search
 
     def search(self, query, limit=MAX_RESULTS):
-        """Spotify tracks for a query, flattened to what the UI needs."""
-        if not query.strip() or self.sp is None:
+        """Tracks for a query, flattened to what the UI needs.
+
+        Spotify first because its catalogue matching is better, but a failure
+        here is not the end of it: an empty answer or an exception falls
+        through to whatever provider needs no account.
+        """
+        if not query.strip():
             return []
+        if self.sp is None:
+            return self._fallback_search(query, limit)
+        try:
+            found = self._spotify_search(query, limit)
+        except Exception:
+            found = []
+        return found or self._fallback_search(query, limit)
+
+    def _fallback_search(self, query, limit):
+        if self.fallback is None:
+            return []
+        try:
+            return self.fallback.search(query, limit=limit)
+        except Exception:
+            return []
+
+    def _spotify_search(self, query, limit=MAX_RESULTS):
         # Spotify caps this endpoint at 10 per call for app-only credentials
         # -- anything larger answers "400 Invalid limit" -- but offset paging
         # still works, so ask for several small pages.
@@ -65,6 +90,7 @@ class Discover:
             album = track.get("album") or {}
             images = album.get("images") or []
             out.append({
+                "source": "spotify",
                 "id": track["id"],
                 "title": track["name"],
                 "artists": [a["name"] for a in track.get("artists") or []],
