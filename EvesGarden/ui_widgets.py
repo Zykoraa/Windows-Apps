@@ -655,9 +655,39 @@ def _g_search(c, cx, cy, s, col, w):
                           fill=col, width=w, capstyle=tk.ROUND)]
 
 
+def _g_leaf(c, cx, cy, s, col, w):
+    """The app mark: a record with a sprout growing out of it.
+
+    Eve's Garden in one silhouette. A filled disc survives being drawn at
+    twenty pixels in a header where an outlined leaf turns to mush, and the
+    two leaves read even when they are three pixels across. The spindle hole
+    is punched in the canvas background rather than left transparent, because
+    a Tk canvas item has no alpha to punch with.
+    """
+    ground = c.cget("bg")
+    r = 6.9
+    disc = _pts([(12 - r, 15.9 - r), (12 + r, 15.9 + r)], cx, cy, s)
+    items = [c.create_oval(disc[0], disc[1], disc[2], disc[3],
+                           fill=col, outline=col)]
+    hole = _pts([(10.8, 14.7), (13.2, 17.1)], cx, cy, s)
+    items.append(c.create_oval(hole[0], hole[1], hole[2], hole[3],
+                               fill=ground, outline=ground))
+    items.append(c.create_line(_pts([(12, 9.6), (12, 2.0)], cx, cy, s),
+                               fill=col, width=max(1.0, w * 1.05),
+                               capstyle=tk.ROUND))
+    for flip in (1, -1):
+        items.append(c.create_polygon(
+            _pts([(12, 7.4), (12 + flip * 3.4, 6.4), (12 + flip * 5.4, 1.9),
+                  (12 + flip * 1.5, 2.6)], cx, cy, s),
+            fill=col, outline=col, width=max(0.5, w * 0.35),
+            joinstyle=tk.ROUND, smooth=True))
+    return items
+
+
 GLYPHS = {
     "close": _g_close,
     "search": _g_search,
+    "leaf": _g_leaf,
     "play": _g_play,
     "pause": _g_pause,
     "prev": _g_prev,
@@ -672,15 +702,31 @@ GLYPHS = {
 
 
 def glyph_canvas(parent, glyph, size=20, colour="#ffffff",
-                 background="#000000", stroke=1.9):
+                 background="#000000", stroke=1.9, fill=0.66):
     """A drawn glyph with no behaviour -- an icon rather than a control."""
     canvas = tk.Canvas(parent, width=size, height=size, highlightthickness=0,
                        bd=0, takefocus=0, bg=background)
+    canvas._glyph_spec = (glyph, size, fill, stroke)
+    repaint_glyph(canvas, colour, background)
+    return canvas
+
+
+def repaint_glyph(canvas, colour, background):
+    """Redraw a glyph_canvas in new colours.
+
+    Canvas items cannot be recoloured as a group, and for the app mark the
+    background is not merely behind the glyph -- it is what punches the
+    spindle hole out of it -- so a theme change has to redraw rather than
+    reconfigure.
+    """
+    glyph, size, fill, stroke = getattr(canvas, "_glyph_spec",
+                                        (None, 20, 0.66, 1.9))
+    canvas.configure(bg=background)
+    canvas.delete("all")
     draw = GLYPHS.get(glyph)
     if draw:
         centre = size / 2.0
-        draw(canvas, centre, centre, size * 0.66 / GLYPH_BOX, colour, stroke)
-    return canvas
+        draw(canvas, centre, centre, size * fill / GLYPH_BOX, colour, stroke)
 
 
 class GlyphButton(tk.Canvas):

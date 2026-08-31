@@ -166,7 +166,8 @@ class CommandPalette:
         self.rule.configure(fg_color=t["surface_hover"])
         self.list.configure(fg_color=t["surface"])
         self.entry.configure(text_color=t["text"])
-        self.icon.configure(bg=t["surface"])
+        # configure(bg=...) alone left the glyph itself in the old colour.
+        ui_widgets.repaint_glyph(self.icon, t["text_secondary"], t["surface"])
         self.footer.configure(text_color=t["text_secondary"])
         if self.visible:
             self._refresh()

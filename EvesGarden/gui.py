@@ -647,27 +647,11 @@ class App(ctk.CTk):
         self.title_bar.bind("<Button-1>", self.get_pos)
         self.title_bar.bind("<Double-Button-1>", self.toggle_maximize)
 
-        # The mark used to be a bare U+2721 glyph, which rendered differently
-        # (or not at all) depending on the installed font.
-        try:
-            art = app_icon.icon_image(22)
-            self._title_icon_img = ctk.CTkImage(light_image=art, dark_image=art,
-                                                size=(22, 22))
-            self.title_icon = ctk.CTkLabel(self.title_bar, text="",
-                                           image=self._title_icon_img)
-            self.title_icon.pack(side="left", padx=(14, 9))
-            self.title_icon.bind("<B1-Motion>", self.move_window)
-            self.title_icon.bind("<Button-1>", self.get_pos)
-            self.title_icon.bind("<Double-Button-1>", self.toggle_maximize)
-        except Exception as e:
-            print(f"Could not draw title icon: {e}")
-
-        self.title_lbl = ctk.CTkLabel(self.title_bar, text="Eve's Garden",
-                                      font=ctk.CTkFont(weight="bold", size=14))
-        self.title_lbl.pack(side="left", padx=(0, 15))
-        self.title_lbl.bind("<B1-Motion>", self.move_window)
-        self.title_lbl.bind("<Button-1>", self.get_pos)
-        self.title_lbl.bind("<Double-Button-1>", self.toggle_maximize)
+        # No mark or title here any more. A frameless window that redraws
+        # the system title bar and then fills it with the same icon and name
+        # the system would have shown is just an imitation of the chrome it
+        # went to the trouble of removing; the branding belongs inside the
+        # app, where there is room to do it properly. See the masthead below.
 
         self.close_btn = ctk.CTkButton(self.title_bar, text=" ✕ ", width=40, height=35, corner_radius=0, fg_color="transparent", hover_color="#e81123", command=self.destroy)
         self.close_btn.pack(side="right")
@@ -704,6 +688,20 @@ class App(ctk.CTk):
         # Songs / Albums / Artists -- the library used to be a flat glob of
         # one folder, discarding the album and artist tags every download
         # writes.
+        # The masthead: the app's mark and name at the top-left of its own
+        # content, rather than pretending to be a Windows title bar.
+        self.brand = ctk.CTkFrame(self.library_header, fg_color="transparent")
+        self.brand.pack(side="left", padx=(2, 18))
+        self.brand_mark = ui_widgets.glyph_canvas(
+            self.brand, "leaf", size=34, colour=self.theme["accent"],
+            background=self.theme["bg"], stroke=2.1, fill=0.88)
+        self.brand_mark.pack(side="left", padx=(0, 9))
+        self.brand_word = ctk.CTkLabel(
+            self.brand, text="Eve's Garden",
+            font=theme_ui.font("display", size=19),
+            text_color=self.theme["text"])
+        self.brand_word.pack(side="left")
+
         self.view_tabs = ctk.CTkSegmentedButton(
             self.library_header, values=["Songs", "Liked", "Recent", "Playlists", "Albums",
                     "Artists", "Duplicates"],
@@ -1774,8 +1772,10 @@ class App(ctk.CTk):
 
         if hasattr(self, 'canvas'):
             self.canvas.configure(bg=t["bg"])
-        if hasattr(self, 'title_lbl'):
-            self.title_lbl.configure(text_color=t["text"])
+        if getattr(self, "brand_word", None) is not None:
+            self.brand_word.configure(text_color=t["text"])
+        if getattr(self, "brand_mark", None) is not None:
+            ui_widgets.repaint_glyph(self.brand_mark, t["accent"], t["bg"])
         if hasattr(self, 'lib_search_entry'):
             self.lib_search_entry.configure(fg_color=t["bg"], text_color=t["text"])
 
