@@ -17,7 +17,7 @@ import math
 import tkinter as tk
 
 import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 import motion
 import theme_ui
@@ -271,7 +271,10 @@ class SeekBar(tk.Canvas):
         self._buf_id = self.create_line(0, 0, 0, 0, capstyle=tk.ROUND)
         self._fill_id = self.create_line(0, 0, 0, 0, capstyle=tk.ROUND)
         self._tick_id = self.create_line(0, 0, 0, 0, state="hidden")
-        self._knob_id = self.create_oval(0, 0, 0, 0, width=0, state="hidden")
+        # An image, not an oval: a canvas oval this small is all staircase.
+        self._knob_id = self.create_image(0, 0, anchor="center",
+                                          state="hidden")
+        self._knob_cache = {}
         self._bubble_id = self.create_line(0, 0, 0, 0, capstyle=tk.ROUND,
                                            state="hidden")
         self._bubble_txt = self.create_text(0, 0, text="", state="hidden",
@@ -303,7 +306,7 @@ class SeekBar(tk.Canvas):
         self.itemconfigure(self._buf_id, fill=self._c_buffer)
         self.itemconfigure(self._fill_id, fill=theme["accent"])
         self.itemconfigure(self._tick_id, fill=self._c_tick)
-        self.itemconfigure(self._knob_id, fill=theme["text"])
+        self._knob_cache = {}
         self.itemconfigure(self._bubble_id, fill=theme["surface_hover"])
         self.itemconfigure(self._bubble_txt, fill=theme["text"])
         self._redraw()
@@ -375,11 +378,12 @@ class SeekBar(tk.Canvas):
             self._fill_id, width=w,
             state="normal" if self._value > 0.001 else "hidden")
 
-        show_knob = self._hover or self._dragging
-        r = self.KNOB_R if show_knob else 0
-        self.coords(self._knob_id, fill_x - r, cy - r, fill_x + r, cy + r)
-        self.itemconfigure(self._knob_id,
-                           state="normal" if show_knob else "hidden")
+        if self._hover or self._dragging:
+            self.coords(self._knob_id, fill_x, cy)
+            self.itemconfigure(self._knob_id, image=self._knob_sprite(),
+                               state="normal")
+        else:
+            self.itemconfigure(self._knob_id, state="hidden")
 
         self._paint_bubble(cy, w)
 
@@ -429,6 +433,23 @@ class SeekBar(tk.Canvas):
         self.itemconfigure(self._bubble_id, width=pill_h, state="normal")
         self.tag_raise(self._bubble_id)
         self.tag_raise(self._bubble_txt)
+
+    def _knob_sprite(self):
+        """The knob, anti-aliased, cached per colour pair."""
+        colour = self.theme["text"]
+        background = self.cget("bg")
+        key = (colour, background)
+        sprite = self._knob_cache.get(key)
+        if sprite is None:
+            size = self.KNOB_R * 2 + 2
+            surface = _AASurface(size, background)
+            centre = size / 2.0
+            surface.create_oval(centre - self.KNOB_R, centre - self.KNOB_R,
+                                centre + self.KNOB_R, centre + self.KNOB_R,
+                                fill=colour, outline=colour)
+            sprite = ImageTk.PhotoImage(surface.finish())
+            self._knob_cache[key] = sprite
+        return sprite
 
     def _animate_thickness(self, target):
         start = self._thickness
@@ -701,12 +722,191 @@ GLYPHS = {
 }
 
 
+
+# --------------------------------------------------- anti-aliased rendering
+
+# A Tk canvas does not anti-alias anything. A fifty-pixel filled circle comes
+# out with visibly stepped edges, which is what made the play button look
+# ragged, and every diagonal in the transport had the same staircase on it.
+# Tk has no way to turn that on, so the drawing is done in PIL at four times
+# the size and scaled back down, which costs about a millisecond a frame.
+SUPERSAMPLE = 4
+
+
+def _flat(points):
+    out = []
+    for x, y in points:
+        out.extend((x, y))
+    return out
+
+
+def _smooth_points(points, closed=False, steps=8):
+    """Subdivide through the points, standing in for Tk's smooth=True.
+
+    Catmull-Rom rather than Tk's B-spline: it passes through the control
+    points instead of being pulled inside them, which for these shapes is
+    both closer to what was drawn and slightly better looking.
+    """
+    if len(points) < 3:
+        return points
+    pts = list(points)
+    pts = ([pts[-1]] + pts + [pts[0], pts[1]] if closed
+           else [pts[0]] + pts + [pts[-1]])
+    out = []
+    for i in range(len(pts) - 3):
+        p0, p1, p2, p3 = pts[i], pts[i + 1], pts[i + 2], pts[i + 3]
+        for s in range(steps):
+            t = s / float(steps)
+            t2, t3 = t * t, t * t * t
+            out.append(tuple(
+                0.5 * ((2 * p1[k]) + (-p0[k] + p2[k]) * t
+                       + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2
+                       + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3)
+                for k in (0, 1)))
+    out.append(pts[-2])
+    return out
+
+
+class _AASurface:
+    """Enough of the Tk canvas drawing API for the glyph functions.
+
+    The glyphs are written against a canvas, and they are also drawn straight
+    onto one in a few places, so rather than rewriting them for PIL this
+    stands in for the canvas and records the same calls into an image.
+    """
+
+    def __init__(self, size, background, scale=SUPERSAMPLE):
+        self.scale = scale
+        self._bg = background
+        self.size = size
+        self.image = Image.new("RGB", (int(size * scale), int(size * scale)),
+                               background)
+        self.draw = ImageDraw.Draw(self.image)
+
+    def cget(self, option):
+        # _g_leaf asks for the background: it punches the spindle hole with it.
+        return self._bg if option == "bg" else ""
+
+    # ------------------------------------------------------------ helpers
+
+    def _points(self, args):
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            flat = list(args[0])
+        else:
+            flat = list(args)
+        return [(flat[i] * self.scale, flat[i + 1] * self.scale)
+                for i in range(0, len(flat) - 1, 2)]
+
+    def _dot(self, point, radius, fill):
+        x, y = point
+        self.draw.ellipse([x - radius, y - radius, x + radius, y + radius],
+                          fill=fill)
+
+    def _arrowhead(self, points, shape, fill):
+        _d1, d2, d3 = shape
+        d2, d3 = d2 * self.scale, d3 * self.scale
+        (x1, y1), (x2, y2) = points[-2], points[-1]
+        dx, dy = x2 - x1, y2 - y1
+        length = math.hypot(dx, dy) or 1.0
+        ux, uy = dx / length, dy / length
+        bx, by = x2 - ux * d2, y2 - uy * d2
+        px, py = -uy * d3, ux * d3
+        self.draw.polygon([(x2, y2), (bx + px, by + py), (bx - px, by - py)],
+                          fill=fill)
+
+    @staticmethod
+    def _box(points):
+        (x0, y0), (x1, y1) = points[0], points[1]
+        return [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+
+    @staticmethod
+    def _colour(value):
+        return value or None
+
+    # ------------------------------------------------- the canvas subset
+
+    def create_line(self, *args, **kw):
+        if kw.get("state") == "hidden":
+            return 0
+        points = self._points(args)
+        if kw.get("smooth"):
+            points = _smooth_points(points)
+        fill = self._colour(kw.get("fill"))
+        width = max(1.0, kw.get("width", 1) * self.scale)
+        if fill and len(points) >= 2:
+            self.draw.line(_flat(points), fill=fill, width=int(round(width)),
+                           joint="curve")
+            if kw.get("capstyle") == "round":
+                for end in (points[0], points[-1]):
+                    self._dot(end, width / 2.0, fill)
+            if kw.get("arrow"):
+                self._arrowhead(points, kw.get("arrowshape", (8, 10, 3)), fill)
+        return 0
+
+    def create_oval(self, *args, **kw):
+        if kw.get("state") == "hidden":
+            return 0
+        box = self._box(self._points(args))
+        outline = self._colour(kw.get("outline"))
+        self.draw.ellipse(box, fill=self._colour(kw.get("fill")),
+                          outline=outline,
+                          width=int(round(max(1.0, kw.get("width", 1)
+                                              * self.scale))))
+        return 0
+
+    def create_polygon(self, *args, **kw):
+        if kw.get("state") == "hidden":
+            return 0
+        points = self._points(args)
+        if kw.get("smooth"):
+            points = _smooth_points(points, closed=True)
+        if len(points) >= 3:
+            self.draw.polygon(_flat(points), fill=self._colour(kw.get("fill")),
+                              outline=self._colour(kw.get("outline")))
+        return 0
+
+    def create_arc(self, *args, **kw):
+        if kw.get("state") == "hidden":
+            return 0
+        box = self._box(self._points(args))
+        start = float(kw.get("start", 0.0))
+        extent = float(kw.get("extent", 90.0))
+        # Tk measures degrees anticlockwise from three o'clock; PIL measures
+        # them clockwise, because its y axis points down.
+        self.draw.arc(box, -(start + extent), -start,
+                      fill=self._colour(kw.get("outline")),
+                      width=int(round(max(1.0, kw.get("width", 1)
+                                          * self.scale))))
+        return 0
+
+    def finish(self):
+        return self.image.resize((self.size, self.size),
+                                 Image.Resampling.LANCZOS)
+
+
+def render_glyph(glyph, size, colour, background, stroke=1.9, fill=0.66,
+                 disc=None, disc_radius=None, press=1.0):
+    """One glyph, optionally on a filled disc, as an anti-aliased image."""
+    surface = _AASurface(size, background)
+    centre = size / 2.0
+    if disc and disc_radius and disc_radius > 0:
+        surface.create_oval(centre - disc_radius, centre - disc_radius,
+                            centre + disc_radius, centre + disc_radius,
+                            fill=disc, outline=disc)
+    draw = GLYPHS.get(glyph)
+    if draw:
+        draw(surface, centre, centre, size * fill / GLYPH_BOX * press,
+             colour, stroke * press)
+    return surface.finish()
+
+
 def glyph_canvas(parent, glyph, size=20, colour="#ffffff",
                  background="#000000", stroke=1.9, fill=0.66):
     """A drawn glyph with no behaviour -- an icon rather than a control."""
     canvas = tk.Canvas(parent, width=size, height=size, highlightthickness=0,
                        bd=0, takefocus=0, bg=background)
     canvas._glyph_spec = (glyph, size, fill, stroke)
+    canvas._glyph_item = None
     repaint_glyph(canvas, colour, background)
     return canvas
 
@@ -722,11 +922,14 @@ def repaint_glyph(canvas, colour, background):
     glyph, size, fill, stroke = getattr(canvas, "_glyph_spec",
                                         (None, 20, 0.66, 1.9))
     canvas.configure(bg=background)
-    canvas.delete("all")
-    draw = GLYPHS.get(glyph)
-    if draw:
-        centre = size / 2.0
-        draw(canvas, centre, centre, size * fill / GLYPH_BOX, colour, stroke)
+    image = render_glyph(glyph, size, colour, background, stroke, fill)
+    canvas._glyph_photo = ImageTk.PhotoImage(image)
+    item = getattr(canvas, "_glyph_item", None)
+    if item is None:
+        canvas._glyph_item = canvas.create_image(0, 0, anchor="nw",
+                                                 image=canvas._glyph_photo)
+    else:
+        canvas.itemconfigure(item, image=canvas._glyph_photo)
 
 
 class GlyphButton(tk.Canvas):
@@ -758,8 +961,8 @@ class GlyphButton(tk.Canvas):
         self._active = False
         self._hover = 0.0
         self._pressed = False
-        self._items = []
-        self._disc = None
+        self._photo = None
+        self._item = None
 
         super().__init__(parent, width=size, height=size, highlightthickness=0,
                          bd=0, takefocus=0, **kwargs)
@@ -816,33 +1019,27 @@ class GlyphButton(tk.Canvas):
         return ink, motion.blend(self._bg, t["surface_hover"], self._hover)
 
     def _redraw(self):
-        for item in self._items:
-            self.delete(item)
-        self._items = []
-        if self._disc is not None:
-            self.delete(self._disc)
-            self._disc = None
-
         ink, disc = self._colours()
-        c = self._size / 2.0
         # The whole control dips slightly while held, which is the only
         # feedback a canvas can give without a border.
         press = 0.94 if self._pressed else 1.0
 
+        radius = 0.0
         if self.primary:
-            r = (self._size / 2.0 - 1) * (1 + 0.04 * self._hover) * press
-            self._disc = self.create_oval(c - r, c - r, c + r, c + r,
-                                          fill=disc, outline=disc)
+            radius = (self._size / 2.0 - 1) * (1 + 0.04 * self._hover) * press
         elif self._hover > 0.01:
-            r = (self._size / 2.0 - 2) * press
-            self._disc = self.create_oval(c - r, c - r, c + r, c + r,
-                                          fill=disc, outline=disc)
+            radius = (self._size / 2.0 - 2) * press
 
-        draw = GLYPHS.get(self._glyph)
-        if draw is None:
-            return
-        s = self._size * self._scale / GLYPH_BOX * press
-        self._items = draw(self, c, c, s, ink, self._stroke * press)
+        image = render_glyph(self._glyph, self._size, ink, self._bg,
+                             stroke=self._stroke, fill=self._scale,
+                             disc=disc if radius else None,
+                             disc_radius=radius, press=press)
+        self._photo = ImageTk.PhotoImage(image)
+        if self._item is None:
+            self._item = self.create_image(0, 0, anchor="nw",
+                                           image=self._photo)
+        else:
+            self.itemconfigure(self._item, image=self._photo)
 
     def _animate_hover(self, target):
         start = self._hover

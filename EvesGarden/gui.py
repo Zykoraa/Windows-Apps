@@ -459,7 +459,6 @@ class App(ctk.CTk):
         ]
 
     def _go_to_view(self, name):
-        self.view_tabs.set(name)
         self.set_library_view(name)
 
     def _toggle_mute(self):
@@ -2510,6 +2509,12 @@ class App(ctk.CTk):
         self.library_view = name
         self.library.playlist_id = None
         self.settings.set("library_view", name)
+        # The segmented button updates itself when the user clicks it, but not
+        # when anything else switches view -- so the palette, a restored
+        # setting or a new playlist all left the tab strip highlighting a view
+        # that was no longer on screen.
+        if getattr(self, "view_tabs", None) is not None:
+            self.view_tabs.set(name)
         self.library.set_view(name)
         self.render_library()
 
