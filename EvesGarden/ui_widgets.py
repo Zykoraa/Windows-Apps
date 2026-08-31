@@ -646,8 +646,18 @@ def _g_close(c, cx, cy, s, col, w):
                           width=w, capstyle=tk.ROUND)]
 
 
+def _g_search(c, cx, cy, s, col, w):
+    r = 5.4
+    box = _pts([(10.4 - r, 10.4 - r), (10.4 + r, 10.4 + r)], cx, cy, s)
+    return [c.create_oval(box[0], box[1], box[2], box[3], outline=col,
+                          width=w),
+            c.create_line(_pts([(14.5, 14.5), (19.4, 19.4)], cx, cy, s),
+                          fill=col, width=w, capstyle=tk.ROUND)]
+
+
 GLYPHS = {
     "close": _g_close,
+    "search": _g_search,
     "play": _g_play,
     "pause": _g_pause,
     "prev": _g_prev,
@@ -659,6 +669,18 @@ GLYPHS = {
     "volume_low": _g_volume_low,
     "volume_high": _g_volume_high,
 }
+
+
+def glyph_canvas(parent, glyph, size=20, colour="#ffffff",
+                 background="#000000", stroke=1.9):
+    """A drawn glyph with no behaviour -- an icon rather than a control."""
+    canvas = tk.Canvas(parent, width=size, height=size, highlightthickness=0,
+                       bd=0, takefocus=0, bg=background)
+    draw = GLYPHS.get(glyph)
+    if draw:
+        centre = size / 2.0
+        draw(canvas, centre, centre, size * 0.66 / GLYPH_BOX, colour, stroke)
+    return canvas
 
 
 class GlyphButton(tk.Canvas):

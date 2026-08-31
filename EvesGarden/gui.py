@@ -78,6 +78,7 @@ from library_index import LibraryIndex, SORTS
 from library_view import LibraryView
 import queue as thread_queue
 import dialogs
+import palette
 import motion
 import ui_widgets
 import recycle
@@ -431,7 +432,50 @@ class App(ctk.CTk):
             self.bind(seq, guard(fn))
 
         self.bind("<slash>", lambda e: (self.lib_search_entry.focus_set(), "break")[1])
+        # Deliberately not wrapped in guard(): the palette has to be reachable
+        # from inside the search box, which is where you notice you wanted it.
+        self.bind("<Control-k>", self.toggle_palette)
+        self.bind("<Control-K>", self.toggle_palette)
         self.bind("<Escape>", lambda e: self._escape())
+
+    def toggle_palette(self, event=None):
+        """One box for the library, Spotify and the app's own commands."""
+        if getattr(self, "_palette", None) is None:
+            self._palette = palette.CommandPalette(
+                self, self.theme, self.index,
+                getattr(self, "discover", None), self._safe_after,
+                on_play=self.play_from_library,
+                on_download=self.download_discovered,
+                commands=self._palette_commands(),
+                thumb_loader=getattr(self.library, "request_thumb", None))
+        self._palette.toggle()
+        return "break"
+
+    def _palette_commands(self):
+        """The parts of the app worth reaching without hunting for a button."""
+        return [
+            ("Now playing", "Full-screen cover, lyrics and queue",
+             self.toggle_now_playing_overlay),
+            ("Add music", "Search Spotify and download", self.open_downloader),
+            ("Visualiser", "Toggle the spectrum view",
+             self.toggle_visualizer_visibility),
+            ("Up next", "Show the queue", self.toggle_queue),
+            ("Shuffle", "Toggle shuffle", self.toggle_shuffle),
+            ("Repeat", "Toggle repeat", self.toggle_repeat),
+            ("Liked songs", "Show everything you have hearted",
+             lambda: self._go_to_view("Liked")),
+            ("Albums", "Browse by album", lambda: self._go_to_view("Albums")),
+            ("Artists", "Browse by artist", lambda: self._go_to_view("Artists")),
+            ("Playlists", "Your playlists", lambda: self._go_to_view("Playlists")),
+            ("Duplicates", "Find and remove duplicate downloads",
+             lambda: self._go_to_view("Duplicates")),
+            ("Repair library", "Recover unconverted downloads",
+             self.run_repair),
+        ]
+
+    def _go_to_view(self, name):
+        self.view_tabs.set(name)
+        self.set_library_view(name)
 
     def _toggle_mute(self):
         self._muted_at = getattr(self, "_muted_at", None)
@@ -445,7 +489,9 @@ class App(ctk.CTk):
             self.on_volume(restore)
 
     def _escape(self):
-        if getattr(self, "setup_overlay", None) is not None:
+        if getattr(self, "_palette", None) is not None and self._palette.visible:
+            self._palette.close()
+        elif getattr(self, "setup_overlay", None) is not None:
             self.close_setup()
         elif getattr(self, "dl_visible", False):
             self.close_downloader()
@@ -1805,6 +1851,9 @@ class App(ctk.CTk):
                 dropdown_hover_color=t["surface_hover"], text_color=t["text"])
         for i in range(len(getattr(self, "lyrics_labels", []))):
             self._lyric_style(i, "active" if i == self.current_lyric_index else "next")
+
+        if getattr(self, "_palette", None) is not None:
+            self._palette.set_theme(t)
 
         view = getattr(self, "library", None)
         if view is not None:
