@@ -49,6 +49,7 @@ def list_playlists(user_sp):
         "owner": (me or {}).get("display_name") or mine or "you",
         "total": _liked_total(user_sp),
         "mine": True,
+        "readable": True,
         "liked": True,
     }]
 
@@ -65,13 +66,31 @@ def list_playlists(user_sp):
                 "name": item.get("name") or "Untitled",
                 "owner": ((item.get("owner") or {}).get("display_name")
                           or owner or ""),
-                "total": (item.get("tracks") or {}).get("total") or 0,
+                "total": _total(item),
                 "mine": owner == mine,
+                # Spotify stopped serving the contents of playlists you only
+                # follow: the endpoint answers 403 for anything you neither
+                # own nor collaborate on, however public it is.
+                "readable": owner == mine or bool(item.get("collaborative")),
                 "liked": False,
             })
         results = user_sp.next(results) if results.get("next") else None
 
     return out
+
+
+def _total(playlist):
+    """How many tracks a playlist holds.
+
+    Spotify renamed this block from `tracks` to `items` and stopped sending
+    the old one at all, so every playlist reported nothing. The old name is
+    still read, because a rename in one direction can happen in the other.
+    """
+    for key in ("items", "tracks"):
+        block = playlist.get(key)
+        if isinstance(block, dict) and block.get("total") is not None:
+            return block["total"]
+    return 0
 
 
 def _liked_total(user_sp):
@@ -86,12 +105,11 @@ def read_playlist(user_sp, playlist):
     if playlist.get("liked"):
         items = _pages(user_sp, user_sp.current_user_saved_tracks(limit=PAGE))
     else:
-        items = _pages(user_sp, user_sp.playlist_items(
-            playlist["id"], limit=100, additional_types=("track",)))
+        items = _playlist_items(user_sp, playlist["id"])
 
     tracks = []
     for item in items:
-        track = (item or {}).get("track")
+        track = _track_of(item)
         # Local files added from someone's own machine, and podcast episodes,
         # both arrive here with nothing to download.
         if not track or track.get("is_local") or track.get("type") != "track":
@@ -100,6 +118,36 @@ def read_playlist(user_sp, playlist):
         if meta:
             tracks.append(meta)
     return tracks
+
+
+def _playlist_items(user_sp, playlist_id):
+    """Page one playlist's contents.
+
+    Spotify moved this from /playlists/{id}/tracks to /playlists/{id}/items,
+    and the old path now answers 403 for every playlist -- including ones you
+    own. spotipy's playlist_items() still calls the old path, so this asks
+    for the new one directly. Only a missing method falls back; an HTTP error
+    is left to travel, because a 403 here means something the caller has to
+    tell the user about rather than paper over.
+    """
+    try:
+        page = user_sp._get("playlists/%s/items" % playlist_id, limit=100)
+    except AttributeError:
+        page = user_sp.playlist_items(playlist_id, limit=100,
+                                      additional_types=("track",))
+    return _pages(user_sp, page)
+
+
+def _track_of(item):
+    """The track on one playlist entry.
+
+    It used to be `track`. On the /items endpoint it is `item`. Liked Songs
+    comes from a different endpoint and still says `track`, so both names
+    have to work.
+    """
+    if not item:
+        return None
+    return item.get("item") or item.get("track")
 
 
 def _pages(user_sp, results):
@@ -198,7 +246,12 @@ def plan(tracks, owned, library_dir):
         path = match(meta, owned)
         if path is None:
             path = predicted_path(meta, library_dir)
-            if path not in seen:
+            # The file can be on disk and still not match: its tags may
+            # disagree with its name, or the index may not have caught up.
+            # Queueing it would download nothing -- process_track skips what
+            # already exists -- but it would tell the user a download was
+            # needed, and the count is the only thing they can see.
+            if path not in seen and not os.path.exists(path):
                 missing.append(meta)
         # A playlist can list the same song twice; a playlist here cannot
         # hold it twice, so the repeat is dropped rather than shifting every

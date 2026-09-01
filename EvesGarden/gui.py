@@ -2881,10 +2881,14 @@ class App(ctk.CTk):
         """
         owned = self.index.fingerprints()
         plans, missing, labels, meta = [], [], {}, {}
+        refused = []
         for playlist in chosen:
             try:
                 tracks = spotify_import.read_playlist(self.user_sp, playlist)
             except Exception as e:
+                # Spotify refuses playlists you do not own, so this is a
+                # thing that happens rather than a thing that went wrong.
+                refused.append(playlist["name"])
                 self._gui_log("Could not read %s: %s" % (playlist["name"], e))
                 continue
             paths, gaps = spotify_import.plan(tracks, owned, LIBRARY_DIR)
@@ -2900,7 +2904,8 @@ class App(ctk.CTk):
                 labels[key] = "%s - %s" % (", ".join(track["artists"]),
                                            track["name"])
                 missing.append(key)
-        self._safe_after(0, self._finish_import, plans, missing, labels, meta)
+        self._safe_after(0, self._finish_import, plans, missing, labels, meta,
+                         refused)
 
     def _playlist_named(self, name):
         """Reuse a playlist of this name, or make one.
@@ -2914,10 +2919,12 @@ class App(ctk.CTk):
                 return row["id"]
         return self.index.create_playlist(name)
 
-    def _finish_import(self, plans, missing, labels, meta):
+    def _finish_import(self, plans, missing, labels, meta, refused=()):
         self.import_pl_btn.configure(state="normal")
         if not plans:
-            self._import_status("Nothing could be read from Spotify.")
+            self._import_status(
+                "Spotify would not hand over %s."
+                % (", ".join(refused) if refused else "any of those"))
             return
 
         here = 0
@@ -2944,6 +2951,8 @@ class App(ctk.CTk):
         note = "%d playlist%s imported, %d track%s already here" % (
             len(plans), "" if len(plans) == 1 else "s",
             here, "" if here == 1 else "s")
+        if refused:
+            note += " (Spotify refused %d)" % len(refused)
         if missing:
             self._import_status("%s. Downloading the other %d."
                                 % (note, len(missing)))

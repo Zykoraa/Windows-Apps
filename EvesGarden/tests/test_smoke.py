@@ -225,16 +225,22 @@ class SurfaceWalk:
         self.mark("spotify import picker")
         picker = self.gui.dialogs.PlaylistPicker(app, app.theme, [
             {"id": "liked-songs", "name": "Liked Songs", "owner": "you",
-             "total": 412, "mine": True, "liked": True},
+             "total": 412, "mine": True, "readable": True, "liked": True},
             {"id": "p1", "name": "Late night", "owner": "you",
-             "total": 1, "mine": True, "liked": False},
-            {"id": "p2", "name": "Someone else's", "owner": "Ada",
-             "total": 90, "mine": False, "liked": False},
+             "total": 1, "mine": True, "readable": True, "liked": False},
+            {"id": "p2", "name": "Shared with you", "owner": "Ada",
+             "total": 90, "mine": False, "readable": True, "liked": False},
+            # Spotify refuses this one, so the row must be dead and say why.
+            {"id": "p3", "name": "One you only follow", "owner": "Mason",
+             "total": 87, "mine": False, "readable": False, "liked": False},
         ])
         picker.present()          # not show(): that blocks on its own loop
         yield 320
         picker._set_all(True)
         yield 120
+        assert len(picker._chosen()) == 3, (
+            "All ticked %d of 4 -- a playlist Spotify will not serve must "
+            "not be selectable" % len(picker._chosen()))
         picker._set_all(False)
         yield 120
         self.mark("close spotify import picker")

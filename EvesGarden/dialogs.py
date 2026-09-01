@@ -242,6 +242,16 @@ class PlaylistPicker(ModalDialog):
 
         for playlist in playlists:
             self._add_row(playlist)
+        blocked = [p for p in playlists if not p.get("readable", True)]
+        if blocked:
+            ctk.CTkLabel(
+                self.body, justify="left", wraplength=560, anchor="w",
+                font=theme_ui.font("caption"), text_color=t["text_secondary"],
+                text=("%d playlist%s you follow but do not own cannot be "
+                      "read: Spotify closed that to apps in 2024. Copying one "
+                      "into a playlist of your own makes it importable."
+                      % (len(blocked), "" if len(blocked) == 1 else "s"))
+            ).pack(fill="x", pady=(10, 0))
         if not playlists:
             ctk.CTkLabel(self.list, font=theme_ui.font("body"),
                          text_color=t["text_secondary"],
@@ -266,6 +276,11 @@ class PlaylistPicker(ModalDialog):
 
     def _add_row(self, playlist):
         t = self.theme
+        # Spotify serves the contents of playlists you own or collaborate on,
+        # and answers 403 for the rest however public they are. Offering one
+        # of those would import a playlist with nothing in it.
+        readable = playlist.get("readable", True)
+
         row = ctk.CTkFrame(self.list, fg_color="transparent", height=36)
         row.pack(fill="x", pady=1)
         row.pack_propagate(False)
@@ -273,21 +288,28 @@ class PlaylistPicker(ModalDialog):
         var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             row, text=playlist["name"], variable=var, command=self._sync,
-            font=theme_ui.font("body"), text_color=t["text"],
+            state="normal" if readable else "disabled",
+            font=theme_ui.font("body"),
+            text_color=t["text"] if readable else t["text_secondary"],
             fg_color=t["accent"], hover_color=t["accent_hover"],
             checkmark_color=t["bg"], border_color=t["surface_hover"],
             checkbox_width=19, checkbox_height=19, border_width=2,
             corner_radius=6).pack(side="left", padx=(12, 8))
 
         total = playlist.get("total") or 0
-        detail = "%d track%s" % (total, "" if total == 1 else "s")
-        if not playlist.get("mine") and playlist.get("owner"):
-            detail = "%s  by %s" % (detail, playlist["owner"])
+        if not readable:
+            detail = "Spotify won't share this one"
+        else:
+            detail = "%d track%s" % (total, "" if total == 1 else "s")
+            if not playlist.get("mine") and playlist.get("owner"):
+                detail = "%s  by %s" % (detail, playlist["owner"])
         ctk.CTkLabel(row, text=detail, anchor="e",
                      font=theme_ui.font("caption"),
                      text_color=t["text_secondary"]).pack(side="right",
                                                           padx=(8, 14))
-        self._rows.append((playlist, var))
+        # Only selectable rows are tracked, so All cannot tick a dead one.
+        if readable:
+            self._rows.append((playlist, var))
 
     # ------------------------------------------------------------ state
 

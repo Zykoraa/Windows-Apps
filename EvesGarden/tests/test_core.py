@@ -809,13 +809,22 @@ def _sp_track(name, artist, ms=200000, extra=None):
     return track
 
 
+def _item(track):
+    """A playlist entry as /items returns it: the track under "item"."""
+    return {"is_local": False, "item": track}
+
+
 class FakeSpotify:
     """Just enough of a signed-in client to page through an account."""
 
-    def __init__(self, playlists=(), items=None, liked=()):
+    def __init__(self, playlists=(), items=None, liked=(), forbidden=(),
+                 tracks_forbidden=True):
         self._playlists = list(playlists)
         self._items = items or {}
         self._liked = list(liked)
+        # Spotify serves /items for playlists you own and 403s the rest.
+        self.forbidden = set(forbidden)
+        self.tracks_forbidden = tracks_forbidden
         self.calls = []
 
     def current_user(self):
@@ -839,12 +848,133 @@ class FakeSpotify:
         return self._page(self._liked, limit, "liked")
 
     def playlist_items(self, playlist_id, limit=100, additional_types=None):
-        self.calls.append("items:%s" % playlist_id)
+        """The old /tracks endpoint, which Spotify now answers 403 for."""
+        self.calls.append("tracks:%s" % playlist_id)
+        if self.tracks_forbidden:
+            raise RuntimeError("http status: 403 - Forbidden")
         return self._page(self._items.get(playlist_id, []), limit, "items")
+
+    def _get(self, path, **kwargs):
+        """spotipy's escape hatch, which is how /items is reached."""
+        self.calls.append("GET " + path)
+        if path.endswith("/items"):
+            playlist_id = path.split("/")[1]
+            if playlist_id in self.forbidden:
+                raise RuntimeError("http status: 403 - Forbidden")
+            return self._page(self._items.get(playlist_id, []),
+                              kwargs.get("limit", 100), "items")
+        raise AssertionError("unexpected path %r" % path)
 
     def next(self, results):
         rest = results.get("_rest") or []
         return {"items": rest, "next": None, "_rest": []}
+
+
+class OldFakeSpotify(FakeSpotify):
+    """A client from before /items existed: no _get to call."""
+
+    _get = None
+
+    def __getattribute__(self, name):
+        if name == "_get":
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
+
+
+def _playlist(pid, name, owner="me", total=None, shape="items",
+              collaborative=False):
+    """One entry as /me/playlists returns it.
+
+    Spotify renamed the count block from `tracks` to `items`; both shapes are
+    built here because the code has to survive either.
+    """
+    out = {"id": pid, "name": name, "owner": {"id": owner},
+           "collaborative": collaborative}
+    if total is not None:
+        out[shape] = {"href": "https://api/%s/items" % pid, "total": total}
+    return out
+
+
+class SpotifyApiShape(unittest.TestCase):
+    """The four things that broke when Spotify moved the endpoint.
+
+    Every playlist showed "0 tracks" and importing any of them would have
+    produced an empty playlist, because /tracks began answering 403 and the
+    count moved to a differently named field.
+    """
+
+    def test_the_count_is_read_from_its_new_name(self):
+        sp = FakeSpotify(playlists=[_playlist("p", "Clubbin'", total=10)])
+        found = spotify_import.list_playlists(sp)
+        self.assertEqual([p["total"] for p in found if not p["liked"]], [10])
+
+    def test_the_old_name_still_reads(self):
+        sp = FakeSpotify(playlists=[_playlist("p", "Clubbin'", total=10,
+                                              shape="tracks")])
+        found = spotify_import.list_playlists(sp)
+        self.assertEqual([p["total"] for p in found if not p["liked"]], [10])
+
+    def test_a_playlist_with_no_count_at_all_is_not_a_crash(self):
+        sp = FakeSpotify(playlists=[_playlist("p", "Clubbin'", total=None)])
+        self.assertEqual(
+            [p["total"] for p in spotify_import.list_playlists(sp)
+             if not p["liked"]], [0])
+
+    def test_contents_come_from_items_not_tracks(self):
+        """/tracks is 403 now, for your own playlists too.
+
+        spotipy's playlist_items() still calls it, so reading a playlist
+        through the library alone gets nothing at all.
+        """
+        sp = FakeSpotify(items={"p": [_item(_sp_track("A", "X")),
+                                      _item(_sp_track("B", "Y"))]})
+        tracks = spotify_import.read_playlist(
+            sp, {"id": "p", "name": "p", "liked": False})
+        self.assertEqual([t["name"] for t in tracks], ["A", "B"])
+        self.assertIn("GET playlists/p/items", sp.calls)
+        self.assertNotIn("tracks:p", sp.calls)
+
+    def test_a_client_without_get_falls_back_to_the_old_call(self):
+        sp = OldFakeSpotify(items={"p": [{"track": _sp_track("A", "X")}]},
+                            tracks_forbidden=False)
+        tracks = spotify_import.read_playlist(
+            sp, {"id": "p", "name": "p", "liked": False})
+        self.assertEqual([t["name"] for t in tracks], ["A"])
+        self.assertIn("tracks:p", sp.calls)
+
+    def test_a_refusal_travels_rather_than_being_swallowed(self):
+        """An empty playlist and a forbidden one must not look the same.
+
+        The old endpoint is left able to answer here, so that falling back to
+        it on a 403 -- rather than only on a missing method -- would quietly
+        succeed and hide the refusal instead of reporting it.
+        """
+        sp = FakeSpotify(items={"p": [_item(_sp_track("A", "X"))]},
+                         forbidden=("p",), tracks_forbidden=False)
+        with self.assertRaises(RuntimeError):
+            spotify_import.read_playlist(
+                sp, {"id": "p", "name": "p", "liked": False})
+
+    def test_playlists_you_only_follow_are_marked_unreadable(self):
+        sp = FakeSpotify(playlists=[
+            _playlist("mine", "Mine", owner="me", total=3),
+            _playlist("theirs", "Theirs", owner="someone", total=99),
+            _playlist("shared", "Shared", owner="someone", total=5,
+                      collaborative=True),
+        ])
+        found = {p["name"]: p for p in spotify_import.list_playlists(sp)}
+        self.assertTrue(found["Mine"]["readable"])
+        self.assertTrue(found["Liked Songs"]["readable"])
+        self.assertTrue(found["Shared"]["readable"])
+        self.assertFalse(found["Theirs"]["readable"])
+
+    def test_a_track_is_found_under_either_name(self):
+        # Playlists say "item" now; Liked Songs still says "track".
+        for wrapper in ("item", "track"):
+            sp = FakeSpotify(items={"p": [{wrapper: _sp_track("A", "X")}]})
+            tracks = spotify_import.read_playlist(
+                sp, {"id": "p", "name": "p", "liked": False})
+            self.assertEqual([t["name"] for t in tracks], ["A"], wrapper)
 
 
 class SpotifyImportReading(unittest.TestCase):
@@ -972,6 +1102,20 @@ class SpotifyImportPlan(unittest.TestCase):
         self.assertEqual(len(paths), 2)
         self.assertEqual(len(set(paths)), 2)
         self.assertEqual([m["name"] for m in missing], ["A", "B"])
+
+    def test_a_file_already_on_disk_is_not_queued_again(self):
+        """The index is not the only witness to what you own.
+
+        A file whose tags disagree with its name, or that the index has not
+        caught up with, is on disk and unmatched -- and queueing it told the
+        user a download was needed when process_track would just skip it.
+        """
+        meta = self._meta("Gravity", "John Mayer")
+        open(spotify_import.predicted_path(meta, self.dir), "w").close()
+
+        paths, missing = spotify_import.plan([meta], {}, self.dir)
+        self.assertEqual(missing, [])
+        self.assertEqual(paths, [spotify_import.predicted_path(meta, self.dir)])
 
     def test_the_predicted_path_is_where_the_download_actually_lands(self):
         """The load-bearing assumption of the whole import.
