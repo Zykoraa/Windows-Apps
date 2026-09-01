@@ -433,6 +433,28 @@ class LibraryIndex:
         groups.sort(key=lambda g: -g["reclaim"])
         return groups
 
+    def fingerprints(self):
+        """Every track keyed by normalised (artist, title).
+
+        Importing a playlist has to ask "do I already own this?" once per
+        track, and a playlist can be a thousand tracks long. Answering that
+        with a query each would be a thousand round trips against an index
+        that fits in memory several times over, so the whole thing is read
+        once and matched in the caller.
+
+        The value is a list because a fingerprint is deliberately loose --
+        it ignores remaster and feature credits -- so a studio cut and a live
+        one can land on the same key. Keeping both lets the caller pick on
+        length rather than on whichever row SQLite returned first.
+        """
+        table = {}
+        for row in self._query("SELECT path, title, artist, duration FROM tracks"):
+            key = (normalise_artist(row["artist"]), normalise_title(row["title"]))
+            if not key[1]:
+                continue
+            table.setdefault(key, []).append((row["path"], row["duration"]))
+        return table
+
     def forget(self, path):
         """Drop a row after its file is deleted."""
         with self._lock:

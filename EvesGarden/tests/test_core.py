@@ -22,6 +22,7 @@ import colorsys
 import downloader
 import metadata
 import smart_playlists
+import spotify_import
 import themes
 import ui_widgets
 
@@ -787,6 +788,248 @@ class Scoring(unittest.TestCase):
 
     def test_missing_duration_is_worst(self):
         self.assertGreaterEqual(self._score("Gravity", None), 1e9)
+
+
+def _sp_track(name, artist, ms=200000, extra=None):
+    """The shape Spotify hands back inside a playlist item."""
+    track = {
+        "name": name,
+        "type": "track",
+        "artists": [{"name": a} for a in artist.split("|")],
+        "album": {"name": "An Album", "release_date": "2011-05-17",
+                  "images": [{"url": "http://art/1.jpg"}],
+                  "artists": [{"name": artist.split("|")[0]}]},
+        "track_number": 3,
+        "disc_number": 1,
+        "duration_ms": ms,
+        "external_urls": {"spotify": "https://open.spotify.com/track/" + name},
+    }
+    track.update(extra or {})
+    return track
+
+
+class FakeSpotify:
+    """Just enough of a signed-in client to page through an account."""
+
+    def __init__(self, playlists=(), items=None, liked=()):
+        self._playlists = list(playlists)
+        self._items = items or {}
+        self._liked = list(liked)
+        self.calls = []
+
+    def current_user(self):
+        return {"id": "me", "display_name": "Me"}
+
+    # Paging is done in two pages everywhere, so the loops are exercised
+    # rather than assumed.
+    def _page(self, rows, limit, kind):
+        head, tail = rows[:1], rows[1:]
+        return {"items": head, "next": ("more:%s" % kind) if tail else None,
+                "total": len(rows), "_rest": tail}
+
+    def current_user_playlists(self, limit=50):
+        self.calls.append("playlists")
+        return self._page(self._playlists, limit, "playlists")
+
+    def current_user_saved_tracks(self, limit=50):
+        self.calls.append("liked")
+        if limit == 1:
+            return {"items": [], "next": None, "total": len(self._liked)}
+        return self._page(self._liked, limit, "liked")
+
+    def playlist_items(self, playlist_id, limit=100, additional_types=None):
+        self.calls.append("items:%s" % playlist_id)
+        return self._page(self._items.get(playlist_id, []), limit, "items")
+
+    def next(self, results):
+        rest = results.get("_rest") or []
+        return {"items": rest, "next": None, "_rest": []}
+
+
+class SpotifyImportReading(unittest.TestCase):
+
+    def test_liked_songs_leads_and_ownership_is_marked(self):
+        sp = FakeSpotify(playlists=[
+            {"id": "p1", "name": "Mine", "owner": {"id": "me"},
+             "tracks": {"total": 4}},
+            {"id": "p2", "name": "Theirs", "owner": {"id": "someone"},
+             "tracks": {"total": 9}},
+        ], liked=[1, 2, 3])
+        found = spotify_import.list_playlists(sp)
+
+        self.assertEqual([p["name"] for p in found],
+                         ["Liked Songs", "Mine", "Theirs"])
+        self.assertEqual(found[0]["id"], spotify_import.LIKED_ID)
+        self.assertEqual([p["mine"] for p in found], [True, True, False])
+        self.assertEqual([p["total"] for p in found], [3, 4, 9])
+
+    def test_a_deleted_collaborative_playlist_is_a_null_item(self):
+        # Spotify returns null in the list rather than leaving it out, which
+        # used to be an AttributeError halfway through the import.
+        sp = FakeSpotify(playlists=[
+            None, {"id": "p", "name": "Real", "owner": {"id": "me"},
+                   "tracks": {"total": 1}}])
+        self.assertEqual([p["name"] for p in spotify_import.list_playlists(sp)],
+                         ["Liked Songs", "Real"])
+
+    def test_no_client_is_not_an_exception(self):
+        self.assertEqual(spotify_import.list_playlists(None), [])
+
+    def test_reading_skips_what_cannot_be_downloaded(self):
+        sp = FakeSpotify(items={"p": [
+            {"track": _sp_track("Real", "Artist")},
+            {"track": _sp_track("Onmydisk", "Artist", extra={"is_local": True})},
+            {"track": {"name": "An episode", "type": "episode",
+                       "artists": [], "album": {}}},
+            {"track": None},
+            {"track": _sp_track("AlsoReal", "Artist")},
+        ]})
+        tracks = spotify_import.read_playlist(
+            sp, {"id": "p", "name": "p", "liked": False})
+        self.assertEqual([t["name"] for t in tracks], ["Real", "AlsoReal"])
+
+    def test_liked_songs_read_from_their_own_endpoint(self):
+        sp = FakeSpotify(liked=[{"track": _sp_track("A", "X")},
+                                {"track": _sp_track("B", "Y")}])
+        tracks = spotify_import.read_playlist(
+            sp, {"id": spotify_import.LIKED_ID, "name": "Liked Songs",
+                 "liked": True})
+        self.assertEqual([t["name"] for t in tracks], ["A", "B"])
+        self.assertIn("liked", sp.calls)
+
+    def test_metadata_carries_everything_the_downloader_tags_with(self):
+        meta = spotify_import.as_metadata(_sp_track("Gravity", "John Mayer|Ed"))
+        self.assertEqual(meta["artists"], ["John Mayer", "Ed"])
+        self.assertEqual(meta["album_artist"], "John Mayer")
+        self.assertEqual(meta["release_date"], "2011")
+        self.assertEqual(meta["cover_url"], "http://art/1.jpg")
+        self.assertEqual(meta["duration_ms"], 200000)
+
+
+class SpotifyImportMatching(unittest.TestCase):
+
+    def _meta(self, name, artist, ms=200000):
+        return spotify_import.as_metadata(_sp_track(name, artist, ms))
+
+    def test_a_remaster_matches_the_copy_already_owned(self):
+        owned = {("john mayer", "gravity"): [("C:/lib/g.mp3", 200.0)]}
+        meta = self._meta("Gravity - Remastered 2011", "John Mayer")
+        self.assertEqual(spotify_import.match(meta, owned), "C:/lib/g.mp3")
+
+    def test_a_feature_credit_does_not_stop_a_match(self):
+        owned = {("tom misch", "water baby"): [("C:/lib/w.mp3", 240.0)]}
+        meta = self._meta("Water Baby", "Tom Misch|De La Soul")
+        self.assertEqual(spotify_import.match(meta, owned), "C:/lib/w.mp3")
+
+    def test_length_separates_a_live_cut_from_the_studio_one(self):
+        # Both normalise to the same key on purpose; the only thing telling
+        # them apart is how long they run.
+        owned = {("john mayer", "gravity"): [("C:/lib/live.mp3", 480.0),
+                                             ("C:/lib/studio.mp3", 247.0)]}
+        meta = self._meta("Gravity", "John Mayer", ms=247000)
+        self.assertEqual(spotify_import.match(meta, owned), "C:/lib/studio.mp3")
+
+    def test_nothing_owned_is_no_match(self):
+        self.assertIsNone(spotify_import.match(self._meta("X", "Y"), {}))
+
+
+class SpotifyImportPlan(unittest.TestCase):
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="eg-import-")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _meta(self, name, artist="Artist", ms=200000):
+        return spotify_import.as_metadata(_sp_track(name, artist, ms))
+
+    def test_order_is_spotify_order_not_what_is_owned(self):
+        """The whole list, in sequence.
+
+        Position is the only thing carrying the playlist's identity once the
+        tracks are just paths, and it is what gets handed to
+        reorder_playlist. Spot-checking one slot is not enough: a reversed
+        list still has the same track in the middle.
+        """
+        owned = {("artist", "b"): [("C:/lib/b.mp3", 200.0)]}
+        tracks = [self._meta("A"), self._meta("B"), self._meta("C")]
+        paths, missing = spotify_import.plan(tracks, owned, self.dir)
+
+        self.assertEqual(paths, [
+            spotify_import.predicted_path(tracks[0], self.dir),
+            "C:/lib/b.mp3",
+            spotify_import.predicted_path(tracks[2], self.dir),
+        ])
+        self.assertEqual([m["name"] for m in missing], ["A", "C"])
+
+    def test_a_song_listed_twice_is_held_once(self):
+        # A playlist may repeat a track; playlist_items is keyed on the path,
+        # so a repeat would collide rather than appear twice.
+        tracks = [self._meta("A"), self._meta("A"), self._meta("B")]
+        paths, missing = spotify_import.plan(tracks, {}, self.dir)
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(len(set(paths)), 2)
+        self.assertEqual([m["name"] for m in missing], ["A", "B"])
+
+    def test_the_predicted_path_is_where_the_download_actually_lands(self):
+        """The load-bearing assumption of the whole import.
+
+        A slot is reserved for a track before it is downloaded, and filled by
+        checking whether that exact path now exists. If the downloader's
+        naming and this prediction ever drift apart, every imported playlist
+        quietly comes out short and nothing raises.
+        """
+        meta = self._meta("Gravity: Live/Remastered?", "John Mayer|Ed")
+        predicted = spotify_import.predicted_path(meta, self.dir)
+
+        open(predicted, "w").close()
+        result = downloader.process_track(None, meta, self.dir,
+                                          log_callback=lambda _m: None)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(os.path.normcase(result["path"]),
+                         os.path.normcase(predicted))
+
+
+class Fingerprints(unittest.TestCase):
+    """The index side of the match."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="eg-fp-")
+        self.ix = LibraryIndex(os.path.join(self.dir, "t.db"))
+
+    def tearDown(self):
+        self.ix.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _add(self, path, title, artist, duration=200.0):
+        with self.ix._lock:
+            self.ix._conn.execute(
+                "INSERT INTO tracks(path, mtime, size, title, artist, duration,"
+                " added) VALUES(?,1,1,?,?,?,0)", (path, title, artist, duration))
+            self.ix._conn.commit()
+
+    def test_variants_collapse_onto_one_key(self):
+        self._add("a.mp3", "Gravity (Remastered 2011)", "John Mayer")
+        self._add("b.mp3", "Gravity - Live", "John Mayer, Someone", 480.0)
+        table = self.ix.fingerprints()
+
+        self.assertEqual(list(table), [("john mayer", "gravity")])
+        self.assertEqual(sorted(p for p, _d in table[("john mayer", "gravity")]),
+                         ["a.mp3", "b.mp3"])
+
+    def test_a_file_with_no_usable_title_is_left_out(self):
+        self._add("c.mp3", "", "Nobody")
+        self.assertEqual(self.ix.fingerprints(), {})
+
+    def test_it_feeds_straight_into_a_match(self):
+        self._add("g.mp3", "Gravity", "John Mayer", 247.0)
+        meta = spotify_import.as_metadata(
+            _sp_track("Gravity (Remastered)", "John Mayer", 247000))
+        self.assertEqual(spotify_import.match(meta, self.ix.fingerprints()),
+                         "g.mp3")
 
 
 if __name__ == "__main__":

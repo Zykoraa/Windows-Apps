@@ -143,6 +143,88 @@ class SurfaceWalk:
         palette.close()
         yield 200
 
+        # The header row is over-subscribed at the size the app opens at,
+        # so the masthead stands down in stages to pay for it. What must
+        # never happen again is a control being sliced instead: "New
+        # playlist" came out 32px wide and the import button did not appear
+        # at all, which reads as a rendering bug rather than a layout one.
+        self.mark("header at the widths it has to survive")
+        for width in (1600, 1340, 1100):
+            app.geometry("%dx820+20+20" % width)
+            yield 260
+            for view in ("Songs", "Playlists", "Duplicates"):
+                app.set_library_view(view)
+                yield 200
+                for child in app.library_actions.winfo_children():
+                    if child.winfo_manager() != "pack":
+                        continue
+                    try:
+                        name = child.cget("text")
+                    except Exception:
+                        name = child.__class__.__name__
+                    assert child.winfo_width() >= child.winfo_reqwidth(), (
+                        "%r squeezed to %dpx of %dpx at %d on %s"
+                        % (name, child.winfo_width(), child.winfo_reqwidth(),
+                           width, view))
+                # And the search box has to still be a box, not a sliver,
+                # wherever the masthead is still being shown.
+                if app.brand.winfo_manager() == "pack":
+                    # Re-packing sends a widget to the end of its side unless
+                    # it says otherwise, so a masthead that stood down and
+                    # came back can reappear in the middle of the row.
+                    assert app.brand.winfo_rootx() < app.view_tabs.winfo_rootx(), (
+                        "masthead came back right of the tabs at %d on %s"
+                        % (width, view))
+                    assert app.lib_search_entry.winfo_width() >= 100, (
+                        "search box %dpx while the masthead still had room, "
+                        "at %d on %s" % (app.lib_search_entry.winfo_width(),
+                                         width, view))
+        app.geometry("1280x800+40+40")
+        yield 260
+        app.set_library_view("Songs")
+        yield 200
+
+        # The import picker is the one surface that needs a Spotify account
+        # to reach, so a walk of the app can never open it. Build it here
+        # instead: it is a dialog full of freshly constructed widgets, which
+        # is precisely where this app's crashes have lived.
+        self.mark("spotify import picker")
+        picker = self.gui.dialogs.PlaylistPicker(app, app.theme, [
+            {"id": "liked-songs", "name": "Liked Songs", "owner": "you",
+             "total": 412, "mine": True, "liked": True},
+            {"id": "p1", "name": "Late night", "owner": "you",
+             "total": 1, "mine": True, "liked": False},
+            {"id": "p2", "name": "Someone else's", "owner": "Ada",
+             "total": 90, "mine": False, "liked": False},
+        ])
+        picker.present()          # not show(): that blocks on its own loop
+        yield 320
+        picker._set_all(True)
+        yield 120
+        picker._set_all(False)
+        yield 120
+        self.mark("close spotify import picker")
+        picker.close()
+        yield 260
+
+        # An account with no playlists at all still has to render something.
+        self.mark("import picker with nothing on the account")
+        empty = self.gui.dialogs.PlaylistPicker(app, app.theme, [])
+        empty.present()
+        yield 260
+        empty.close()
+        yield 260
+
+        # No credentials in a fresh config directory, so this takes the
+        # "tell them what is missing" path rather than opening anything.
+        self.mark("import with no Spotify connected")
+        app.set_library_view("Playlists")
+        yield 160
+        app.import_from_spotify()
+        yield 200
+        app.set_library_view("Songs")
+        yield 160
+
         # Hover the seek bar first. Its knob is a cached image, and a theme
         # change drops that cache -- but only a bar that has been hovered has
         # ever assigned one, so without this the walk switched themes with

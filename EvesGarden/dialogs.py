@@ -190,3 +190,135 @@ def prompt_text(parent, theme, title, prompt, placeholder="", initial="",
     """Ask for one line of text. Returns the string, or None if cancelled."""
     return TextPrompt(parent, theme, title, prompt, placeholder, initial,
                       confirm).show()
+
+
+class PlaylistPicker(ModalDialog):
+    """Choose which Spotify playlists to bring across.
+
+    A checklist rather than one playlist at a time: somebody importing an
+    account has ten or thirty of these, and confirming the same dialog thirty
+    times is not a feature.
+
+    Nothing starts out ticked. Ticking everything by default would be one
+    click away from queueing several thousand downloads, which is not a
+    decision to make on somebody's behalf -- so the running total sits above
+    the list and updates as they choose.
+    """
+
+    def __init__(self, parent, theme, playlists):
+        super().__init__(parent, theme, "Import from Spotify", size=(620, 640))
+        t = theme
+        self._rows = []
+
+        ctk.CTkLabel(
+            self.body, justify="left", wraplength=560, anchor="w",
+            font=theme_ui.font("body"), text_color=t["text_secondary"],
+            text=("Each one becomes a playlist here, in the same order. "
+                  "Tracks you already have go in straight away, and the rest "
+                  "are downloaded and slotted into place as they arrive.")
+        ).pack(fill="x", pady=(0, 16))
+
+        head = ctk.CTkFrame(self.body, fg_color="transparent")
+        head.pack(fill="x")
+        self.count_label = ctk.CTkLabel(head, text="", anchor="w",
+                                        font=theme_ui.font("body_med"),
+                                        text_color=t["text"])
+        self.count_label.pack(side="left")
+
+        for label, value in (("None", False), ("All", True)):
+            ctk.CTkButton(
+                head, text=label, width=62, height=28,
+                corner_radius=theme_ui.RADIUS_PILL, border_width=1,
+                fg_color="transparent", border_color=t["surface_hover"],
+                hover_color=t["surface_hover"], text_color=t["text_secondary"],
+                font=theme_ui.font("caption"),
+                command=lambda v=value: self._set_all(v)).pack(side="right",
+                                                               padx=(6, 0))
+
+        self.list = ctk.CTkScrollableFrame(
+            self.body, fg_color=t["surface"], corner_radius=theme_ui.RADIUS,
+            height=356)
+        self.list.pack(fill="both", expand=True, pady=(10, 0))
+
+        for playlist in playlists:
+            self._add_row(playlist)
+        if not playlists:
+            ctk.CTkLabel(self.list, font=theme_ui.font("body"),
+                         text_color=t["text_secondary"],
+                         text="No playlists on this account.").pack(pady=40)
+
+        row = ctk.CTkFrame(self.body, fg_color="transparent")
+        row.pack(fill="x", pady=(18, 0))
+        ctk.CTkButton(row, text="Cancel", width=96, height=36,
+                      corner_radius=theme_ui.RADIUS_PILL, border_width=1,
+                      fg_color="transparent", border_color=t["surface_hover"],
+                      hover_color=t["surface_hover"], text_color=t["text"],
+                      font=theme_ui.font("body_med"),
+                      command=self.close).pack(side="right")
+        self.import_btn = ctk.CTkButton(
+            row, text="Import", width=150, height=36,
+            corner_radius=theme_ui.RADIUS_PILL, fg_color=t["accent"],
+            hover_color=t["accent_hover"], text_color=t["bg"],
+            font=theme_ui.font("body_med"), command=self._submit)
+        self.import_btn.pack(side="right", padx=(0, 10))
+
+        self._sync()
+
+    def _add_row(self, playlist):
+        t = self.theme
+        row = ctk.CTkFrame(self.list, fg_color="transparent", height=36)
+        row.pack(fill="x", pady=1)
+        row.pack_propagate(False)
+
+        var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            row, text=playlist["name"], variable=var, command=self._sync,
+            font=theme_ui.font("body"), text_color=t["text"],
+            fg_color=t["accent"], hover_color=t["accent_hover"],
+            checkmark_color=t["bg"], border_color=t["surface_hover"],
+            checkbox_width=19, checkbox_height=19, border_width=2,
+            corner_radius=6).pack(side="left", padx=(12, 8))
+
+        total = playlist.get("total") or 0
+        detail = "%d track%s" % (total, "" if total == 1 else "s")
+        if not playlist.get("mine") and playlist.get("owner"):
+            detail = "%s  by %s" % (detail, playlist["owner"])
+        ctk.CTkLabel(row, text=detail, anchor="e",
+                     font=theme_ui.font("caption"),
+                     text_color=t["text_secondary"]).pack(side="right",
+                                                          padx=(8, 14))
+        self._rows.append((playlist, var))
+
+    # ------------------------------------------------------------ state
+
+    def _chosen(self):
+        return [p for p, var in self._rows if var.get()]
+
+    def _set_all(self, value):
+        for _playlist, var in self._rows:
+            var.set(value)
+        self._sync()
+
+    def _sync(self):
+        chosen = self._chosen()
+        tracks = sum(p.get("total") or 0 for p in chosen)
+        if chosen:
+            self.count_label.configure(
+                text="%d selected  ·  %s tracks" % (len(chosen),
+                                                    "{:,}".format(tracks)))
+        else:
+            self.count_label.configure(text="Nothing selected")
+        # Disabled rather than hidden, so the button does not move about.
+        self.import_btn.configure(
+            state="normal" if chosen else "disabled",
+            text="Import" if not chosen else "Import %d" % len(chosen))
+
+    def _submit(self):
+        chosen = self._chosen()
+        if chosen:
+            self.close(chosen)
+
+
+def pick_playlists(parent, theme, playlists):
+    """Ask which playlists to import. Returns a list, or None if cancelled."""
+    return PlaylistPicker(parent, theme, playlists).show()

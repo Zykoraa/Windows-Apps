@@ -95,6 +95,7 @@ import app_icon
 from discord_presence import DiscordPresence
 import credentials
 import spotify_auth
+import spotify_import
 from downloader import (
     setup_spotify, search_spotify_track, search_spotify_artist,
     get_artist_albums, get_spotify_album_tracks, get_spotify_playlist_tracks,
@@ -260,6 +261,11 @@ class App(ctk.CTk):
         self.current_library_files = []
         self.current_rows = []
         self.current_playlist = []
+        # (playlist_id, ordered paths) for imports whose downloads
+        # have not finished yet.
+        self._pending_imports = []
+        # Re-entrancy guard for the masthead's own measuring pass.
+        self._brand_busy = False
         self.current_index = -1
         self.shuffle = bool(self.settings.get("shuffle"))
         self.repeat = bool(self.settings.get("repeat"))
@@ -758,6 +764,7 @@ class App(ctk.CTk):
 
         self.library_header = ctk.CTkFrame(self.main_area, height=60, fg_color="transparent")
         self.library_header.grid(row=0, column=0, sticky="ew", padx=20, pady=10)
+        self.library_header.bind("<Configure>", self._sync_brand)
 
         # Songs / Albums / Artists -- the library used to be a flat glob of
         # one folder, discarding the album and artist tags every download
@@ -784,46 +791,64 @@ class App(ctk.CTk):
         self.view_tabs.set(self.library_view)
         self.view_tabs.pack(side="left", padx=(0, 12))
 
-        # Requests little and expands into what is left, so the row degrades
-        # by shortening the search box rather than by crushing whatever was
-        # packed last.
-        self.lib_search_entry = ctk.CTkEntry(
-            self.library_header, placeholder_text="Search title, artist or album",
-            border_width=1, corner_radius=theme_ui.RADIUS_PILL, height=36,
-            width=200, font=theme_ui.font("body"))
-        self.lib_search_entry.pack(side="left", padx=(4, 10), fill="x",
-                                   expand=True)
-        self.lib_search_entry.bind("<KeyRelease>", self._on_library_search)
+        # Everything that acts on the library rides in one cluster, and the
+        # cluster is packed before the search box. Pack hands out width in
+        # packing order, so whatever goes last is what gets squeezed when the
+        # row runs out -- and a shorter search box is a far better failure
+        # than a button sliced in half, which is what this row did when the
+        # search box was packed first.
+        self.library_actions = ctk.CTkFrame(self.library_header,
+                                            fg_color="transparent")
+        self.library_actions.pack(side="right")
 
         self.sort_dropdown = ctk.CTkOptionMenu(
-            self.library_header, values=list(SORTS.keys()),
+            self.library_actions, values=list(SORTS.keys()),
             command=self.set_library_sort, corner_radius=theme_ui.RADIUS_PILL,
             width=170, height=36, font=theme_ui.font("body"))
         self.sort_dropdown.set(self.library_sort)
-        self.sort_dropdown.pack(side="left", padx=10)
+        self.sort_dropdown.pack(side="left", padx=(0, 10))
 
         self.nav_dl_btn = ctk.CTkButton(
-            self.library_header, text="+  Add music", command=self.open_downloader,
+            self.library_actions, text="+  Add music", command=self.open_downloader,
             corner_radius=theme_ui.RADIUS_PILL, height=36, width=132,
             font=theme_ui.font("body_med"))
         self.nav_dl_btn.pack(side="left", padx=6)
 
-        # Only offered when there is actually something to recover.
         self.new_pl_btn = ctk.CTkButton(
-            self.library_header, text="New playlist",
+            self.library_actions, text="+  New",
             command=self.prompt_new_playlist,
             corner_radius=theme_ui.RADIUS_PILL, height=36, width=0,
             font=theme_ui.font("body_med"))
 
+        # Beside New playlist, because the Playlists tab is where somebody
+        # goes looking for a playlist they already keep somewhere else.
+        self.import_pl_btn = ctk.CTkButton(
+            self.library_actions, text="Import from Spotify",
+            command=self.import_from_spotify, fg_color="transparent",
+            border_width=1, corner_radius=theme_ui.RADIUS_PILL,
+            height=36, width=0, font=theme_ui.font("body_med"))
+
         self.dedupe_btn = ctk.CTkButton(
-            self.library_header, text="Move ticked to Recycle Bin",
+            self.library_actions, text="Move ticked to Recycle Bin",
             command=self.remove_duplicates, corner_radius=theme_ui.RADIUS_PILL,
             height=36, width=0, font=theme_ui.font("body_med"))
 
-        self.repair_btn = ctk.CTkButton(self.library_header, text="Repair library",
+        # Only offered when there is actually something to recover.
+        self.repair_btn = ctk.CTkButton(self.library_actions, text="Repair library",
                                         command=self.run_repair, corner_radius=20,
                                         font=ctk.CTkFont(weight="bold"))
         self.refresh_repair_button()
+
+        # Requests little and expands into what is left, so the row degrades
+        # by shortening the search box. Packed last, which is what makes that
+        # sentence true rather than merely intended.
+        self.lib_search_entry = ctk.CTkEntry(
+            self.library_header, placeholder_text="Search title, artist or album",
+            border_width=1, corner_radius=theme_ui.RADIUS_PILL, height=36,
+            width=140, font=theme_ui.font("body"))
+        self.lib_search_entry.pack(side="left", padx=(4, 10), fill="x",
+                                   expand=True)
+        self.lib_search_entry.bind("<KeyRelease>", self._on_library_search)
 
         # Shown only while drilled into one album or artist.
         self.crumb_bar = ctk.CTkFrame(self.main_area, fg_color="transparent")
@@ -2026,14 +2051,14 @@ class App(ctk.CTk):
             if widget is not None:
                 widget.configure(fg_color=t["accent"], hover_color=t["accent_hover"],
                                  text_color=t["bg"])
-        if getattr(self, "signin_btn", None) is not None:
-            self.signin_btn.configure(border_color=t["accent"],
-                                      hover_color=t["surface_hover"],
-                                      text_color=t["text"])
-        if getattr(self, "cancel_button", None) is not None:
-            self.cancel_button.configure(border_color=t["accent"],
-                                         hover_color=t["surface_hover"],
-                                         text_color=t["text"])
+        # Outlined buttons: the accent is the edge rather than the fill, so
+        # they sit beside a solid one without competing with it.
+        for name in ("signin_btn", "cancel_button", "import_pl_btn"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.configure(border_color=t["accent"],
+                                 hover_color=t["surface_hover"],
+                                 text_color=t["text"])
         # The full-screen view keeps its own dark palette on purpose, so a
         # theme change only has to reach its one accent-coloured control.
         if getattr(self, "np_close_btn", None) is not None:
@@ -2364,13 +2389,107 @@ class App(ctk.CTk):
         self.time_total.configure(text=fmt_time(self.player.get_duration()))
 
     def _sync_playlist_button(self):
-        button = getattr(self, "new_pl_btn", None)
-        if button is None:
+        for name in ("new_pl_btn", "import_pl_btn"):
+            button = getattr(self, name, None)
+            if button is None:
+                continue
+            if self.library_view == "Playlists":
+                button.pack(side="left", padx=6)
+            else:
+                button.pack_forget()
+
+    # What the search box keeps before the wordmark is asked to go. 180px
+    # still shows most of its placeholder; below that it stops reading as a
+    # search box at all.
+    SEARCH_FLOOR = 180
+
+    def _sync_brand(self, _event=None):
+        """Give up the wordmark before the search box becomes unusable.
+
+        This row carries a brand, seven tabs and up to four controls, and at
+        the size the app opens at they do not all fit -- they never did; the
+        overflow used to land on whichever button was packed last, which came
+        out sliced in half. Something has to yield, and the wordmark is the
+        only part of the row that is decoration rather than a control, so it
+        goes first and takes the leaf with it if that is still not enough.
+        """
+        # A <Configure> can land while the row is still being built, so
+        # every part of it is checked before any of it is measured.
+        head = getattr(self, "library_header", None)
+        word = getattr(self, "brand_word", None)
+        mark = getattr(self, "brand_mark", None)
+        tabs = getattr(self, "view_tabs", None)
+        actions = getattr(self, "library_actions", None)
+        if None in (head, word, mark, tabs, actions):
             return
-        if self.library_view == "Playlists":
-            button.pack(side="left", padx=6)
+        if self._brand_busy:
+            return          # update_idletasks below can land us back here
+        available = head.winfo_width()
+        if available <= 1:
+            return          # not laid out yet; Configure will call again
+
+        self._brand_busy = True
+        try:
+            # A control that has just been packed, or had its label changed,
+            # has not worked out how wide it wants to be yet -- the Duplicates
+            # button reported almost nothing until Tk caught up, so the row
+            # kept its masthead and squeezed the search box to 62px instead.
+            actions.update_idletasks()
+            self._place_brand(head, tabs, actions, word, mark, available)
+        finally:
+            self._brand_busy = False
+
+    def _place_brand(self, head, tabs, actions, word, mark, available):
+        # Summed over the cluster's own children rather than asking the
+        # cluster: a frame's requested width is only recomputed once the
+        # geometry manager next runs, so straight after a button is packed or
+        # forgotten it still reports the width it had before -- which had the
+        # wide Playlists row keeping the wordmark while the narrow Songs row
+        # gave it up. A child's own requested width does not move.
+        cluster = sum(w.winfo_reqwidth() + 12
+                      for w in actions.winfo_children()
+                      if w.winfo_manager() == "pack")
+        needed = tabs.winfo_reqwidth() + 12 + cluster + self.SEARCH_FLOOR + 14
+        spare = available - needed
+        mark_w = mark.winfo_reqwidth() + 20      # the leaf and the padding
+        want_mark = spare >= mark_w
+        want_word = want_mark and spare >= mark_w + word.winfo_reqwidth() + 9
+
+        # The frame goes, not just its contents: an emptied CTkFrame still
+        # holds 43px of the row, which is most of what the leaf was meant to
+        # be giving back.
+        for widget, wanted, kwargs in (
+                (self.brand, want_mark,
+                 {"side": "left", "padx": (2, 18), "before": tabs}),
+                (word, want_word, {"side": "left"})):
+            if wanted == (widget.winfo_manager() == "pack"):
+                continue
+            if wanted:
+                widget.pack(**kwargs)
+            else:
+                widget.pack_forget()
+
+    def _sync_sort_control(self):
+        """Offer the sort only where it changes anything.
+
+        Five of the seven tabs ignore it outright: Liked is always ordered by
+        when you liked it, Recent by when you played it, Duplicates by what
+        deleting them would reclaim, Albums and Artists by name, and a
+        playlist by its own order. The dropdown sat over all of them looking
+        live, and answering to nothing.
+        """
+        widget = getattr(self, "sort_dropdown", None)
+        if widget is None:
+            return
+        wanted = (self.library_view == "Songs"
+                  or getattr(self.library, "filter", None) is not None)
+        if wanted == (widget.winfo_manager() == "pack"):
+            return
+        if wanted:
+            # before=, or it would come back at the far end of the cluster.
+            widget.pack(side="left", padx=(0, 10), before=self.nav_dl_btn)
         else:
-            button.pack_forget()
+            widget.pack_forget()
 
     def _sync_dedupe_button(self):
         """Only offer the delete action while the Duplicates view is open."""
@@ -2675,6 +2794,162 @@ class App(ctk.CTk):
         self.library.set_view("Playlists")
         self.render_library()
 
+    # ------------------------------------------- importing from Spotify
+
+    def _import_status(self, message):
+        """Status belongs beside the library, not in the download log.
+
+        The log lives on the Add music screen; an import starts from the
+        Playlists tab, and reporting into a panel the user is not looking at
+        is the same as not reporting at all.
+        """
+        if getattr(self, "library_status", None) is not None:
+            self.library_status.configure(text=message)
+
+    def import_from_spotify(self):
+        """Bring the account's playlists across as playlists here."""
+        if not self.sp:
+            self._import_status("Connect Spotify first: Add music, then "
+                                "Set up Spotify access.")
+            return
+        if self.user_sp is None and not self._refresh_user_client():
+            # Reading playlists needs a signed-in user -- public ones
+            # included -- and that button lives on the Add music screen.
+            self._import_status("Sign in to Spotify first.")
+            self.open_downloader()
+            return
+        if self.downloads.running:
+            self._import_status("A download is already running. Try again "
+                                "once it has finished.")
+            return
+
+        self.import_pl_btn.configure(state="disabled")
+        self._import_status("Reading your playlists...")
+
+        def work():
+            try:
+                found = spotify_import.list_playlists(self.user_sp)
+            except Exception as e:
+                self._safe_after(0, self._import_failed,
+                                 "Could not read your playlists: %s" % e)
+                return
+            self._safe_after(0, self._choose_playlists, found)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _import_failed(self, message):
+        self.import_pl_btn.configure(state="normal")
+        self._import_status(message)
+        self._gui_log(message)
+
+    def _choose_playlists(self, playlists):
+        self.import_pl_btn.configure(state="normal")
+        self._import_status("")
+        chosen = dialogs.pick_playlists(self, self.theme, playlists)
+        if not chosen:
+            return
+        self.import_pl_btn.configure(state="disabled")
+        self._import_status("Reading %d playlist%s from Spotify..."
+                            % (len(chosen), "" if len(chosen) == 1 else "s"))
+        threading.Thread(target=self._import_worker, args=(chosen,),
+                         daemon=True).start()
+
+    def _import_worker(self, chosen):
+        """Read each chosen playlist and work out what is already here.
+
+        Off the main thread: a long account is a lot of paging, and the whole
+        library index is walked once to match against.
+        """
+        owned = self.index.fingerprints()
+        plans, missing, labels, meta = [], [], {}, {}
+        for playlist in chosen:
+            try:
+                tracks = spotify_import.read_playlist(self.user_sp, playlist)
+            except Exception as e:
+                self._gui_log("Could not read %s: %s" % (playlist["name"], e))
+                continue
+            paths, gaps = spotify_import.plan(tracks, owned, LIBRARY_DIR)
+            plans.append((playlist["name"], paths))
+            for track in gaps:
+                # Keyed so a song sitting on three playlists is downloaded
+                # once rather than three times.
+                key = (track.get("spotify_url")
+                       or spotify_import.predicted_path(track, LIBRARY_DIR))
+                if key in meta:
+                    continue
+                meta[key] = track
+                labels[key] = "%s - %s" % (", ".join(track["artists"]),
+                                           track["name"])
+                missing.append(key)
+        self._safe_after(0, self._finish_import, plans, missing, labels, meta)
+
+    def _playlist_named(self, name):
+        """Reuse a playlist of this name, or make one.
+
+        Importing the same account twice should top the playlists up rather
+        than leaving two of everything.
+        """
+        wanted = (name or "").strip().lower()
+        for row in self.index.playlists():
+            if (row["name"] or "").strip().lower() == wanted:
+                return row["id"]
+        return self.index.create_playlist(name)
+
+    def _finish_import(self, plans, missing, labels, meta):
+        self.import_pl_btn.configure(state="normal")
+        if not plans:
+            self._import_status("Nothing could be read from Spotify.")
+            return
+
+        here = 0
+        for name, paths in plans:
+            playlist_id = self._playlist_named(name)
+            have = [p for p in paths if os.path.exists(p)]
+            if have:
+                self.index.add_to_playlist(playlist_id, have)
+                self.index.reorder_playlist(playlist_id, have)
+            here += len(have)
+            # The rest are filed once they land, and the whole playlist is
+            # put back into Spotify's order then -- so a track that took
+            # longest does not end up at the bottom because of it.
+            if len(have) < len(paths):
+                self._pending_imports.append((playlist_id, paths))
+
+        self.library_view = "Playlists"
+        self.view_tabs.set("Playlists")
+        self.library.playlist_id = None
+        self.library.set_view("Playlists")
+        self.library.invalidate()
+        self.render_library()
+
+        note = "%d playlist%s imported, %d track%s already here" % (
+            len(plans), "" if len(plans) == 1 else "s",
+            here, "" if here == 1 else "s")
+        if missing:
+            self._import_status("%s. Downloading the other %d."
+                                % (note, len(missing)))
+            self._start_batch(missing, labels=labels, meta=meta)
+        else:
+            self._import_status(note + ". Nothing left to download.")
+
+    def _reconcile_imports(self):
+        """File newly downloaded tracks into the playlists waiting for them."""
+        if not self._pending_imports:
+            return
+        pending, self._pending_imports = self._pending_imports, []
+        for playlist_id, paths in pending:
+            have = [p for p in paths if os.path.exists(p)]
+            if not have:
+                continue
+            self.index.add_to_playlist(playlist_id, have)
+            self.index.reorder_playlist(playlist_id, have)
+            # A failed download can still be retried, so the plan is kept
+            # until every track is either here or given up on.
+            if len(have) < len(paths) and self.downloads.failed_jobs():
+                self._pending_imports.append((playlist_id, paths))
+        if getattr(self, "library", None) is not None:
+            self.library.invalidate()
+
     def _queue_next(self):
         current = None
         if 0 <= self.current_index < len(self.current_playlist):
@@ -2717,6 +2992,8 @@ class App(ctk.CTk):
         self.current_library_files = self.library.paths
         self._sync_dedupe_button()
         self._sync_playlist_button()
+        self._sync_sort_control()
+        self._sync_brand()
 
     def set_library_view(self, name):
         self.library_view = name
@@ -3732,6 +4009,7 @@ class App(ctk.CTk):
             self._safe_after(500, self._watch_downloads)
             return
         self._sync_download_buttons()
+        self._reconcile_imports()
         self.load_library()
 
 
