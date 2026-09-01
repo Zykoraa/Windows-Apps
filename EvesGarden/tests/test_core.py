@@ -23,6 +23,7 @@ import downloader
 import metadata
 import lyrics
 import smart_playlists
+import visualizers
 import spotify_import
 import themes
 import ui_widgets
@@ -1312,6 +1313,103 @@ class LyricFetching(unittest.TestCase):
     def test_nothing_anywhere_is_reported_as_nothing(self):
         log = []
         self.assertEqual(lyrics.fetch("q", self._search(log)), ([], False))
+
+
+class PeakHold(unittest.TestCase):
+    """What makes a spectrum analyser look like one."""
+
+    def test_a_peak_holds_above_the_bar_then_falls(self):
+        peaks = visualizers._Peaks()
+        peaks.update([1.0], 0.0)
+        # Still held while the bar has dropped away underneath it.
+        self.assertAlmostEqual(peaks.update([0.1], 0.2)[0], 1.0)
+        # After the hold, falling but not yet down to the bar.
+        after = peaks.update([0.1], 0.2 + peaks.HOLD + 0.1)[0]
+        self.assertLess(after, 1.0)
+        self.assertGreater(after, 0.1)
+
+    def test_a_peak_never_falls_below_the_bar(self):
+        """Within the single frame where the decay would overshoot it.
+
+        A frame later the peak is picked back up by the bar anyway, so the
+        only way to see this is to catch the one update that overshoots --
+        which on screen is a cap flickering below the bar it belongs to.
+        """
+        peaks = visualizers._Peaks()
+        peaks.update([1.0], 0.0)
+        # Far enough past the hold that a full clamped step is taken, and the
+        # bar is high enough that the step would carry the peak under it.
+        held = peaks.update([0.9], peaks.HOLD + 0.5)[0]
+        self.assertGreaterEqual(held, 0.9)
+
+    def test_a_peak_does_come_down_to_meet_a_quiet_band(self):
+        peaks = visualizers._Peaks()
+        peaks.update([1.0], 0.0)
+        now = peaks.HOLD + 0.1
+        for _ in range(12):
+            now += 0.2
+            held = peaks.update([0.1], now)[0]
+        self.assertLess(held, 0.2)
+
+    def test_a_louder_band_takes_the_peak_immediately(self):
+        peaks = visualizers._Peaks()
+        peaks.update([0.2], 0.0)
+        self.assertAlmostEqual(peaks.update([0.9], 0.05)[0], 0.9)
+
+    def test_one_frame_cannot_drop_every_peak_to_the_floor(self):
+        """A paused visualiser comes back to an enormous time delta.
+
+        Unclamped, the first frame after it would subtract minutes of decay
+        and every peak would land on its bar at once.
+        """
+        peaks = visualizers._Peaks()
+        peaks.update([1.0], 0.0)
+        peaks.update([1.0], 0.1)
+        self.assertGreater(peaks.update([0.0], 600.0)[0], 0.4)
+
+    def test_a_different_band_count_is_a_different_song(self):
+        peaks = visualizers._Peaks()
+        peaks.update([1.0, 1.0], 0.0)
+        self.assertEqual(peaks.update([0.2, 0.2, 0.2], 0.01), [0.2, 0.2, 0.2])
+
+
+class VisualiserChoice(unittest.TestCase):
+    """The list was cut from 32 to 9, so every saved position moved."""
+
+    def test_a_name_is_taken_as_it_is(self):
+        for name in visualizers.names():
+            self.assertEqual(visualizers.names()[visualizers.resolve(name)],
+                             name)
+
+    def test_an_old_index_finds_the_mode_it_meant(self):
+        # 16 was Spectrum Ribbon and 23 was Tunnel, both of which survived.
+        self.assertEqual(visualizers.names()[visualizers.resolve(16)],
+                         "Spectrum Ribbon")
+        self.assertEqual(visualizers.names()[visualizers.resolve(23)],
+                         "Tunnel")
+
+    def test_an_index_for_a_mode_that_is_gone_falls_back(self):
+        # 25 was Grid Pulse, which no longer exists. Wrapping the index would
+        # silently hand back some unrelated visualiser instead.
+        self.assertEqual(visualizers.resolve(25), 0)
+        self.assertEqual(visualizers.resolve(9), 0)
+
+    def test_nonsense_is_the_first_one_rather_than_an_error(self):
+        for saved in (None, "", "Fire", 99, -1, "12", object()):
+            self.assertEqual(visualizers.resolve(saved), 0, repr(saved))
+
+    def test_the_legacy_list_still_matches_what_it_describes(self):
+        """It is the map from old positions, so its length is load-bearing."""
+        self.assertEqual(len(visualizers.LEGACY_NAMES), 32)
+        self.assertEqual(len(set(visualizers.LEGACY_NAMES)), 32)
+        # Everything kept must appear in it, or that mode's old setting is
+        # unreachable.
+        for name in visualizers.names():
+            self.assertIn(name, visualizers.LEGACY_NAMES)
+
+    def test_no_two_modes_share_a_name(self):
+        self.assertEqual(len(set(visualizers.names())),
+                         len(visualizers.names()))
 
 
 if __name__ == "__main__":

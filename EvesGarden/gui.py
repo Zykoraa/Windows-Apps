@@ -209,9 +209,11 @@ class App(ctk.CTk):
             on_log=self._gui_log,
         )
 
-        self.visualizer_mode = int(self.settings.get("visualizer_mode") or 0)
-        if not (0 <= self.visualizer_mode < len(VIZ_MODES)):
-            self.visualizer_mode = 0
+        # Saved by name now. It used to be saved as a position in the mode
+        # list, and every position moved when the list was cut, so an old
+        # setting is translated rather than followed.
+        self.visualizer_mode = visualizers.resolve(
+            self.settings.get("visualizer_mode"))
         # Best-effort: no application id, or Discord closed, simply means the
         # feature stays off. It must never affect playback.
         self.discord = DiscordPresence(
@@ -2180,7 +2182,7 @@ class App(ctk.CTk):
 
     def set_visualizer_mode(self, index):
         self.visualizer_mode = index % len(VIZ_MODES)
-        self.settings.set("visualizer_mode", self.visualizer_mode)
+        self.settings.set("visualizer_mode", VIZ_MODES[self.visualizer_mode])
         if hasattr(self, "viz_dropdown"):
             self.viz_dropdown.set(VIZ_MODES[self.visualizer_mode])
 
