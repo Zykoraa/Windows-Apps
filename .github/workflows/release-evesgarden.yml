@@ -127,8 +127,10 @@ jobs:
             away -- track details come from Apple's iTunes catalogue, which
             needs no account.
 
-            Connecting Spotify is optional, and adds your own library on top:
-            your playlists and your liked songs. Create a free app at
+            Connecting Spotify is optional, and adds your own library on
+            top. Import from Spotify, on the Playlists tab, brings your
+            playlists and your liked songs across as real playlists here and
+            downloads whatever is missing. Create a free app at
             https://developer.spotify.com/dashboard (any name, no card
             needed) and paste the Client ID and Client Secret into the setup
             screen.
