@@ -344,6 +344,25 @@ class SurfaceWalk:
         app.toggle_visualizer_visibility()
         yield 200
 
+        # Windows decides whether it will snap or tile a window from its
+        # style bits alone. A frameless window is a WS_POPUP and gets neither
+        # unless it also says it is sizable and can be maximised -- without
+        # these, Win+Left does nothing, dragging to an edge does nothing, and
+        # a tiling manager will not take the window at all.
+        self.mark("window can still be snapped")
+        if sys.platform == "win32":
+            import ctypes
+            hwnd = app._hwnd()
+            assert hwnd, "no top-level window handle"
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, app.GWL_STYLE)
+            for bit, name in ((app.WS_THICKFRAME, "WS_THICKFRAME"),
+                              (app.WS_MAXIMIZEBOX, "WS_MAXIMIZEBOX"),
+                              (app.WS_MINIMIZEBOX, "WS_MINIMIZEBOX")):
+                assert style & bit, (
+                    "%s is not set, so Windows will not snap this window"
+                    % name)
+        yield 80
+
         self.mark("transport with nothing loaded")
         app.toggle_play_pause()
         yield 120

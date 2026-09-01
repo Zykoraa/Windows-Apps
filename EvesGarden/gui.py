@@ -1047,10 +1047,31 @@ class App(ctk.CTk):
         self.load_library()
 
     def get_pos(self, event):
-        self.xwin = event.x
-        self.ywin = event.y
+        """Hand the drag to Windows, so dragging to an edge snaps.
+
+        Moving the window by setting its geometry on every motion event is a
+        drag the shell knows nothing about: no snapping at the edges, no
+        Aero shake, and the window lags the cursor. Telling Windows the
+        title bar was pressed hands it the whole move, and everything that
+        comes with one arrives for free.
+        """
+        self.xwin, self.ywin = event.x, event.y
+        hwnd = self._hwnd()
+        if not hwnd:
+            return
+        try:
+            ctypes.windll.user32.ReleaseCapture()
+            ctypes.windll.user32.SendMessageW(
+                hwnd, self.WM_NCLBUTTONDOWN, self.HTCAPTION, 0)
+            self._native_drag = True
+        except Exception:
+            self._native_drag = False
 
     def move_window(self, event):
+        # Only reached when the native move could not be started; otherwise
+        # Windows has already handled the whole drag.
+        if getattr(self, "_native_drag", False):
+            return
         self.geometry(f'+{event.x_root - self.xwin}+{event.y_root - self.ywin}')
 
     def toggle_now_playing_overlay(self, event=None):
@@ -2236,13 +2257,51 @@ class App(ctk.CTk):
                            font=theme_ui.font("body"))
 
     def set_appwindow(self):
-        hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-        style = style & ~0x00000080
-        style = style | 0x00040000
-        ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
+        hwnd = self._hwnd()
+        if not hwnd:
+            return
+        user32 = ctypes.windll.user32
+        # Taskbar button: drop TOOLWINDOW, add APPWINDOW.
+        ex = user32.GetWindowLongW(hwnd, self.GWL_EXSTYLE)
+        ex = (ex & ~self.WS_EX_TOOLWINDOW) | self.WS_EX_APPWINDOW
+        user32.SetWindowLongW(hwnd, self.GWL_EXSTYLE, ex)
+
+        # And this is what lets the window be snapped and tiled. A frameless
+        # window is a WS_POPUP, and the shell will not snap one: Win+Left did
+        # nothing, dragging to an edge did nothing, and a tiling manager
+        # would not take it. Windows decides that on the style bits alone, so
+        # saying the window is sizable and can be maximised is enough -- no
+        # title bar comes back with them, because the caption bits are not
+        # among them.
+        style = user32.GetWindowLongW(hwnd, self.GWL_STYLE)
+        style |= (self.WS_THICKFRAME | self.WS_MAXIMIZEBOX
+                  | self.WS_MINIMIZEBOX)
+        user32.SetWindowLongW(hwnd, self.GWL_STYLE, style)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, self.SWP_FRAMECHANGED
+                            | self.SWP_NOMOVE | self.SWP_NOSIZE
+                            | self.SWP_NOZORDER | self.SWP_NOACTIVATE)
         self.withdraw()
         self.deiconify()
+
+    # Win32 constants, named rather than spelled as magic numbers at the
+    # call site the way the taskbar flags used to be.
+    GWL_STYLE, GWL_EXSTYLE = -16, -20
+    WS_THICKFRAME = 0x00040000
+    WS_MINIMIZEBOX = 0x00020000
+    WS_MAXIMIZEBOX = 0x00010000
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_APPWINDOW = 0x00040000
+    SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER = 0x0001, 0x0002, 0x0004
+    SWP_NOACTIVATE, SWP_FRAMECHANGED = 0x0010, 0x0020
+    WM_NCLBUTTONDOWN, HTCAPTION = 0x00A1, 2
+
+    def _hwnd(self):
+        """The real top-level window, not Tk's frame inside it."""
+        try:
+            return (ctypes.windll.user32.GetParent(self.winfo_id())
+                    or self.winfo_id())
+        except Exception:
+            return None
 
     def _apply_window_icon(self):
         """Set the window/taskbar icon from the icon baked into the source.
