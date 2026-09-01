@@ -106,6 +106,9 @@ from downloader import (
     SpotifyAuthError,
 )
 
+VIEWS = ("Songs", "Liked", "Recent", "Playlists", "Albums", "Artists",
+         "Duplicates")
+
 LIBRARY_DIR = os.path.join(os.path.expanduser("~"), "Music", "SpotifyDownloads")
 CONFIG_DIR = LOG_DIR
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
@@ -265,8 +268,10 @@ class App(ctk.CTk):
         # (playlist_id, ordered paths) for imports whose downloads
         # have not finished yet.
         self._pending_imports = []
-        # Re-entrancy guard for the masthead's own measuring pass.
+        # Re-entrancy guard for the masthead's own measuring pass, and the
+        # pending timer that coalesces a burst of them into one.
         self._brand_busy = False
+        self._brand_job = False
         self.current_index = -1
         self.shuffle = bool(self.settings.get("shuffle"))
         self.repeat = bool(self.settings.get("repeat"))
@@ -284,8 +289,11 @@ class App(ctk.CTk):
         # setting only the engine leaves the sliders showing their defaults.
         self._restore_audio_controls()
 
-        if self.settings.get("visualizer_visible"):
-            self.toggle_visualizer_visibility()
+        # The visualiser is deliberately not restored. It is a thing you turn
+        # on to watch, not a mode to be put back into before you have asked
+        # for anything -- and it is one keystroke away (v), so having it open
+        # itself at launch mostly meant it had been opened by accident.
+        # The app opens on the library, every time.
 
         # Start GUI update loops
         self._pump_ui_calls()
@@ -785,12 +793,21 @@ class App(ctk.CTk):
         self.brand_word.pack(side="left")
 
         self.view_tabs = ctk.CTkSegmentedButton(
-            self.library_header, values=["Songs", "Liked", "Recent", "Playlists", "Albums",
-                    "Artists", "Duplicates"],
+            self.library_header, values=list(VIEWS),
             command=self.set_library_view, corner_radius=theme_ui.RADIUS_PILL,
             height=36, font=theme_ui.font("body_med"))
         self.view_tabs.set(self.library_view)
         self.view_tabs.pack(side="left", padx=(0, 12))
+
+        # The same seven views in 150px instead of 580. Below about 1000px
+        # wide the strip alone is most of the row, and everything after it
+        # was being sliced; this is what the row falls back to rather than
+        # start cutting controls in half.
+        self.view_menu = ctk.CTkOptionMenu(
+            self.library_header, values=list(VIEWS),
+            command=self.set_library_view, corner_radius=theme_ui.RADIUS_PILL,
+            width=150, height=36, font=theme_ui.font("body_med"))
+        self.view_menu.set(self.library_view)
 
         # Everything that acts on the library rides in one cluster, and the
         # cluster is packed before the search box. Pack hands out width in
@@ -829,10 +846,13 @@ class App(ctk.CTk):
             border_width=1, corner_radius=theme_ui.RADIUS_PILL,
             height=36, width=0, font=theme_ui.font("body_med"))
 
+        # Fixed width, not width=0: its label counts the ticked rows, so a
+        # width that follows the text changes under the masthead measurement
+        # and gives it a number that was true a moment ago.
         self.dedupe_btn = ctk.CTkButton(
             self.library_actions, text="Move ticked to Recycle Bin",
             command=self.remove_duplicates, corner_radius=theme_ui.RADIUS_PILL,
-            height=36, width=0, font=theme_ui.font("body_med"))
+            height=36, width=210, font=theme_ui.font("body_med"))
 
         # Only offered when there is actually something to recover.
         self.repair_btn = ctk.CTkButton(self.library_actions, text="Repair library",
@@ -880,9 +900,15 @@ class App(ctk.CTk):
         # 3. Bottom Playback Bar
         self.bottom_bar = ctk.CTkFrame(self, height=90, corner_radius=0, fg_color=self.theme["surface"])
         self.bottom_bar.grid(row=2, column=0, sticky="ew")
-        self.bottom_bar.grid_columnconfigure(0, weight=1)
+        # Only the middle column stretches, so the slack goes to the seek bar
+        # rather than being shared out among the controls either side of it.
+        # (What was actually slicing the EQ button into a 15px sliver was the
+        # now-playing text, which had no width of its own and grew with
+        # whatever was playing. That is bounded now; this is just the right
+        # shape for the row.)
+        self.bottom_bar.grid_columnconfigure(0, weight=0)
         self.bottom_bar.grid_columnconfigure(1, weight=1)
-        self.bottom_bar.grid_columnconfigure(2, weight=1)
+        self.bottom_bar.grid_columnconfigure(2, weight=0)
 
         self.now_playing_frame = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         self.now_playing_frame.grid(row=0, column=0, rowspan=2, sticky="w", padx=20)
@@ -900,12 +926,24 @@ class App(ctk.CTk):
 
         # One flat "Artist - Title" string gave the title no prominence, so
         # split it: title leads, artist and album sit under it.
-        np_text = ctk.CTkFrame(self.now_playing_frame, fg_color="transparent")
-        np_text.pack(side="left", fill="y")
+        # A fixed width, so what is playing cannot widen the bar and squeeze
+        # the transport. The text is trimmed to fit it instead -- it used to
+        # be cut off wherever the frame happened to end, mid-word and with no
+        # ellipsis to say it had been.
+        # Height as well as width: pack_propagate(False) freezes both, and a
+        # CTkFrame with no height asked for defaults to 200px -- which pushed
+        # the bar to more than twice its size and dragged the artwork out of
+        # the bottom of the window.
+        np_text = ctk.CTkFrame(self.now_playing_frame, fg_color="transparent",
+                               width=self.NP_TEXT_W, height=46)
+        np_text.pack(side="left")
+        np_text.pack_propagate(False)
         self.now_playing_label = ctk.CTkLabel(np_text, text="No track selected",
                                               font=theme_ui.font("heading"),
                                               anchor="w", justify="left")
-        self.now_playing_label.pack(anchor="w", pady=(16, 0))
+        # No top padding now that the frame is a fixed height and packs
+        # centred: 16px of it pushed the artist line out of the bottom.
+        self.now_playing_label.pack(anchor="w")
         self.now_playing_sub = ctk.CTkLabel(np_text, text="",
                                             font=theme_ui.font("caption"),
                                             anchor="w", justify="left")
@@ -1994,7 +2032,7 @@ class App(ctk.CTk):
                                             placeholder_text_color=t["text_secondary"])
 
         for name in ("theme_dropdown", "viz_dropdown", "preset_dropdown",
-                     "sort_dropdown"):
+                     "sort_dropdown", "view_menu"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.configure(fg_color=t["surface"], button_color=t["surface"],
@@ -2109,7 +2147,6 @@ class App(ctk.CTk):
         self.visualizer_visible = not self.visualizer_visible
         # Skip the per-chunk FFT entirely while the overlay is hidden.
         self.player.visualizer_enabled = self.visualizer_visible
-        self.settings.set("visualizer_visible", self.visualizer_visible)
         self._viz_idle = False
         if self.visualizer_visible:
             self._slide_in(self.viz_overlay)
@@ -2407,6 +2444,36 @@ class App(ctk.CTk):
         self.time_elapsed.configure(text=fmt_time(self.player.get_position()))
         self.time_total.configure(text=fmt_time(self.player.get_duration()))
 
+    # How much room the track and artist get in the bottom bar.
+    NP_TEXT_W = 240
+
+    def _set_now_playing_text(self, title, subtitle=""):
+        """Put the track in the bar, trimmed to the room it has."""
+        self._fit_label(self.now_playing_label, title)
+        if getattr(self, "now_playing_sub", None) is not None:
+            self._fit_label(self.now_playing_sub, subtitle)
+
+    def _fit_label(self, label, text):
+        """Trim to what actually fits, with an ellipsis to say so.
+
+        A Tk label does not clip: given more text than room it simply draws
+        over whatever is next to it, or gets cut off by the window edge in
+        the middle of a word.
+        """
+        text = text or ""
+        try:
+            font = label.cget("font")
+            room = self.NP_TEXT_W - 6
+            if font.measure(text) <= room:
+                label.configure(text=text)
+                return
+            ellipsis = "\u2026"
+            while text and font.measure(text + ellipsis) > room:
+                text = text[:-1]
+            label.configure(text=text.rstrip() + ellipsis)
+        except Exception:
+            label.configure(text=text)
+
     def _sync_playlist_button(self):
         for name in ("new_pl_btn", "import_pl_btn"):
             button = getattr(self, name, None)
@@ -2417,7 +2484,7 @@ class App(ctk.CTk):
             else:
                 button.pack_forget()
 
-    # What the search box keeps before the wordmark is asked to go. 180px
+    # What the search box keeps before anything else is asked to go. 180px
     # still shows most of its placeholder; below that it stops reading as a
     # search box at all.
     SEARCH_FLOOR = 180
@@ -2449,38 +2516,113 @@ class App(ctk.CTk):
 
         self._brand_busy = True
         try:
-            # A control that has just been packed, or had its label changed,
-            # has not worked out how wide it wants to be yet -- the Duplicates
-            # button reported almost nothing until Tk caught up, so the row
-            # kept its masthead and squeezed the search box to 62px instead.
-            actions.update_idletasks()
             self._place_brand(head, tabs, actions, word, mark, available)
         finally:
             self._brand_busy = False
 
+    def _schedule_brand(self):
+        """Measure the header a frame later, and only once.
+
+        A control that has just been packed has not worked out how wide it
+        wants to be yet. This used to be forced with update_idletasks(),
+        which flushes every pending piece of geometry in the interpreter --
+        including the rows the library had just built. That put 640ms of
+        somebody else's work inside a masthead measurement, on every single
+        view switch. A timer waits for the same information without paying
+        for it, and coalescing means a burst of renders measures once.
+        """
+        if self._brand_job:
+            return
+        # A flag, not a timer id: _safe_after marshals through the UI queue
+        # and has nothing to cancel. Coalescing is all this needs.
+        self._brand_job = True
+        self._safe_after(16, self._run_brand_job)
+
+    def _run_brand_job(self):
+        self._brand_job = False
+        self._sync_brand()
+
     def _place_brand(self, head, tabs, actions, word, mark, available):
+        """Give things up in order, and never let a control be sliced.
+
+        Everything in the cluster keeps the width it asked for, so the only
+        way to fit a narrower row is to carry less. The order is decoration
+        first, then labels, then whole controls -- and the search box is not
+        on the list, because a row with nowhere to type is worse than one
+        without a sort order.
+        """
         # Summed over the cluster's own children rather than asking the
         # cluster: a frame's requested width is only recomputed once the
         # geometry manager next runs, so straight after a button is packed or
         # forgotten it still reports the width it had before -- which had the
         # wide Playlists row keeping the wordmark while the narrow Songs row
         # gave it up. A child's own requested width does not move.
-        cluster = sum(w.winfo_reqwidth() + 12
-                      for w in actions.winfo_children()
-                      if w.winfo_manager() == "pack")
-        needed = tabs.winfo_reqwidth() + 12 + cluster + self.SEARCH_FLOOR + 14
-        spare = available - needed
-        mark_w = mark.winfo_reqwidth() + 20      # the leaf and the padding
-        want_mark = spare >= mark_w
-        want_word = want_mark and spare >= mark_w + word.winfo_reqwidth() + 9
+        # Measured against the fullest the cluster can ever be, not the one
+        # on screen. Sizing for the current view meant the row rearranged
+        # itself as you moved between tabs -- and at 1100px the tab strip you
+        # had just clicked was what disappeared. What the header shows should
+        # depend on how wide the window is and nothing else.
+        def width(widget):
+            return widget.winfo_reqwidth() + 12
 
+        sort_w = self.sort_dropdown.winfo_reqwidth() + 10
+        widest = max(width(self.new_pl_btn) + width(self.import_pl_btn),
+                     width(self.dedupe_btn), sort_w)
+        # Repair is not a view: it appears when there is damage to fix, and
+        # can share the row with any of them.
+        repair = (width(self.repair_btn)
+                  if self.repair_btn.winfo_manager() == "pack" else 0)
+        base = repair + widest + self.SEARCH_FLOOR + 14
+        mark_w = mark.winfo_reqwidth() + 20
+        word_w = word.winfo_reqwidth() + 9
+        sortable = self._sort_is_meaningful()
+
+        # Richest arrangement first; the first that fits is the one used, and
+        # if none do the last is what the row is left with.
+        menu_w = self.view_menu.winfo_reqwidth() + 12
+        strip_w = tabs.winfo_reqwidth() + 12
+
+        # Richest arrangement first; the first that fits is the one used, and
+        # if none do the last is what the row is left with. Decoration goes
+        # before labels, labels before whole controls, and the search box is
+        # not on the list at all -- a row with nowhere to type is worse than
+        # one whose tabs have become a dropdown.
+        for masthead, strip in (
+                ("word", True), ("mark", True), ("none", True),
+                ("none", False)):
+            cost = (base + (strip_w if strip else menu_w) + width(self.nav_dl_btn)
+                    + (mark_w if masthead in ("mark", "word") else 0)
+                    + (word_w if masthead == "word" else 0))
+            if cost <= available:
+                break
+
+        self._set_view_control(strip)
+        self._set_masthead(masthead, tabs, word)
+        # The sort control is only ever a question of whether it means
+        # anything here: its width is already inside the worst case above.
+        self._set_sort_shown(sortable)
+
+    def _set_view_control(self, strip):
+        """Seven tabs, or the dropdown that says the same thing in 150px."""
+        show, hide = ((self.view_tabs, self.view_menu) if strip
+                      else (self.view_menu, self.view_tabs))
+        if show.winfo_manager() == "pack":
+            return
+        hide.pack_forget()
+        # Packed against the search box, so it keeps its place in the row
+        # whichever of the two is on screen.
+        show.pack(side="left", padx=(0, 12), before=self.lib_search_entry)
+
+    def _set_masthead(self, level, tabs, word):
         # The frame goes, not just its contents: an emptied CTkFrame still
         # holds 43px of the row, which is most of what the leaf was meant to
         # be giving back.
         for widget, wanted, kwargs in (
-                (self.brand, want_mark,
-                 {"side": "left", "padx": (2, 18), "before": tabs}),
-                (word, want_word, {"side": "left"})):
+                (self.brand, level in ("mark", "word"),
+                 {"side": "left", "padx": (2, 18),
+                  "before": (tabs if tabs.winfo_manager() == "pack"
+                             else self.view_menu)}),
+                (word, level == "word", {"side": "left"})):
             if wanted == (widget.winfo_manager() == "pack"):
                 continue
             if wanted:
@@ -2488,20 +2630,8 @@ class App(ctk.CTk):
             else:
                 widget.pack_forget()
 
-    def _sync_sort_control(self):
-        """Offer the sort only where it changes anything.
-
-        Five of the seven tabs ignore it outright: Liked is always ordered by
-        when you liked it, Recent by when you played it, Duplicates by what
-        deleting them would reclaim, Albums and Artists by name, and a
-        playlist by its own order. The dropdown sat over all of them looking
-        live, and answering to nothing.
-        """
-        widget = getattr(self, "sort_dropdown", None)
-        if widget is None:
-            return
-        wanted = (self.library_view == "Songs"
-                  or getattr(self.library, "filter", None) is not None)
+    def _set_sort_shown(self, wanted):
+        widget = self.sort_dropdown
         if wanted == (widget.winfo_manager() == "pack"):
             return
         if wanted:
@@ -2509,6 +2639,18 @@ class App(ctk.CTk):
             widget.pack(side="left", padx=(0, 10), before=self.nav_dl_btn)
         else:
             widget.pack_forget()
+
+    def _sort_is_meaningful(self):
+        """Whether the sort order changes anything on the current view.
+
+        Five of the seven tabs ignore it outright: Liked is always ordered by
+        when you liked it, Recent by when you played it, Duplicates by what
+        deleting them would reclaim, Albums and Artists by name, and a
+        playlist by its own order. The dropdown sat over all of them looking
+        live, and answering to nothing.
+        """
+        return (self.library_view == "Songs"
+                or getattr(self.library, "filter", None) is not None)
 
     def _sync_dedupe_button(self):
         """Only offer the delete action while the Duplicates view is open."""
@@ -3020,8 +3162,7 @@ class App(ctk.CTk):
         self.current_library_files = self.library.paths
         self._sync_dedupe_button()
         self._sync_playlist_button()
-        self._sync_sort_control()
-        self._sync_brand()
+        self._schedule_brand()
 
     def set_library_view(self, name):
         self.library_view = name
@@ -3032,8 +3173,10 @@ class App(ctk.CTk):
         # when anything else switches view -- so the palette, a restored
         # setting or a new playlist all left the tab strip highlighting a view
         # that was no longer on screen.
-        if getattr(self, "view_tabs", None) is not None:
-            self.view_tabs.set(name)
+        for control in ("view_tabs", "view_menu"):
+            widget = getattr(self, control, None)
+            if widget is not None:
+                widget.set(name)
         self.library.set_view(name)
         self.render_library()
 
@@ -3194,10 +3337,7 @@ class App(ctk.CTk):
         artist = " \u00b7 ".join(x for x in ((row or {}).get("artist"),
                                              (row or {}).get("album")) if x)
 
-        self.now_playing_label.configure(
-            text=display if len(display) <= 46 else display[:43] + "\u2026")
-        if hasattr(self, "now_playing_sub"):
-            self.now_playing_sub.configure(text=artist)
+        self._set_now_playing_text(display, artist)
 
         self._now_playing_row = row or {"path": path}
         self._sync_now_playing_heart()
@@ -3698,9 +3838,8 @@ class App(ctk.CTk):
             except Exception:
                 pass
         self._streaming_track = track
-        self.now_playing_label.configure(text=track["title"])
-        self.now_playing_sub.configure(
-            text=f"{track['artist']}  ·  preview")
+        self._set_now_playing_text(track["title"],
+                                   f"{track['artist']}  ·  preview")
 
         def work():
             try:

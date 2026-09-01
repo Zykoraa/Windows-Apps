@@ -10,6 +10,7 @@ set passed to the constructor.
 import io
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import customtkinter as ctk
@@ -24,7 +25,12 @@ from PIL import Image
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC
 
-CHUNK = 40  # rows rendered per event-loop turn
+# Rows rendered per turn of the event loop. This is the click latency of a
+# view switch: the first chunk is built before anything is drawn, and a track
+# row costs about 2ms to build. At 40 that was a 290ms freeze on the Songs
+# tab; at 12 it is under 100ms, and the rest of the list still fills in well
+# inside the time it takes to look at it.
+CHUNK = 12
 ROW_H = theme_ui.ROW_H
 ART = theme_ui.ROW_ART
 FADE_H = 14  # the header tint's fade-out into the list below it
@@ -71,6 +77,8 @@ class LibraryView:
         self._art_cache = {}
         self._signature = None
         self._token = 0
+        # Rows detached from the list and waiting to be destroyed.
+        self._discarding = set()
         # Rows keyed by path so the playing track can be highlighted without
         # re-rendering the list.
         self._rows_by_path = {}
@@ -242,8 +250,17 @@ class LibraryView:
 
         self._token += 1
         token = self._token
-        for widget in self.frame.winfo_children():
-            widget.destroy()
+        # Detaching is one cheap call per row; destroying is not, and doing
+        # it here meant every view switch paid for the view being left before
+        # the new one could be drawn.
+        stale = [w for w in self.frame.winfo_children()
+                 if w not in self._discarding]
+        for widget in stale:
+            try:
+                widget.pack_forget()
+            except Exception:
+                pass
+        self._discard(stale)
 
         self.rows = rows
         self.paths = [r["path"] for r in rows if r.get("path")]
@@ -273,6 +290,41 @@ class LibraryView:
 
         chunk(0)
         self._set_status(plural(len(rows), noun.rstrip("s")))
+
+    # Long enough to be worth a turn of the loop, short enough that a frame
+    # is never missed for it.
+    DISCARD_SLICE = 0.008
+
+    def _discard(self, widgets):
+        """Tear down rows in the background instead of all at once.
+
+        A CustomTkinter widget costs about 0.8ms to destroy, and a track row
+        is eight of them, so clearing a 125-track list took very nearly a
+        second -- spent before the view being switched to had drawn anything.
+        That second was the whole of "switching views lags". The rows are
+        detached first, so they are already gone from the screen, and what
+        is left is bookkeeping nobody is waiting on.
+        """
+        if not widgets:
+            return
+        self._discarding.update(widgets)
+        pending = list(widgets)
+
+        def drain():
+            deadline = time.perf_counter() + self.DISCARD_SLICE
+            while pending:
+                widget = pending.pop()
+                self._discarding.discard(widget)
+                try:
+                    widget.destroy()
+                except Exception:
+                    pass
+                if time.perf_counter() >= deadline:
+                    break
+            if pending:
+                self.schedule(1, drain)
+
+        self.schedule(1, drain)
 
     def _toggle_like(self, path, label):
         if not self.on_like:

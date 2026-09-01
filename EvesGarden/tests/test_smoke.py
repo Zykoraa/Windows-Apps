@@ -183,12 +183,61 @@ class SurfaceWalk:
         # playlist" came out 32px wide and the import button did not appear
         # at all, which reads as a rendering bug rather than a layout one.
         self.mark("header at the widths it has to survive")
-        for width in (1600, 1340, 1100):
-            app.geometry("%dx820+20+20" % width)
+        # 900 is the narrowest the window can be dragged to, so it is the one
+        # that has to hold.
+        for width in (1600, 1340, 1100, 900):
+            app.geometry("%dx700+20+20" % width)
             yield 260
+            shape = None
             for view in ("Songs", "Playlists", "Duplicates"):
                 app.set_library_view(view)
                 yield 200
+                # What the header carries must depend on the window width and
+                # nothing else. Sizing it for the view on screen meant the row
+                # rearranged as you moved between tabs -- and at 1100px the
+                # tab strip you had just clicked was what disappeared.
+                here = (app.view_tabs.winfo_manager() == "pack",
+                        app.brand.winfo_manager() == "pack",
+                        app.brand_word.winfo_manager() == "pack",
+                        app.nav_dl_btn.cget("text"))
+                assert shape is None or here == shape, (
+                    "header rearranged on %s at %dpx: %r then %r"
+                    % (view, width, shape, here))
+                shape = here
+                # Exactly one way to change view, always.
+                assert (app.view_tabs.winfo_manager() == "pack") !=                        (app.view_menu.winfo_manager() == "pack"), (
+                    "tab strip and view dropdown must not both be %s at %d"
+                    % ("hidden" if app.view_tabs.winfo_manager() != "pack"
+                       else "shown", width))
+                # Re-packing sends a widget to the end of its side, so the
+                # control that changes view can come back to the right of
+                # the search box it is supposed to sit before.
+                showing = (app.view_tabs
+                           if app.view_tabs.winfo_manager() == "pack"
+                           else app.view_menu)
+                assert showing.winfo_rootx() < app.lib_search_entry.winfo_rootx(), (
+                    "view control ended up right of the search box at %d on %s"
+                    % (width, view))
+                # The search box is the one thing the row never gives up.
+                assert app.lib_search_entry.winfo_width() >= 100, (
+                    "search box down to %dpx at %d on %s"
+                    % (app.lib_search_entry.winfo_width(), width, view))
+                # The bottom bar has the same problem and had it worse: all
+                # three of its columns stretched, so when it ran out of room
+                # the EQ button was drawn as a 15px sliver of a pill.
+                app._set_now_playing_text(
+                    "A Track With A Rather Long Name On It",
+                    "Some Artist · An Album With A Long Name")
+                for child in (app.eq_toggle_btn, app.viz_toggle_btn,
+                              app.queue_btn, app.volume_icon):
+                    assert child.winfo_width() >= child.winfo_reqwidth() - 1, (
+                        "%s squeezed to %dpx of %dpx at %d"
+                        % (child.__class__.__name__, child.winfo_width(),
+                           child.winfo_reqwidth(), width))
+                assert app.bottom_bar.winfo_height() <= 140, (
+                    "bottom bar grew to %dpx at %d -- a fixed-size frame with "
+                    "no height asked for defaults to 200"
+                    % (app.bottom_bar.winfo_height(), width))
                 for child in app.library_actions.winfo_children():
                     if child.winfo_manager() != "pack":
                         continue
@@ -200,19 +249,16 @@ class SurfaceWalk:
                         "%r squeezed to %dpx of %dpx at %d on %s"
                         % (name, child.winfo_width(), child.winfo_reqwidth(),
                            width, view))
-                # And the search box has to still be a box, not a sliver,
-                # wherever the masthead is still being shown.
                 if app.brand.winfo_manager() == "pack":
                     # Re-packing sends a widget to the end of its side unless
                     # it says otherwise, so a masthead that stood down and
                     # came back can reappear in the middle of the row.
-                    assert app.brand.winfo_rootx() < app.view_tabs.winfo_rootx(), (
+                    ahead = (app.view_tabs
+                             if app.view_tabs.winfo_manager() == "pack"
+                             else app.view_menu)
+                    assert app.brand.winfo_rootx() < ahead.winfo_rootx(), (
                         "masthead came back right of the tabs at %d on %s"
                         % (width, view))
-                    assert app.lib_search_entry.winfo_width() >= 100, (
-                        "search box %dpx while the masthead still had room, "
-                        "at %d on %s" % (app.lib_search_entry.winfo_width(),
-                                         width, view))
         app.geometry("1280x800+40+40")
         yield 260
         app.set_library_view("Songs")
