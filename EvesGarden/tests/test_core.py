@@ -21,6 +21,7 @@ from play_queue import PlayQueue
 import colorsys
 import downloader
 import metadata
+import lyrics
 import smart_playlists
 import spotify_import
 import themes
@@ -1030,6 +1031,143 @@ class Fingerprints(unittest.TestCase):
             _sp_track("Gravity (Remastered)", "John Mayer", 247000))
         self.assertEqual(spotify_import.match(meta, self.ix.fingerprints()),
                          "g.mp3")
+
+
+class LyricParsing(unittest.TestCase):
+    """Everything the old inline parser dropped on the floor."""
+
+    def test_one_line_can_carry_several_timestamps(self):
+        # A compressed LRC gives the chorus once and lists when it recurs.
+        # The old parser read the first stamp and left the rest sitting in
+        # the text, so every repeat was lost and one line came out wrong.
+        out, synced = lyrics.parse(
+            "[00:12.00][01:45.30][02:58.10]We go again\n[00:20.00]A verse")
+        self.assertTrue(synced)
+        self.assertEqual(out, [(12.0, "We go again"), (20.0, "A verse"),
+                               (105.3, "We go again"), (178.1, "We go again")])
+
+    def test_the_legacy_hundredths_form_still_reads(self):
+        # [mm:ss:xx] has three colon-separated parts, which the old parser
+        # counted and skipped.
+        out, _ = lyrics.parse("[01:02:50]Old form")
+        self.assertEqual(out, [(62.5, "Old form")])
+
+    def test_fractions_are_not_read_as_whole_seconds(self):
+        out, _ = lyrics.parse("[00:01.5]Half\n[00:02.05]Also")
+        self.assertEqual(out, [(1.5, "Half"), (2.05, "Also")])
+
+    def test_metadata_tags_are_not_lyrics(self):
+        out, _ = lyrics.parse("[ar:Someone]\n[ti:A Song]\n[length:03:24]\n"
+                              "[offset:+500]\n[00:05.00]The only real line")
+        self.assertEqual(out, [(5.0, "The only real line")])
+
+    def test_an_instrumental_break_is_kept_as_a_gap(self):
+        """A timed line with no words is where the singing stops.
+
+        Dropping it left the last line before the break highlighted through
+        all of it, and the closing one highlighted to the end of the song --
+        which is what "the lyrics stop and it gets stuck" looks like.
+        """
+        out, _ = lyrics.parse("[00:05.00]Before\n[00:35.37] \n[01:46.28]After")
+        self.assertEqual(out, [(5.0, "Before"), (35.37, ""),
+                               (106.28, "After")])
+
+    def test_lines_come_back_in_time_order(self):
+        out, _ = lyrics.parse("[02:00.00]Third\n[00:10.00]First\n[01:00.00]Second")
+        self.assertEqual([t for _s, t in out], ["First", "Second", "Third"])
+
+    def test_a_repeated_line_at_one_timestamp_is_held_once(self):
+        out, _ = lyrics.parse("[00:05.00]Same\n[00:05.00]Same\n[00:09.00]Different")
+        self.assertEqual(out, [(5.0, "Same"), (9.0, "Different")])
+
+    def test_nothing_in_nothing_out(self):
+        self.assertEqual(lyrics.parse(""), ([], False))
+        self.assertEqual(lyrics.parse(None), ([], False))
+
+
+class PlainLyrics(unittest.TestCase):
+    """Words with no timings are still words."""
+
+    GENIUS = ("2 Contributors\n"
+              "Daylily - Live at Studio 4 Lyrics\n"
+              "\n"
+              "Outside for the first time\n"
+              "You might also like\n"
+              "And you'll be just fine\n"
+              "\n"
+              "\n"
+              "Shine onto me4Embed")
+
+    def test_the_page_furniture_is_stripped(self):
+        out, synced = lyrics.parse(self.GENIUS)
+        self.assertFalse(synced)
+        self.assertEqual([t for _s, t in out],
+                         ["Outside for the first time",
+                          "And you'll be just fine",
+                          "",
+                          "Shine onto me"])
+
+    def test_untimed_lines_carry_no_time(self):
+        out, _ = lyrics.parse("Just some words\nOn two lines")
+        self.assertEqual(out, [(None, "Just some words"), (None, "On two lines")])
+
+    def test_a_section_marker_survives(self):
+        # [Chorus] is the only structure plain lyrics have, and it is not a
+        # timestamp, so it must not be mistaken for one or thrown away.
+        out, synced = lyrics.parse("[Chorus]\nSing along")
+        self.assertFalse(synced)
+        self.assertEqual([t for _s, t in out], ["[Chorus]", "Sing along"])
+
+
+class LyricFetching(unittest.TestCase):
+    """A timed transcript beats plain text, whoever answers first."""
+
+    SYNCED = "[00:01.00]Timed line"
+    PLAIN = "Just the words"
+
+    def _search(self, log, synced=None, plain=None, raises=()):
+        def search(query, synced_only=False, plain_only=False):
+            log.append("synced" if synced_only else "plain")
+            if synced_only:
+                if "synced" in raises:
+                    raise RuntimeError("provider down")
+                return synced
+            if "plain" in raises:
+                raise RuntimeError("provider down")
+            return plain
+        return search
+
+    def test_synced_is_asked_for_first_and_settles_it(self):
+        """search() on its own returns whoever answered first.
+
+        That is how a song with a good LRC on one provider came back as
+        Genius plain text instead, differently on different runs.
+        """
+        log = []
+        out, synced = lyrics.fetch(
+            "q", self._search(log, synced=self.SYNCED, plain=self.PLAIN))
+        self.assertTrue(synced)
+        self.assertEqual(log, ["synced"])          # never had to ask for plain
+        self.assertEqual(out, [(1.0, "Timed line")])
+
+    def test_plain_is_used_rather_than_thrown_away(self):
+        log = []
+        out, synced = lyrics.fetch(
+            "q", self._search(log, synced=None, plain=self.PLAIN))
+        self.assertFalse(synced)
+        self.assertEqual(log, ["synced", "plain"])
+        self.assertEqual(out, [(None, "Just the words")])
+
+    def test_a_provider_that_raises_is_not_the_end_of_it(self):
+        log = []
+        out, synced = lyrics.fetch(
+            "q", self._search(log, plain=self.PLAIN, raises=("synced",)))
+        self.assertFalse(synced)
+        self.assertEqual([t for _s, t in out], ["Just the words"])
+
+    def test_nothing_anywhere_is_reported_as_nothing(self):
+        log = []
+        self.assertEqual(lyrics.fetch("q", self._search(log)), ([], False))
 
 
 if __name__ == "__main__":

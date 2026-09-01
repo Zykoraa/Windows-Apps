@@ -94,6 +94,7 @@ import visualizers
 import app_icon
 from discord_presence import DiscordPresence
 import credentials
+import lyrics as lyrics_source
 import spotify_auth
 import spotify_import
 from downloader import (
@@ -1514,6 +1515,14 @@ class App(ctk.CTk):
         card = getattr(self, "_np_card", self.theme["bg"])
         label = self.lyrics_labels[index]
         try:
+            # An instrumental break has no words to light up, and a
+            # highlight pill around nothing looks like a rendering fault.
+            if not (label.cget("text") or "").strip():
+                label.configure(fg_color="transparent")
+                return
+        except Exception:
+            pass
+        try:
             if state == "active":
                 label.configure(
                     text_color=self.NP_INK,
@@ -1540,11 +1549,11 @@ class App(ctk.CTk):
     def fetch_lyrics(self, query):
         def _fetch():
             try:
-                lrc = syncedlyrics.search(query)
-                self._safe_after(0, self.setup_lyrics, lrc)
+                found = lyrics_source.fetch(query, syncedlyrics.search)
+                self._safe_after(0, self.setup_lyrics, found)
             except Exception as e:
                 print(f"Lyrics error: {e}")
-                self._safe_after(0, self.setup_lyrics, None)
+                self._safe_after(0, self.setup_lyrics, ([], False))
 
         # Clear existing
         for lbl in self.lyrics_labels:
@@ -1561,7 +1570,15 @@ class App(ctk.CTk):
         import threading
         threading.Thread(target=_fetch, daemon=True).start()
 
-    def setup_lyrics(self, lrc):
+    def setup_lyrics(self, found):
+        """Render whatever came back: a timed transcript, or just the words.
+
+        Plain lyrics used to be answered with "no synced timings for this
+        track" and nothing else, while the words themselves sat in hand and
+        went in the bin. They are worth showing; they just do not follow
+        along, so the pane says so rather than looking stuck.
+        """
+        lines, synced = found
         for lbl in self.lyrics_labels:
             lbl.destroy()
         for spacer in getattr(self, "_lyric_spacers", []):
@@ -1580,57 +1597,59 @@ class App(ctk.CTk):
             lbl.grid(row=0, column=0, padx=16, pady=24, sticky="ew")
             self.lyrics_labels.append(lbl)
 
-        if not lrc:
-            message("No lyrics found for this track.\n\nNot every release has a synced "
+        if not lines:
+            message("No lyrics found for this track.\n\nNot every release has a "
                     "transcript; the cover and the queue still work.")
-            return
-
-        for line in lrc.split("\n"):
-            if not (line.startswith("[") and "]" in line):
-                continue
-            time_str, text = line[1:].split("]", 1)
-            text = text.strip()
-            if not text:
-                continue
-            try:
-                parts = time_str.split(":")
-                if len(parts) == 2:
-                    self.parsed_lyrics.append(
-                        (float(parts[0]) * 60 + float(parts[1]), text))
-            except ValueError:
-                pass
-
-        self.parsed_lyrics.sort(key=lambda x: x[0])
-
-        if not self.parsed_lyrics:
-            message("Found lyrics, but no synced timings for this track.")
             return
 
         wrap = self._lyric_wrap_width()
         self._lyrics_wrap = wrap
+        row = 0
+
+        if not synced:
+            note = ctk.CTkLabel(
+                self.lyrics_scroll,
+                text="No timings for this one \u2014 the words will not follow along.",
+                font=theme_ui.font("caption"), text_color=self.NP_DIM,
+                fg_color="transparent", anchor="w", justify="left",
+                wraplength=wrap)
+            note.grid(row=row, column=0, sticky="ew", padx=16, pady=(6, 14))
+            # A spacer rather than a lyric: lyrics_labels is indexed by line.
+            self._lyric_spacers.append(note)
+            row += 1
 
         # Spacers top and bottom so the first and last lines can still sit in
-        # the middle of the pane when the active line is centred.
-        top = ctk.CTkFrame(self.lyrics_scroll, fg_color="transparent", height=140)
-        top.grid(row=0, column=0, sticky="ew")
+        # the middle of the pane when the active line is centred. Untimed
+        # lyrics are never centred, so they do not need the room.
+        top = ctk.CTkFrame(self.lyrics_scroll, fg_color="transparent",
+                           height=140 if synced else 8)
+        top.grid(row=row, column=0, sticky="ew")
         self._lyric_spacers.append(top)
+        row += 1
 
-        for i, (_t, text) in enumerate(self.parsed_lyrics):
+        for i, (at, text) in enumerate(lines):
+            if synced:
+                self.parsed_lyrics.append((at, text))
             lbl = ctk.CTkLabel(self.lyrics_scroll, text=text,
                                font=self._lyric_font(21),
                                text_color=self.NP_DIM,
                                fg_color="transparent", corner_radius=12,
                                wraplength=wrap, justify="left", anchor="w")
-            lbl.grid(row=i + 1, column=0, sticky="ew", padx=2, pady=3,
-                     ipadx=14, ipady=9)
-            # Clicking a line jumps to it. The timings are already parsed, so
-            # the lyrics may as well be a second scrub bar.
-            lbl.configure(cursor="hand2")
-            lbl.bind("<Button-1>", lambda _e, n=i: self._seek_to_lyric(n))
+            # An empty line is an instrumental break, and reads as one only
+            # if it is a gap rather than a full-height blank row.
+            lbl.grid(row=row, column=0, sticky="ew", padx=2, pady=3,
+                     ipadx=14, ipady=9 if text else 1)
+            if synced and text:
+                # Clicking a line jumps to it. The timings are already
+                # parsed, so the lyrics may as well be a second scrub bar.
+                lbl.configure(cursor="hand2")
+                lbl.bind("<Button-1>", lambda _e, n=i: self._seek_to_lyric(n))
             self.lyrics_labels.append(lbl)
+            row += 1
 
-        bottom = ctk.CTkFrame(self.lyrics_scroll, fg_color="transparent", height=200)
-        bottom.grid(row=len(self.parsed_lyrics) + 1, column=0, sticky="ew")
+        bottom = ctk.CTkFrame(self.lyrics_scroll, fg_color="transparent",
+                              height=200 if synced else 24)
+        bottom.grid(row=row, column=0, sticky="ew")
         self._lyric_spacers.append(bottom)
 
     def build_dl_view(self, parent):

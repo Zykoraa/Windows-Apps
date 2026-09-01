@@ -129,6 +129,40 @@ class SurfaceWalk:
             closer()
             yield 320
 
+        # The lyrics pane has three shapes and none of them can be reached
+        # without the network, so they are handed straight to the renderer.
+        app.toggle_now_playing_overlay()
+        yield 340
+
+        self.mark("lyrics: timed, with an instrumental gap")
+        app.setup_lyrics(([(0.0, "The first line"), (12.5, "The second line"),
+                           (35.4, ""), (48.0, "After the break")], True))
+        yield 260
+        assert len(app.parsed_lyrics) == 4, "timed lines did not reach the loop"
+        assert len(app.lyrics_labels) == 4, (
+            "labels and timings must stay index-aligned, or the highlight "
+            "lands on the wrong line")
+        app._lyric_style(1, "active")
+        app._lyric_style(2, "active")      # the gap: no pill around nothing
+        app._lyric_style(0, "past")
+        app._scroll_lyric_into_view(3)
+        yield 220
+
+        self.mark("lyrics: words with no timings")
+        app.setup_lyrics(([(None, "Just the words"), (None, ""),
+                           (None, "On three lines")], False))
+        yield 260
+        assert app.parsed_lyrics == [], (
+            "untimed lines must not drive the highlight loop -- it compares "
+            "them against the playhead")
+        assert len(app.lyrics_labels) == 3
+
+        self.mark("lyrics: nothing found")
+        app.setup_lyrics(([], False))
+        yield 220
+        app.toggle_now_playing_overlay()
+        yield 300
+
         self.mark("command palette")
         app.toggle_palette()
         yield 320
