@@ -393,17 +393,28 @@ class SurfaceWalk:
         yield 60
         assert not app._dragging, "the drag never ended"
 
-        # Let go against the left edge and the window takes that half.
+        # Let go against the left edge and the window takes that half --
+        # unless half is narrower than the window is allowed to be, which is
+        # the case on a 1024px CI runner, and there it must decline rather
+        # than wedge itself against its own minimum.
         self.mark("drop the window on the left edge")
         left, top, right, bottom = app._work_area()
         assert right > left and bottom > top, "no usable work area"
+        half = (right - left) // 2
+        was = app.winfo_width()
         app.get_pos(FakeEvent(x=40, y=10, x_root=500, y_root=300))
         yield 60
         app.end_drag(FakeEvent(x=1, y=10, x_root=left, y_root=top + 300))
         yield 200
-        assert app.winfo_width() <= (right - left) // 2 + 4, (
-            "dropping on the left edge did not take half the screen: %dpx of %d"
-            % (app.winfo_width(), right - left))
+        if half >= app.MIN_W:
+            assert app.winfo_width() <= half + 4, (
+                "dropping on the left edge did not take half the screen: "
+                "%dpx of %d" % (app.winfo_width(), right - left))
+        else:
+            assert app.winfo_width() == was, (
+                "snapped to %dpx when half the screen is %dpx and the window "
+                "may not go below %dpx"
+                % (app.winfo_width(), half, app.MIN_W))
         app.geometry(before)
         yield 200
 
