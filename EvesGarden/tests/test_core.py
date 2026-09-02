@@ -7,6 +7,7 @@ every regression this project has had was caught by a human noticing the app
 misbehave rather than by anything automated.
 """
 
+import ast
 import os
 import shutil
 import sys
@@ -1410,6 +1411,82 @@ class VisualiserChoice(unittest.TestCase):
     def test_no_two_modes_share_a_name(self):
         self.assertEqual(len(set(visualizers.names())),
                          len(visualizers.names()))
+
+
+class BlockingWin32Calls(unittest.TestCase):
+    """Nothing reached from a Tk callback may run a Windows modal loop.
+
+    Dragging the title bar used to do the standard trick for moving a
+    frameless window: ReleaseCapture, then SendMessage with
+    WM_NCLBUTTONDOWN/HTCAPTION, which asks Windows to run the move for you
+    and hands you edge snapping for free. It also aborted the interpreter the
+    first time anyone clicked the title bar:
+
+        Fatal Python error: PyEval_RestoreThread: the function must be
+        called with the GIL held, but the GIL is released
+
+    SendMessage does not return until the move is finished. Windows runs a
+    modal loop meanwhile, and that loop dispatches messages straight back
+    into Tk -- while ctypes is still holding the GIL released for the call it
+    has not returned from. The first callback that reaches Python during the
+    drag finds no thread state and the process dies. It is not an exception,
+    so nothing catches it and no log records it.
+
+    No behavioural test can reach this. SendMessage(WM_NCLBUTTONDOWN) returns
+    immediately unless a mouse button is genuinely held down, so a
+    synthesised click runs the same code and proves nothing; only a real
+    hand on a real mouse reproduces it. What can be checked is that the call
+    is not there, which is what this does -- by reading the source rather
+    than importing it, so it needs no display.
+    """
+
+    # Every one of these runs a message loop of its own, and every one of
+    # them is reachable from a binding.
+    FORBIDDEN = ("SendMessageW", "SendMessageA", "SendMessage",
+                 "DoDragDrop", "TrackPopupMenu", "MessageBoxW")
+
+    def _module(self, name):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, name), encoding="utf-8") as handle:
+            return ast.parse(handle.read(), filename=name)
+
+    def _called_names(self, tree):
+        """Attribute and function names actually called, not mentioned.
+
+        Parsed rather than grepped: the fix carries an explanation naming
+        the call it removed, and a test that cannot tell the difference
+        between doing a thing and describing it would fail on its own
+        comment.
+        """
+        found = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            target = node.func
+            if isinstance(target, ast.Attribute):
+                found.add(target.attr)
+            elif isinstance(target, ast.Name):
+                found.add(target.id)
+        return found
+
+    def test_the_window_never_hands_a_drag_to_windows(self):
+        for name in ("gui.py", "ui_widgets.py", "media_keys.py"):
+            called = self._called_names(self._module(name))
+            for blocking in self.FORBIDDEN:
+                self.assertNotIn(
+                    blocking, called,
+                    "%s calls %s. It does not return until Windows has "
+                    "finished with it, and the loop it runs meanwhile "
+                    "dispatches back into Tk with the GIL released -- which "
+                    "kills the process rather than raising." % (name, blocking))
+
+    def test_it_can_tell_a_call_from_a_mention(self):
+        """The guard above is only worth having if it is not fooled."""
+        described = ast.parse('"""We used to call user32.SendMessageW here."""\n'
+                              'x = "SendMessageW"')
+        self.assertNotIn("SendMessageW", self._called_names(described))
+        actually = ast.parse("user32.SendMessageW(h, 1, 2, 3)")
+        self.assertIn("SendMessageW", self._called_names(actually))
 
 
 if __name__ == "__main__":

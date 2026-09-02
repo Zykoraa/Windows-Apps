@@ -68,6 +68,14 @@ def _has_display():
 HAS_DISPLAY = _has_display()
 
 
+class FakeEvent:
+    """Enough of a Tk event for the window-drag handlers."""
+
+    def __init__(self, x=0, y=0, x_root=0, y_root=0):
+        self.x, self.y = x, y
+        self.x_root, self.y_root = x_root, y_root
+
+
 class SurfaceWalk:
     """Drives one App through every screen, collecting anything that broke."""
 
@@ -362,6 +370,42 @@ class SurfaceWalk:
                     "%s is not set, so Windows will not snap this window"
                     % name)
         yield 80
+
+        # Dragging the title bar handed the whole move to Windows for one
+        # release -- ReleaseCapture, then SendMessage(WM_NCLBUTTONDOWN),
+        # which is the usual recipe for edge snapping on a frameless window.
+        # It aborted the interpreter the first time anybody clicked the title
+        # bar: the modal move loop dispatches back into Tk while ctypes still
+        # has the GIL released for the call it has not returned from.
+        #
+        #     Fatal Python error: PyEval_RestoreThread: the function must be
+        #     called with the GIL held, but the GIL is released
+        #
+        # That is not an exception and cannot be caught, so this step passes
+        # by the process still being here afterwards.
+        self.mark("drag the title bar and let go")
+        before = app.geometry()
+        app.get_pos(FakeEvent(x=40, y=10, x_root=500, y_root=300))
+        yield 60
+        app.move_window(FakeEvent(x=40, y=10, x_root=560, y_root=340))
+        yield 60
+        app.end_drag(FakeEvent(x=40, y=10, x_root=560, y_root=340))
+        yield 60
+        assert not app._dragging, "the drag never ended"
+
+        # Let go against the left edge and the window takes that half.
+        self.mark("drop the window on the left edge")
+        left, top, right, bottom = app._work_area()
+        assert right > left and bottom > top, "no usable work area"
+        app.get_pos(FakeEvent(x=40, y=10, x_root=500, y_root=300))
+        yield 60
+        app.end_drag(FakeEvent(x=1, y=10, x_root=left, y_root=top + 300))
+        yield 200
+        assert app.winfo_width() <= (right - left) // 2 + 4, (
+            "dropping on the left edge did not take half the screen: %dpx of %d"
+            % (app.winfo_width(), right - left))
+        app.geometry(before)
+        yield 200
 
         self.mark("transport with nothing loaded")
         app.toggle_play_pause()

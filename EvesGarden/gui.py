@@ -170,7 +170,7 @@ class App(ctk.CTk):
         self.after(10, self.set_appwindow)
         self.title("Spotify Downloader & Player")
         self._restore_geometry()
-        self.minsize(900, 620)
+        self.minsize(self.MIN_W, self.MIN_H)
 
         self.current_theme_name = self.settings.get("theme")
         if self.current_theme_name not in THEMES:
@@ -736,6 +736,7 @@ class App(ctk.CTk):
         self.title_bar.grid(row=0, column=0, sticky="ew")
         self.title_bar.bind("<B1-Motion>", self.move_window)
         self.title_bar.bind("<Button-1>", self.get_pos)
+        self.title_bar.bind("<ButtonRelease-1>", self.end_drag)
         self.title_bar.bind("<Double-Button-1>", self.toggle_maximize)
 
         # No mark or title here any more. A frameless window that redraws
@@ -1048,33 +1049,84 @@ class App(ctk.CTk):
 
         self.load_library()
 
-    def get_pos(self, event):
-        """Hand the drag to Windows, so dragging to an edge snaps.
+    # The smallest the window may be dragged to. Kept as constants because
+    # CustomTkinter's minsize() cannot be called as a getter -- it reads the
+    # arguments it was not given.
+    MIN_W, MIN_H = 900, 620
+    # How close to an edge of the work area counts as aiming at it.
+    SNAP_EDGE = 14
+    SPI_GETWORKAREA = 0x0030
 
-        Moving the window by setting its geometry on every motion event is a
-        drag the shell knows nothing about: no snapping at the edges, no
-        Aero shake, and the window lags the cursor. Telling Windows the
-        title bar was pressed hands it the whole move, and everything that
-        comes with one arrives for free.
+    def get_pos(self, event):
+        """Start a drag.
+
+        This briefly handed the whole move to Windows -- ReleaseCapture, then
+        SendMessage(WM_NCLBUTTONDOWN, HTCAPTION) -- which is the usual way to
+        get edge snapping on a frameless window, and which killed the process
+        every time the title bar was clicked:
+
+            Fatal Python error: PyEval_RestoreThread: the function must be
+            called with the GIL held, but the GIL is released
+
+        SendMessage does not return until the move is over. Windows runs a
+        modal loop for it, and that loop dispatches messages straight back
+        into Tk -- while ctypes is still holding the GIL released for the
+        call it has not returned from. The first callback that reaches Python
+        during the drag finds no thread state and aborts the interpreter. It
+        is not a bug that can be caught; the process is gone.
+
+        So the window is moved here, and the edge snapping the native move
+        was wanted for is done in end_drag by working out where the cursor
+        was let go. Win+Left, Win+Up and tiling managers are unaffected --
+        those come from the window's style bits, not from how it is dragged.
         """
         self.xwin, self.ywin = event.x, event.y
-        hwnd = self._hwnd()
-        if not hwnd:
-            return
-        try:
-            ctypes.windll.user32.ReleaseCapture()
-            ctypes.windll.user32.SendMessageW(
-                hwnd, self.WM_NCLBUTTONDOWN, self.HTCAPTION, 0)
-            self._native_drag = True
-        except Exception:
-            self._native_drag = False
+        self._dragging = True
 
     def move_window(self, event):
-        # Only reached when the native move could not be started; otherwise
-        # Windows has already handled the whole drag.
-        if getattr(self, "_native_drag", False):
+        if not getattr(self, "_dragging", False):
             return
         self.geometry(f'+{event.x_root - self.xwin}+{event.y_root - self.ywin}')
+
+    def end_drag(self, event):
+        """Snap to half the screen when let go against an edge."""
+        if not getattr(self, "_dragging", False):
+            return
+        self._dragging = False
+        left, top, right, bottom = self._work_area()
+        width, height = right - left, bottom - top
+        if width < 2 * self.MIN_W or height < 1:
+            return          # nowhere sensible to snap to
+        x, y = event.x_root, event.y_root
+        if y <= top + self.SNAP_EDGE:
+            box = (width, height, left, top)
+        elif x <= left + self.SNAP_EDGE:
+            box = (width // 2, height, left, top)
+        elif x >= right - self.SNAP_EDGE:
+            box = (width - width // 2, height, left + width // 2, top)
+        else:
+            return
+        self.geometry("%dx%d+%d+%d" % box)
+
+    def _work_area(self):
+        """The desktop minus the taskbar.
+
+        Read rather than assumed: snapping to half the screen height puts the
+        bottom of the window behind the taskbar on every machine that has one
+        anywhere but hidden.
+        """
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        rect = RECT()
+        try:
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    self.SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+                return rect.left, rect.top, rect.right, rect.bottom
+        except Exception:
+            pass
+        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
 
     def toggle_now_playing_overlay(self, event=None):
         if getattr(self, "dl_visible", False):
@@ -2295,7 +2347,6 @@ class App(ctk.CTk):
     WS_EX_APPWINDOW = 0x00040000
     SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER = 0x0001, 0x0002, 0x0004
     SWP_NOACTIVATE, SWP_FRAMECHANGED = 0x0010, 0x0020
-    WM_NCLBUTTONDOWN, HTCAPTION = 0x00A1, 2
 
     def _hwnd(self):
         """The real top-level window, not Tk's frame inside it."""
