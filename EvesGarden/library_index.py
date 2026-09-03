@@ -164,7 +164,9 @@ class LibraryIndex:
             columns = {r[1] for r in self._conn.execute("PRAGMA table_info(tracks)")}
             for column, ddl in (("cover_url", "cover_url TEXT"),
                                 ("liked", "liked INTEGER DEFAULT 0"),
-                                ("liked_at", "liked_at REAL")):
+                                ("liked_at", "liked_at REAL"),
+                                ("lufs", "lufs REAL"),
+                                ("peak", "peak REAL")):
                 if column not in columns:
                     self._conn.execute(f"ALTER TABLE tracks ADD COLUMN {ddl}")
             self._conn.commit()
@@ -258,7 +260,10 @@ class LibraryIndex:
                          album=excluded.album, albumartist=excluded.albumartist,
                          track_no=excluded.track_no, disc_no=excluded.disc_no,
                          year=excluded.year, duration=excluded.duration,
-                         bitrate=excluded.bitrate, has_art=excluded.has_art""",
+                         bitrate=excluded.bitrate, has_art=excluded.has_art,
+                         -- The file changed, so whatever it measured before
+                         -- was measured on something else.
+                         lufs=NULL, peak=NULL""",
                     rows,
                 )
             if removed:
@@ -423,6 +428,31 @@ class LibraryIndex:
                 continue
             table.setdefault(key, []).append((row["path"], row["duration"]))
         return table
+
+    # -------------------------------------------------------- loudness
+
+    def loudness(self, path):
+        """(lufs, peak) measured for this file, or None if never measured.
+
+        Kept here rather than in the engine because it survives restarts:
+        measuring is half a second a track, and doing it again every launch
+        would be half a second before every first play, forever.
+        """
+        rows = self._query(
+            "SELECT lufs, peak FROM tracks WHERE path = ? AND lufs IS NOT NULL",
+            (path,))
+        if not rows:
+            return None
+        return (rows[0]["lufs"], rows[0]["peak"])
+
+    def set_loudness(self, path, lufs, peak):
+        if lufs is None:
+            return
+        with self._lock:
+            self._conn.execute(
+                "UPDATE tracks SET lufs = ?, peak = ? WHERE path = ?",
+                (float(lufs), float(peak or 0.0), path))
+            self._conn.commit()
 
     def forget_outside(self, roots):
         """Drop tracks that no longer sit under any library folder.

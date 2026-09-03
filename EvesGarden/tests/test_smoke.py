@@ -301,6 +301,22 @@ class SurfaceWalk:
         picker.close()
         yield 260
 
+        # The library folder picker, which is the only way in for anybody
+        # who already owns music.
+        self.mark("music folders")
+        folders = self.gui.dialogs.FolderPicker(
+            app, app.theme, [self.gui.LIBRARY_DIR, r"D:\Music\Archive"],
+            fixed=(self.gui.LIBRARY_DIR,))
+        folders.present()
+        yield 300
+        # The download folder cannot be removed; the other one can.
+        folders._remove(r"D:\Music\Archive")
+        yield 120
+        assert folders.roots == [self.gui.LIBRARY_DIR], folders.roots
+        self.mark("close music folders")
+        folders.close()
+        yield 260
+
         # An account with no playlists at all still has to render something.
         self.mark("import picker with nothing on the account")
         empty = self.gui.dialogs.PlaylistPicker(app, app.theme, [])

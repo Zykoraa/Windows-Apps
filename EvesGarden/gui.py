@@ -502,11 +502,36 @@ class App(ctk.CTk):
             ("Playlists", "Your playlists", lambda: self._go_to_view("Playlists")),
             ("Duplicates", "Find and remove duplicate downloads",
              lambda: self._go_to_view("Duplicates")),
+            ("Volume levelling", "Even out loud and quiet tracks",
+             self.toggle_normalise),
             ("Music folders", "Add folders you already keep music in",
              self.choose_library_folders),
             ("Repair library", "Recover unconverted downloads",
              self.run_repair),
         ]
+
+    def _remember_loudness(self, path, lufs, peak):
+        """Called from a worker thread when a track has just been measured."""
+        try:
+            self.index.set_loudness(path, lufs, peak)
+        except Exception as e:
+            print("Could not store loudness for %s: %s" % (path, e))
+
+    def toggle_normalise(self):
+        """Turn loudness matching on or off, for the next track."""
+        self.player.normalise = not self.player.normalise
+        self.settings.set("normalise_loudness", self.player.normalise)
+        if not self.player.normalise:
+            self.player.track_gain = 1.0
+        else:
+            current = self._current_path()
+            if current:
+                self.player.track_gain = self.player._gain_for(
+                    current, self.player.audio_data,
+                    self.player.sample_rate, measure=False)
+        self.library_status.configure(
+            text="Volume levelling %s"
+                 % ("on" if self.player.normalise else "off"))
 
     def _go_to_view(self, name):
         self.set_library_view(name)
@@ -1047,6 +1072,15 @@ class App(ctk.CTk):
         self.library.sort = self.library_sort
         self.library.on_like = self.toggle_like
         self.library.on_menu = self.show_track_menu
+
+        # The engine is the only thing holding a decoded track, so it does
+        # the measuring; the index is the only thing that survives a restart,
+        # so it does the remembering.
+        self.player.loudness_for = self.index.loudness
+        self.player.on_loudness = self._remember_loudness
+        self.player.normalise = bool(self.settings.get("normalise_loudness")
+                                     if self.settings.get("normalise_loudness")
+                                     is not None else True)
 
         self._build_resize_grips()
 

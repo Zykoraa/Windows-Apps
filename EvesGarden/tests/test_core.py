@@ -23,6 +23,7 @@ import colorsys
 import downloader
 import metadata
 import audio_files
+import loudness
 import lyrics
 import smart_playlists
 import visualizers
@@ -1777,6 +1778,203 @@ class ImportSlotsFollowTheFormat(unittest.TestCase):
         paths, missing = spotify_import.plan([self.meta], {}, self.dir)
         self.assertEqual(missing, [])
         self.assertTrue(paths[0].endswith(".m4a"))
+
+
+def _sine(db, rate=48000, secs=4.0, freq=1000.0, channels=2):
+    """A tone at a known level, which is what the standard calibrates on."""
+    import numpy as np
+    amp = 10.0 ** (db / 20.0)
+    t = np.arange(int(rate * secs)) / float(rate)
+    return np.repeat((amp * np.sin(2 * np.pi * freq * t))[:, None],
+                     channels, axis=1)
+
+
+class LoudnessMeasurement(unittest.TestCase):
+    """ITU-R BS.1770, checked against the numbers the standard publishes.
+
+    Worth checking rather than assuming: a plausible-looking filter design
+    read 0.25dB low at every level, which is a kind of wrong that never
+    announces itself -- everything still works, everything is quietly a
+    quarter of a decibel off, forever.
+    """
+
+    # The coefficients BS.1770-4 tabulates for 48kHz.
+    PUBLISHED = (
+        [1.53512485958697, -2.69169618940638, 1.19839281085285],
+        [1.0, -1.69065929318241, 0.73248077421585],
+        [1.0, -2.0, 1.0],
+        [1.0, -1.99004745483398, 0.99007225036621],
+    )
+
+    def test_the_filter_matches_the_published_coefficients(self):
+        import numpy as np
+        (b1, a1), (b2, a2) = loudness._k_weighting(48000)
+        for mine, published in zip((b1, a1, b2, a2), self.PUBLISHED):
+            self.assertLess(float(np.max(np.abs(np.asarray(mine)
+                                                - np.asarray(published)))),
+                            1e-12)
+
+    def test_a_tone_reads_its_own_level(self):
+        """The standard's calibration: 1kHz on both channels reads its dBFS."""
+        for rate in (48000, 44100):
+            for db in (-23.0, -20.0, -14.0):
+                got = loudness.integrated_lufs(_sine(db, rate=rate), rate)
+                self.assertAlmostEqual(got, db, delta=0.1,
+                                       msg="%ddB at %dHz" % (db, rate))
+
+    def test_silence_at_the_end_does_not_drag_it_down(self):
+        """Gating is the whole reason this is not a plain average.
+
+        Without it a track with a long quiet outro measures too quiet, and is
+        then played too loud -- which is the opposite of the point.
+        """
+        import numpy as np
+        tone = _sine(-20.0, secs=4.0)
+        padded = np.concatenate([tone, np.zeros_like(tone)], axis=0)
+        self.assertAlmostEqual(loudness.integrated_lufs(padded, 48000),
+                               -20.0, delta=0.3)
+
+    def test_a_quiet_passage_does_not_drag_it_down_either(self):
+        """The relative gate, which the silence test does not reach.
+
+        A quiet intro is above the absolute gate but well below the body of
+        the track. Averaged in, it makes the track measure quieter than it
+        is, and it is then played louder than everything else -- the exact
+        problem this is here to fix, arriving through the fix itself.
+        """
+        import numpy as np
+        loud = _sine(-14.0, secs=4.0)
+        quiet = _sine(-40.0, secs=4.0)
+        mixed = np.concatenate([quiet, loud], axis=0)
+        self.assertAlmostEqual(loudness.integrated_lufs(mixed, 48000),
+                               -14.0, delta=0.5)
+
+    def test_mono_is_measured_too(self):
+        import numpy as np
+        mono = _sine(-20.0)[:, :1]
+        self.assertIsNotNone(loudness.integrated_lufs(mono, 48000))
+
+    def test_nothing_to_measure_is_not_a_crash(self):
+        import numpy as np
+        self.assertIsNone(loudness.integrated_lufs(None, 48000))
+        self.assertIsNone(loudness.integrated_lufs(np.zeros((10, 2)), 48000))
+        self.assertIsNone(loudness.integrated_lufs(_sine(-20.0), 0))
+        self.assertIsNone(loudness.integrated_lufs(
+            np.zeros((48000 * 2, 2)), 48000))     # digital silence
+
+
+class LoudnessGain(unittest.TestCase):
+
+    def test_a_quiet_track_is_brought_up_and_a_loud_one_down(self):
+        quiet = loudness.gain_for(-24.0, 0.3)
+        loud = loudness.gain_for(-6.0, 0.5)
+        self.assertGreater(quiet, 1.0)
+        self.assertLess(loud, 1.0)
+
+    def test_it_will_not_push_a_track_into_clipping(self):
+        """A track already mastered to full scale cannot be turned up.
+
+        Turning it up anyway and letting it clip would be a worse sound than
+        leaving it a little quiet.
+        """
+        gain = loudness.gain_for(-24.0, 1.0)
+        self.assertLessEqual(gain * 1.0, 1.0)
+
+    def test_a_very_quiet_recording_is_not_lifted_out_of_its_noise(self):
+        self.assertLessEqual(
+            loudness.gain_for(-60.0, 0.01),
+            10.0 ** (loudness.MAX_GAIN_DB / 20.0) + 1e-9)
+
+    def test_no_measurement_means_leave_it_alone(self):
+        self.assertEqual(loudness.gain_for(None, 0.5), 1.0)
+
+    def test_matching_actually_matches(self):
+        """Two tones eight decibels apart end up on the same level."""
+        import numpy as np
+        levels = []
+        for db in (-8.0, -16.0, -22.0):
+            tone = _sine(db)
+            lufs, peak = loudness.measure(tone, 48000)
+            adjusted = np.clip(tone * loudness.gain_for(lufs, peak), -1, 1)
+            levels.append(loudness.integrated_lufs(adjusted, 48000))
+        self.assertLess(max(levels) - min(levels), 0.2)
+        for level in levels:
+            self.assertAlmostEqual(level, loudness.TARGET_LUFS, delta=0.2)
+
+
+class EngineLoudness(unittest.TestCase):
+    """How the engine decides what to apply, without an audio device."""
+
+    def _engine(self):
+        import player_engine
+        cls = next(v for v in vars(player_engine).values()
+                   if isinstance(v, type) and hasattr(v, "_gain_for"))
+        engine = cls.__new__(cls)
+        engine.normalise = True
+        engine.loudness_for = None
+        engine.on_loudness = None
+        return engine
+
+    def _data(self, db=-20.0):
+        import numpy as np
+        return (_sine(db, rate=48000, secs=1.0) * 32767).astype(np.int16)
+
+    def test_it_measures_once_and_reports_what_it_found(self):
+        engine = self._engine()
+        seen = []
+        engine.on_loudness = lambda p, l, k: seen.append((p, l, k))
+        gain = engine._gain_for("a.mp3", self._data(), 48000)
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0][1], -20.0, delta=0.3)
+        self.assertGreater(gain, 1.0)
+
+    def test_a_remembered_measurement_is_not_taken_again(self):
+        engine = self._engine()
+        engine.loudness_for = lambda path: (-8.0, 0.5)
+        engine.on_loudness = lambda *a: self.fail("measured despite the cache")
+        self.assertLess(engine._gain_for("a.mp3", self._data(), 48000), 1.0)
+
+    def test_the_playback_thread_never_measures(self):
+        """The gapless swap runs inside the audio callback.
+
+        Half a second of measurement there is half a second of silence in
+        the middle of a song, so with nothing cached it must decline.
+        """
+        engine = self._engine()
+        engine.on_loudness = lambda *a: self.fail("measured on the audio path")
+        self.assertEqual(
+            engine._gain_for("a.mp3", self._data(), 48000, measure=False), 1.0)
+
+    def test_switching_it_off_leaves_everything_alone(self):
+        engine = self._engine()
+        engine.normalise = False
+        engine.on_loudness = lambda *a: self.fail("measured while switched off")
+        self.assertEqual(engine._gain_for("a.mp3", self._data(), 48000), 1.0)
+
+    def test_the_gain_reaches_the_audio(self):
+        """Everything else here is arithmetic nobody hears unless this does."""
+        import numpy as np
+        engine = self._engine()
+        engine.volume = 1.0
+        engine.track_gain = 0.5
+        chunk = np.full((64, 2), 0.4, dtype=np.float32)
+        self.assertTrue(np.allclose(engine._level(chunk), 0.2, atol=1e-3))
+
+        engine.track_gain = 1.0
+        engine.volume = 0.25
+        self.assertTrue(np.allclose(engine._level(chunk), 0.1, atol=1e-3))
+
+    def test_the_output_is_still_kept_inside_full_scale(self):
+        import numpy as np
+        engine = self._engine()
+        engine.volume = 1.0
+        engine.track_gain = 4.0
+        loud = np.full((64, 2), 0.9, dtype=np.float32)
+        self.assertLessEqual(float(np.max(np.abs(engine._level(loud)))), 1.0)
+
+    def test_nothing_loaded_is_not_a_crash(self):
+        engine = self._engine()
+        self.assertEqual(engine._gain_for("a.mp3", None, 48000), 1.0)
 
 
 if __name__ == "__main__":

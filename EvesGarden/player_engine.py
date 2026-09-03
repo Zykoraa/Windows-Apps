@@ -4,6 +4,8 @@ import threading
 import time
 
 import numpy as np
+
+import loudness
 import pyaudio
 from scipy.signal import lfilter, lfilter_zi
 from pydub import AudioSegment
@@ -71,6 +73,18 @@ class PlayerEngine:
         self.current_frame = 0
         self.chunk_size = 2048
         self.volume = 1.0
+
+        # Loudness matching. A library assembled from many sources is a
+        # library of many masterings, and eight decibels between two tracks
+        # is a playlist you ride the volume knob through.
+        self.normalise = True
+        self.track_gain = 1.0
+        # Set by the app: read a track's measured loudness from the index,
+        # and put one back when it has just been worked out. The engine keeps
+        # no store of its own -- it is the only thing here holding a decoded
+        # track, which is why it does the measuring at all.
+        self.loudness_for = None
+        self.on_loudness = None
         self.last_error = None
 
         self.eq_gains = [1.0] * 10
@@ -246,6 +260,11 @@ class PlayerEngine:
             # A different track was requested while this one decoded.
             if self._preload_path == file_path:
                 self._preloaded = data
+        if data is not None:
+            # Measured here, on a thread with nothing waiting on it, so the
+            # gapless swap has an answer ready and does not have to stop for
+            # half a second in the middle of the audio callback.
+            self._gain_for(file_path, data, rate)
 
     def clear_preload(self):
         with self._preload_lock:
@@ -271,6 +290,50 @@ class PlayerEngine:
             path, data = self._preload_path, self._preloaded
             self._preload_path, self._preloaded = None, None
             return path, data
+
+    def _level(self, chunk):
+        """The last thing that happens to a chunk before it is written out.
+
+        Volume and the track's loudness gain are one multiply, and the soft
+        clip catches whatever the two of them together push past full scale.
+        Its own method so that it can be checked: the loudness work is
+        pointless if the number it produces never reaches the audio.
+        """
+        gain = self.volume * self.track_gain
+        if gain != 1.0:
+            chunk = chunk * gain
+        return _soft_clip(chunk)
+
+    def _gain_for(self, path, data, rate, measure=True):
+        """How much to lift or drop this track, and remember the answer.
+
+        Measuring costs about half a second on a four-minute track, which is
+        nothing beside the decode it follows -- but it must never happen on
+        the playback thread, so the gapless path passes measure=False and
+        settles for whatever has already been worked out.
+        """
+        if not self.normalise or data is None or not len(data):
+            return 1.0
+
+        known = None
+        if self.loudness_for and path:
+            try:
+                known = self.loudness_for(path)
+            except Exception:
+                known = None
+
+        if known is None:
+            if not measure:
+                return 1.0
+            samples = data.astype(np.float32) / 32768.0
+            known = loudness.measure(samples, rate)
+            if self.on_loudness and path:
+                try:
+                    self.on_loudness(path, known[0], known[1])
+                except Exception:
+                    pass
+
+        return loudness.gain_for(known[0], known[1])
 
     def load_track(self, file_path):
         """Decode a file into memory. Safe to call while another load is running."""
@@ -302,6 +365,7 @@ class PlayerEngine:
             self.channels = chans
             self.current_frame = 0
             self._rebuild_filters()
+        self.track_gain = self._gain_for(file_path, data, rate)
         return True
 
     def load_stream(self, url, duration=0.0, title=None, ffmpeg=None):
@@ -469,9 +533,7 @@ class PlayerEngine:
                 chunk = self.apply_eq(chunk)
                 self.compute_visualizer(chunk)
 
-                if self.volume != 1.0:
-                    chunk = chunk * self.volume
-                chunk = _soft_clip(chunk)
+                chunk = self._level(chunk)
 
                 stream.write(np.ascontiguousarray(chunk, dtype=np.float32).tobytes())
 
@@ -573,6 +635,10 @@ class PlayerEngine:
             self.current_frame = 0
         # A new track should not inherit the filter tails of the last one.
         self.reset_filters()
+        # Cached only: this runs on the playback thread, and measuring here
+        # would be half a second of silence in the middle of a song.
+        self.track_gain = self._gain_for(path, data, self.sample_rate,
+                                         measure=False)
 
         if self.on_track_advanced_callback:
             try:
