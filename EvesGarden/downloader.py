@@ -371,6 +371,109 @@ def _score_candidate(entry, target_ms, metadata):
     return score
 
 
+# Hosts whose links mean "look this up on Spotify, then find the audio
+# elsewhere". Everything else that looks like a link is fetched from where it
+# points, which is the only way to get audio Spotify does not have -- and the
+# only way to get lossless, since YouTube has never served any.
+SPOTIFY_MARKERS = ("open.spotify.com", "//spotify.com", "spotify:")
+
+LOSSLESS_CODECS = ("flac", "alac", "wav", "pcm", "aiff", "ape", "wavpack")
+
+
+def is_media_url(text):
+    """A link to audio somewhere that is not Spotify."""
+    lowered = (text or "").strip().lower()
+    if not lowered.startswith(("http://", "https://")):
+        return False
+    return not any(marker in lowered for marker in SPOTIFY_MARKERS)
+
+
+def describe_format(entry):
+    """What a download will actually be, in words.
+
+    Bitrate is the thing worth knowing and the thing never shown. A track
+    from YouTube is Opus at around 160kbps because that is all YouTube has;
+    the same track from Bandcamp is FLAC. Until this said so, both arrived
+    looking identical.
+    """
+    if not entry:
+        return ""
+    codec = (entry.get("acodec") or entry.get("ext") or "").split(".")[0]
+    if codec.lower() in ("none", ""):
+        codec = entry.get("ext") or ""
+    if codec.lower() in LOSSLESS_CODECS:
+        return "%s, lossless" % codec.upper()
+    rate = entry.get("abr") or entry.get("tbr")
+    if rate:
+        return "%s %d kbps" % (codec or "audio", round(rate))
+    return codec or ""
+
+
+def as_source_metadata(entry, fallback_album=None):
+    """One yt-dlp result as the metadata dict the rest of this expects."""
+    if not entry:
+        return None
+    name = entry.get("track") or entry.get("title")
+    source = (entry.get("webpage_url") or entry.get("original_url")
+              or entry.get("url"))
+    if not name or not source:
+        return None
+    # Kept whole rather than split on commas: Bandcamp and the Archive give a
+    # clean artist string, and guessing at collaborators in it only invents
+    # names that were never there.
+    artist = (entry.get("artist") or entry.get("creator")
+              or entry.get("uploader") or entry.get("channel") or "Unknown")
+    return {
+        "name": name,
+        "artists": [artist],
+        "album": entry.get("album") or fallback_album or "",
+        "album_artist": entry.get("album_artist") or artist,
+        "cover_url": entry.get("thumbnail"),
+        "track_number": entry.get("track_number"),
+        "disc_number": entry.get("disc_number"),
+        "release_date": (str(entry.get("release_year") or "")[:4]
+                         or (entry.get("upload_date") or "")[:4] or None),
+        "duration_ms": int((entry.get("duration") or 0) * 1000) or None,
+        # The whole point: download from here rather than going looking for
+        # something that sounds like it.
+        "source_url": source,
+        "source_format": describe_format(entry),
+    }
+
+
+def probe_source(url, log_callback=print, limit=200):
+    """What is at this link, as tracks ready to download.
+
+    One link may be one track or a whole album, so this always answers with a
+    list. Nothing is downloaded: the formats are resolved so the caller can
+    say what the audio will be before committing to fetching it.
+    """
+    opts = dict(_base_ydl_opts(), skip_download=True, format="bestaudio/best")
+    # A pasted album link means the album, unlike a YouTube link that happens
+    # to sit in somebody's playlist.
+    opts["noplaylist"] = False
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        raise DownloadError(str(e).replace("\n", " ").strip()[:300]
+                            or type(e).__name__) from e
+    if not info:
+        return []
+
+    entries = info.get("entries")
+    if entries is None:
+        entries = [info]
+    album = info.get("album") or (info.get("title") if info.get("entries")
+                                  else None)
+    out = []
+    for entry in list(entries)[:limit]:
+        meta = as_source_metadata(entry, fallback_album=album)
+        if meta:
+            out.append(meta)
+    return out
+
+
 def _base_ydl_opts():
     return {
         "quiet": True,
@@ -602,7 +705,11 @@ def process_track(sp, track, output_dir, log_callback=print,
 
     try:
         log_callback(f"  > {label}")
-        source = pick_youtube_source(metadata, log_callback=log_callback)
+        # A track that came from a pasted link knows where it lives. Only a
+        # Spotify lookup, which has metadata but no audio, has to go and find
+        # something that sounds like it.
+        source = (metadata.get("source_url")
+                  or pick_youtube_source(metadata, log_callback=log_callback))
         path = download_audio(
             source, output_path_base, log_callback=log_callback, quality=quality
         )

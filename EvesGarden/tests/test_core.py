@@ -1583,6 +1583,20 @@ class Formats(unittest.TestCase):
         self.assertAlmostEqual(audio_files.read_tags(path)["duration"], 1.0,
                                delta=0.2)
 
+    def test_each_format_describes_itself(self):
+        """Shown in the queue and while playing, so it has to be right."""
+        expected = {"flac": "FLAC 16/", "m4a": "AAC ", "opus": "Opus ",
+                    "ogg": "Vorbis ", "mp3": "MP3 "}
+        for ext, prefix in expected.items():
+            said = audio_files.describe(os.path.join(self.dir,
+                                                     "sample." + ext))
+            self.assertTrue(said.startswith(prefix),
+                            "%s described as %r" % (ext, said))
+        self.assertIn("kHz", audio_files.describe(
+            os.path.join(self.dir, "sample.flac")))
+        self.assertIn("kbps", audio_files.describe(
+            os.path.join(self.dir, "sample.mp3")))
+
     def test_a_lossless_file_reports_a_bitrate(self):
         """FLAC has no bitrate field; without one it sorts as though free."""
         path = os.path.join(self.dir, "sample.flac")
@@ -1975,6 +1989,133 @@ class EngineLoudness(unittest.TestCase):
     def test_nothing_loaded_is_not_a_crash(self):
         engine = self._engine()
         self.assertEqual(engine._gain_for("a.mp3", None, 48000), 1.0)
+
+
+class PastedLinks(unittest.TestCase):
+    """A link to audio is not a search term.
+
+    Everything that was not a Spotify link went to Spotify as a search
+    string, so pasting a Bandcamp album searched Spotify for the URL and
+    found nothing. It is also the only route to lossless: YouTube has never
+    served any, so a track sourced through it is capped around 170kbps
+    however it is asked for.
+    """
+
+    def test_it_knows_a_link_from_a_search(self):
+        for link in ("https://artist.bandcamp.com/album/x",
+                     "https://archive.org/details/y",
+                     "https://soundcloud.com/a/b",
+                     "http://example.com/track.flac"):
+            self.assertTrue(downloader.is_media_url(link), link)
+        for other in ("https://open.spotify.com/track/x",
+                      "https://spotify.com/album/y",
+                      "spotify:track:x",
+                      "the national bloodbuzz ohio", "", None):
+            self.assertFalse(downloader.is_media_url(other), repr(other))
+
+    def test_lossless_is_named_as_such(self):
+        self.assertEqual(
+            downloader.describe_format({"acodec": "flac", "ext": "flac"}),
+            "FLAC, lossless")
+        self.assertEqual(
+            downloader.describe_format({"acodec": "alac", "abr": 900}),
+            "ALAC, lossless")
+
+    def test_a_lossy_format_is_named_with_its_bitrate(self):
+        """The number worth knowing, and the one never shown."""
+        self.assertEqual(
+            downloader.describe_format({"acodec": "opus", "abr": 170.6}),
+            "opus 171 kbps")
+        self.assertEqual(
+            downloader.describe_format({"ext": "m4a", "acodec": "none",
+                                        "tbr": 128}),
+            "m4a 128 kbps")
+        self.assertEqual(downloader.describe_format({}), "")
+        self.assertEqual(downloader.describe_format(None), "")
+
+    def test_a_result_becomes_something_downloadable(self):
+        meta = downloader.as_source_metadata({
+            "track": "Turning", "artist": "Grateful Dead",
+            "album": "Barton Hall", "thumbnail": "http://art/x.jpg",
+            "duration": 40.5, "track_number": 3, "release_year": 1977,
+            "webpage_url": "https://archive.org/x", "acodec": "flac",
+        })
+        self.assertEqual(meta["name"], "Turning")
+        self.assertEqual(meta["artists"], ["Grateful Dead"])
+        self.assertEqual(meta["source_url"], "https://archive.org/x")
+        self.assertEqual(meta["source_format"], "FLAC, lossless")
+        self.assertEqual(meta["duration_ms"], 40500)
+        self.assertEqual(meta["release_date"], "1977")
+
+    def test_an_artist_credit_is_kept_whole(self):
+        """Splitting it on commas invents names that were never there."""
+        meta = downloader.as_source_metadata(
+            {"title": "X", "uploader": "Simon, Garfunkel & Friends",
+             "webpage_url": "https://e.com/x"})
+        self.assertEqual(meta["artists"], ["Simon, Garfunkel & Friends"])
+
+    def test_something_with_no_audio_behind_it_is_skipped(self):
+        self.assertIsNone(downloader.as_source_metadata(None))
+        self.assertIsNone(downloader.as_source_metadata({"title": "no url"}))
+        self.assertIsNone(downloader.as_source_metadata(
+            {"webpage_url": "https://e.com/x"}))       # no title
+
+    def test_an_album_falls_back_to_its_own_title(self):
+        meta = downloader.as_source_metadata(
+            {"title": "Track One", "webpage_url": "https://e.com/1"},
+            fallback_album="The Album")
+        self.assertEqual(meta["album"], "The Album")
+
+
+class DownloadsGoWhereTheLinkPoints(unittest.TestCase):
+    """A track that came from a link must not be looked for somewhere else.
+
+    Searching YouTube for it would find something that sounds like it, at
+    YouTube's quality -- which throws away both the exact recording and the
+    only reason to have pasted the link.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="eg-src-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.searched = []
+        self.fetched = []
+
+        def no_search(metadata, log_callback=print, num_results=5):
+            self.searched.append(metadata)
+            return "https://youtube.example/found"
+
+        def fake_download(source_url, base, log_callback=print,
+                          quality="original"):
+            self.fetched.append(source_url)
+            path = base + ".flac"
+            open(path, "wb").close()
+            return path
+
+        for name, stub in (("pick_youtube_source", no_search),
+                           ("download_audio", fake_download),
+                           ("apply_metadata", lambda *a, **k: True)):
+            original = getattr(downloader, name)
+            self.addCleanup(setattr, downloader, name, original)
+            setattr(downloader, name, stub)
+
+    def test_a_link_is_fetched_directly(self):
+        meta = {"name": "Turning", "artists": ["Grateful Dead"],
+                "album": "Barton Hall",
+                "source_url": "https://archive.org/x"}
+        result = downloader.process_track(None, meta, self.dir,
+                                          log_callback=lambda m: None)
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.fetched, ["https://archive.org/x"])
+        self.assertEqual(self.searched, [],
+                         "went looking for a track it had the address of")
+
+    def test_a_spotify_lookup_still_has_to_go_and_find_the_audio(self):
+        meta = {"name": "Gravity", "artists": ["John Mayer"], "album": "X"}
+        downloader.process_track(None, meta, self.dir,
+                                 log_callback=lambda m: None)
+        self.assertEqual(self.fetched, ["https://youtube.example/found"])
+        self.assertEqual(len(self.searched), 1)
 
 
 if __name__ == "__main__":

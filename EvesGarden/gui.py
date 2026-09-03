@@ -278,6 +278,10 @@ class App(ctk.CTk):
         # (playlist_id, ordered paths) for imports whose downloads
         # have not finished yet.
         self._pending_imports = []
+        # path -> "Opus 141 kbps". Reading a header is cheap, but a queue
+        # repaints on every state change and there is no sense doing it again
+        # for a file that has not moved.
+        self._format_cache = {}
         # Re-entrancy guard for the masthead's own measuring pass, and the
         # pending timer that coalesces a burst of them into one.
         self._brand_busy = False
@@ -1976,12 +1980,38 @@ class App(ctk.CTk):
             icon.configure(text=glyph, text_color=self.theme[colour])
             label.configure(text=job.label, text_color=self.theme[
                 "text" if job.state in (RUNNING, DONE) else "text_secondary"])
-            note.configure(
-                text=(job.error or "")[:60] if job.state == FAILED else
-                     ("already have it" if job.state == SKIPPED else ""),
-                text_color=self.theme["text_secondary"])
+            note.configure(text=self._job_note(job),
+                           text_color=self.theme["text_secondary"])
         except Exception:
             pass
+
+    def _quality_of(self, path):
+        """What this file is, remembered so a repaint does not re-read it."""
+        if not path:
+            return ""
+        known = self._format_cache.get(path)
+        if known is None:
+            known = audio_files.describe(path)
+            self._format_cache[path] = known
+        return known
+
+    def _job_note(self, job):
+        """What to say beside a finished job: what actually arrived.
+
+        A download used to end in a tick and nothing else, so whether it had
+        fetched 128kbps AAC or a lossless FLAC was invisible -- and now that
+        the transcoding is gone, that is the difference between one source
+        and another rather than a detail.
+        """
+        if job.state == FAILED:
+            return (job.error or "")[:60]
+        if job.state in (DONE, SKIPPED) and job.path:
+            quality = self._quality_of(job.path)
+            if job.state == SKIPPED:
+                return ("already have it  %s" % quality if quality
+                        else "already have it")
+            return quality
+        return ""
 
     def _dl_alive(self):
         """Whether the downloader panel exists and can be written to."""
@@ -3532,6 +3562,9 @@ class App(ctk.CTk):
             bits.append(str(row["year"]))
         if (row or {}).get("duration"):
             bits.append(fmt_time(row["duration"]))
+        quality = self._quality_of(path)
+        if quality:
+            bits.append(quality)
         self._np_set_track(display, artist, "  \u00b7  ".join(bits))
 
         self.extract_album_art(path)
@@ -3912,7 +3945,16 @@ class App(ctk.CTk):
         self.log_box.configure(state="disabled")
 
     def _on_discover_key(self, event=None):
-        """Debounce typing, then search Spotify."""
+        """Debounce typing, then search Spotify.
+
+        A link is not a search term: pasting one used to send the whole URL
+        to the catalogue and get back nothing, slowly.
+        """
+        if downloader.is_media_url(self.url_entry.get().strip()):
+            self._render_discover_message(
+                "That link will be fetched from where it points. "
+                "Press Start download.")
+            return
         if self._discover_timer:
             try:
                 self.after_cancel(self._discover_timer)
@@ -4374,7 +4416,9 @@ class App(ctk.CTk):
         if not url:
             self.log("Please enter a URL.")
             return
-        if not self.sp:
+        # A link to audio needs nothing looked up: it says where the audio
+        # is. Only a search, or a Spotify link, needs the Spotify client.
+        if not self.sp and not downloader.is_media_url(url):
             self.log(self.spotify_error or "Spotify is not configured.")
             return
         if self.downloads.running:
@@ -4390,6 +4434,9 @@ class App(ctk.CTk):
                          args=(url, LIBRARY_DIR), daemon=True).start()
 
     def download_thread(self, url, out_dir):
+        if downloader.is_media_url(url):
+            self._download_from_link(url)
+            return
         try:
             if is_liked_songs(url):
                 # "Liked Songs" has no playlist id -- its URL is
@@ -4424,6 +4471,47 @@ class App(ctk.CTk):
             return
 
         self._safe_after(0, self._start_batch, track_urls)
+
+    def _download_from_link(self, url):
+        """Fetch what is at a link, rather than looking for it on Spotify.
+
+        This is the only way to get audio Spotify does not have, and the only
+        way to get lossless: YouTube has never served any, so a track sourced
+        through it is capped at about 170kbps whatever is asked for.
+        Bandcamp and the Internet Archive have FLAC.
+        """
+        self._gui_log("Reading %s ..." % url)
+        try:
+            tracks = downloader.probe_source(url, log_callback=self._gui_log)
+        except Exception as e:
+            self._gui_log("Could not read that link: %s" % e)
+            return
+        if not tracks:
+            self._gui_log("No audio found at that link.")
+            return
+
+        formats = {t.get("source_format") or "unknown" for t in tracks}
+        self._gui_log("Found %d track%s -- %s"
+                      % (len(tracks), "" if len(tracks) == 1 else "s",
+                         ", ".join(sorted(formats))))
+        for track in tracks[:5]:
+            self._gui_log("   %s - %s   (%s)"
+                          % (", ".join(track["artists"]), track["name"],
+                             track.get("source_format") or "?"))
+        if len(tracks) > 5:
+            self._gui_log("   ... and %d more" % (len(tracks) - 5))
+
+        keys, labels, meta = [], {}, {}
+        for track in tracks:
+            key = track["source_url"]
+            if key in meta:
+                continue
+            keys.append(key)
+            meta[key] = track
+            labels[key] = "%s - %s" % (", ".join(track["artists"]),
+                                       track["name"])
+        self._safe_after(0, self._start_batch, keys, labels, meta)
+
 
 if __name__ == "__main__":
     app = App()

@@ -161,6 +161,49 @@ def cover_bytes(path):
     return None
 
 
+# What mutagen calls the file, and what a person calls the format.
+_CODEC_NAMES = {
+    "MP3": "MP3", "FLAC": "FLAC", "MP4": "AAC", "OggOpus": "Opus",
+    "OggVorbis": "Vorbis", "WAVE": "WAV", "AIFF": "AIFF", "ASF": "WMA",
+    "AAC": "AAC", "MonkeysAudio": "APE", "WavPack": "WavPack",
+    "TrueAudio": "TTA", "OggFLAC": "FLAC",
+}
+LOSSLESS = ("FLAC", "WAV", "AIFF", "APE", "WavPack", "TTA", "ALAC")
+
+
+def describe(path):
+    """Codec and bitrate in words -- "Opus 141 kbps", "FLAC 16/44.1 kHz".
+
+    The one thing worth knowing about an audio file and the one thing never
+    shown. A track from YouTube and the same track from Bandcamp look
+    identical in a library until something says which is which.
+
+    Header only: no artwork is decoded, so this is cheap enough to call
+    while painting a row.
+    """
+    try:
+        audio = mutagen.File(path)
+    except Exception:
+        return ""
+    if audio is None:
+        return ""
+
+    info = getattr(audio, "info", None)
+    name = _CODEC_NAMES.get(type(audio).__name__, type(audio).__name__)
+    if name == "AAC" and "alac" in str(getattr(info, "codec", "")).lower():
+        name = "ALAC"
+
+    if name in LOSSLESS:
+        depth = getattr(info, "bits_per_sample", None)
+        rate = getattr(info, "sample_rate", None)
+        if depth and rate:
+            return "%s %d/%.1f kHz" % (name, depth, rate / 1000.0)
+        return name
+
+    bitrate = getattr(info, "bitrate", 0) or 0
+    return "%s %d kbps" % (name, round(bitrate / 1000.0)) if bitrate else name
+
+
 def has_art(path):
     return cover_bytes(path) is not None
 
