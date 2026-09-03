@@ -14,6 +14,7 @@ recording in a playlist -- is testable without an account.
 
 import os
 
+import audio_files
 import library_index
 
 # Liked Songs is not a playlist. It lives behind /me/tracks and has no id, so
@@ -224,12 +225,36 @@ def predicted_path(meta, library_dir):
 
     The filename is derived from the metadata, not discovered afterwards, so
     a playlist slot can be reserved before the download starts and filled in
-    without having to match the file all over again.
+    without having to match the file all over again. Only the extension is a
+    guess: a download keeps whatever the source was, so it may land as .opus
+    or .m4a instead. resolve() is what turns this back into the real file.
     """
+    return _stem(meta, library_dir) + audio_files.EXTENSIONS[0]
+
+
+def _stem(meta, library_dir):
     import downloader
     label = "%s - %s" % (", ".join(meta["artists"]), meta["name"])
-    return os.path.join(library_dir,
-                        downloader.sanitize_filename(label) + ".mp3")
+    return os.path.join(library_dir, downloader.sanitize_filename(label))
+
+
+def resolve(path):
+    """The file actually on disk for a reserved slot, or None.
+
+    A slot is reserved under the name the download will have, but not under
+    the extension: that is whatever the source turned out to be. So the
+    reservation is really a stem, and this is what reads it back.
+    """
+    if not path:
+        return None
+    if os.path.exists(path):
+        return path
+    stem = os.path.splitext(path)[0]
+    for ext in audio_files.EXTENSIONS:
+        candidate = stem + ext
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 def plan(tracks, owned, library_dir):
@@ -247,11 +272,15 @@ def plan(tracks, owned, library_dir):
         if path is None:
             path = predicted_path(meta, library_dir)
             # The file can be on disk and still not match: its tags may
-            # disagree with its name, or the index may not have caught up.
-            # Queueing it would download nothing -- process_track skips what
-            # already exists -- but it would tell the user a download was
-            # needed, and the count is the only thing they can see.
-            if path not in seen and not os.path.exists(path):
+            # disagree with its name, the index may not have caught up, or it
+            # may be sitting under a different extension than the one guessed
+            # above. Queueing it would download nothing -- process_track
+            # skips what already exists -- but it would tell the user a
+            # download was needed, and the count is the only thing they see.
+            found = resolve(path)
+            if found:
+                path = found
+            elif path not in seen:
                 missing.append(meta)
         # A playlist can list the same song twice; a playlist here cannot
         # hold it twice, so the repeat is dropped rather than shifting every

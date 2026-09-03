@@ -22,8 +22,8 @@ import ui_widgets
 HEART_FULL = "♥"
 HEART_EMPTY = "♡"
 from PIL import Image
-from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, APIC
+
+import audio_files
 
 # Rows rendered per turn of the event loop. This is the click latency of a
 # view switch: the first chunk is built before anything is drawn, and a track
@@ -274,7 +274,10 @@ class LibraryView:
                                 "Liked": "No liked songs yet. Tap the heart on any track.",
                                 "Recent": "Nothing played yet.",
                                 "Playlists": "No playlists yet. Use New playlist to make one."}.get(self.view)
-                               or "Nothing here yet. Use Add music to get started."),
+                               or "Nothing here yet. Use Add music to "
+                                  "get started, or Ctrl+K \u2192 Music "
+                                  "folders to point it at music you already "
+                                  "have."),
                          text_color=self.theme["text_secondary"],
                          font=ctk.CTkFont(size=15)).pack(pady=40)
             self._set_status(f"{self.index.count()} tracks indexed")
@@ -678,9 +681,7 @@ class LibraryView:
 
         def work():
             try:
-                audio = MP3(path, ID3=ID3)
-                data = next((t.data for t in (audio.tags or {}).values()
-                             if isinstance(t, APIC)), None)
+                data = audio_files.cover_bytes(path)
                 if not data:
                     return
                 img = Image.open(io.BytesIO(data)).convert("RGB").resize(
@@ -743,9 +744,7 @@ class LibraryView:
         def work():
             colour = None
             try:
-                audio = MP3(cover_path, ID3=ID3)
-                data = next((t.data for t in (audio.tags or {}).values()
-                             if isinstance(t, APIC)), None)
+                data = audio_files.cover_bytes(cover_path)
                 if data:
                     colour = ui_widgets.dominant_colour(
                         Image.open(io.BytesIO(data)).convert("RGB"))

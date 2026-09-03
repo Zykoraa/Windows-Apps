@@ -22,6 +22,7 @@ from play_queue import PlayQueue
 import colorsys
 import downloader
 import metadata
+import audio_files
 import lyrics
 import smart_playlists
 import visualizers
@@ -236,9 +237,24 @@ class OrphanedDownloads(unittest.TestCase):
         path = self.write("Artist - Title.webm")
         self.assertEqual(downloader.find_orphaned_downloads(self.dir), [path])
 
-    def test_finds_m4a_orphan(self):
-        path = self.write("Artist - Title.m4a", head=M4A_HEAD)
+    def test_finds_an_extensionless_stream(self):
+        # yt-dlp writing the raw stream with no extension at all is the other
+        # shape a failed postprocess leaves behind.
+        path = self.write("Artist - Title")
         self.assertEqual(downloader.find_orphaned_downloads(self.dir), [path])
+
+    def test_a_kept_source_format_is_not_an_orphan(self):
+        """The downloader keeps .m4a and .opus now instead of transcoding.
+
+        A .m4a used to count as an orphan because nothing could play it: the
+        library globbed *.mp3 and ignored everything else. It is a library
+        file now, and repair converting it back to MP3 would undo the whole
+        point of keeping it -- quietly, and to every track downloaded.
+        """
+        self.write("Artist - Title.m4a", head=M4A_HEAD)
+        self.write("Artist - Other.opus", head=b"OggS" + bytes([0, 2]))
+        self.write("Artist - Third.flac", head=b"fLaC")
+        self.assertEqual(downloader.find_orphaned_downloads(self.dir), [])
 
     def test_skips_partials(self):
         for name in ("Artist - Title.webm.part",
@@ -1487,6 +1503,280 @@ class BlockingWin32Calls(unittest.TestCase):
         self.assertNotIn("SendMessageW", self._called_names(described))
         actually = ast.parse("user32.SendMessageW(h, 1, 2, 3)")
         self.assertIn("SendMessageW", self._called_names(actually))
+
+
+def _ffmpeg():
+    """The bundled ffmpeg, if this machine has it. CI does not."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "bin", "ffmpeg.exe")
+    return path if os.path.exists(path) else None
+
+
+class Formats(unittest.TestCase):
+    """The library indexed .mp3 and nothing else, and wrote only ID3.
+
+    Anyone arriving with a collection already on disk -- which is most people
+    who want a local music player -- could not see a note of it.
+    """
+
+    META = {"name": "A Title", "artists": ["An Artist", "Another"],
+            "album": "An Album", "album_artist": "An Artist",
+            "track_number": 4, "disc_number": 1, "release_date": "2011"}
+    # A real, if tiny, JPEG.
+    COVER = bytes.fromhex(
+        "ffd8ffe000104a46494600010100000100010000ffdb004300ffffffffffffff"
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc200"
+        "0b080001000101011100ffc40014000100000000000000000000000000000009"
+        "ffda0008010100013f10")
+    CODECS = (("flac", "flac"), ("m4a", "aac"), ("opus", "libopus"),
+              ("ogg", "libvorbis"), ("mp3", "libmp3lame"))
+    # WAV carries no tags through this interface, which is worth saying out
+    # loud rather than reporting a success that wrote nothing.
+    UNTAGGABLE = (("wav", "pcm_s16le"),)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ffmpeg = _ffmpeg()
+        if not cls.ffmpeg:
+            return
+        import subprocess
+        cls.dir = tempfile.mkdtemp(prefix="eg-fmt-")
+        # One second of a tone is enough to be a real file of each kind.
+        for ext, codec in cls.CODECS + cls.UNTAGGABLE:
+            subprocess.run(
+                [cls.ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i",
+                 "sine=frequency=440:duration=1", "-c:a", codec,
+                 os.path.join(cls.dir, "sample." + ext)],
+                check=True, capture_output=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "ffmpeg", None):
+            shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def setUp(self):
+        if not self.ffmpeg:
+            self.skipTest("no bundled ffmpeg to make sample files with")
+
+    def test_every_format_round_trips_tags_and_art(self):
+        for ext, _codec in self.CODECS:
+            path = os.path.join(self.dir, "sample." + ext)
+            self.assertTrue(audio_files.write_tags(path, self.META,
+                                                   cover=self.COVER), ext)
+            tags = audio_files.read_tags(path)
+            self.assertEqual(tags["title"], "A Title", ext)
+            self.assertEqual(tags["artist"], "An Artist, Another", ext)
+            self.assertEqual(tags["album"], "An Album", ext)
+            self.assertEqual(tags["track_no"], 4, ext)
+            self.assertEqual(tags["year"], "2011", ext)
+            self.assertEqual(audio_files.cover_bytes(path), self.COVER, ext)
+            self.assertTrue(tags["has_art"], ext)
+            self.assertAlmostEqual(tags["duration"], 1.0, delta=0.2)
+
+    def test_a_format_that_cannot_be_tagged_says_so(self):
+        path = os.path.join(self.dir, "sample.wav")
+        self.assertFalse(audio_files.write_tags(path, self.META))
+        # And it is still indexable, by its filename.
+        self.assertTrue(audio_files.is_audio(path))
+        self.assertAlmostEqual(audio_files.read_tags(path)["duration"], 1.0,
+                               delta=0.2)
+
+    def test_a_lossless_file_reports_a_bitrate(self):
+        """FLAC has no bitrate field; without one it sorts as though free."""
+        path = os.path.join(self.dir, "sample.flac")
+        self.assertGreater(audio_files.read_tags(path)["bitrate"] or 0, 0)
+
+
+class FormatsWithoutFfmpeg(unittest.TestCase):
+    """The parts that need no real audio to check."""
+
+    def test_it_knows_what_it_will_index(self):
+        for name in ("a.mp3", "A.FLAC", "b.m4a", "c.opus", "d.Ogg", "e.wav"):
+            self.assertTrue(audio_files.is_audio(name), name)
+        for name in ("cover.jpg", "notes.txt", "stream.webm", "a.mp3.part"):
+            self.assertFalse(audio_files.is_audio(name), name)
+
+    def test_an_untagged_file_still_reads_as_its_filename(self):
+        directory = tempfile.mkdtemp(prefix="eg-untagged-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, "Some Artist - Some Song.mp3")
+        with open(path, "wb") as handle:
+            handle.write(b"not really an mp3")
+        tags = audio_files.read_tags(path)
+        self.assertEqual(tags["artist"], "Some Artist")
+        self.assertEqual(tags["title"], "Some Song")
+        self.assertEqual(tags["has_art"], 0)
+
+
+class LibraryFolders(unittest.TestCase):
+    """One flat folder was the only thing the index understood."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="eg-roots-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.ix = LibraryIndex(os.path.join(self.home, "t.db"))
+        self.addCleanup(self.ix.close)
+
+    def _make(self, *parts):
+        path = os.path.join(self.home, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"x" * 32)
+        return path
+
+    def test_it_walks_into_subfolders(self):
+        """A collection anyone has kept is in Artist/Album folders."""
+        self._make("music", "Artist", "Album", "One - Song.mp3")
+        self._make("music", "Artist", "Album", "Two - Song.flac")
+        self._make("music", "loose.opus")
+        added, _updated, _removed = self.ix.scan(
+            [os.path.join(self.home, "music")])
+        self.assertEqual(added, 3)
+
+    def test_it_indexes_more_than_one_folder(self):
+        self._make("a", "one.mp3")
+        self._make("b", "two.flac")
+        added, _u, _r = self.ix.scan([os.path.join(self.home, "a"),
+                                      os.path.join(self.home, "b")])
+        self.assertEqual(added, 2)
+
+    def test_it_ignores_things_that_are_not_music(self):
+        self._make("music", "song.mp3")
+        self._make("music", "cover.jpg")
+        self._make("music", "notes.txt")
+        self._make("music", "node_modules", "pkg", "buried.mp3")
+        added, _u, _r = self.ix.scan([os.path.join(self.home, "music")])
+        self.assertEqual(added, 1)
+
+    def test_an_unplugged_drive_does_not_empty_the_library(self):
+        """Only files missing from a folder actually looked at are forgotten.
+
+        Otherwise scanning with an external drive disconnected would delete
+        every track on it, including its play counts and its place in every
+        playlist.
+        """
+        self._make("a", "one.mp3")
+        self._make("b", "two.mp3")
+        roots = [os.path.join(self.home, "a"), os.path.join(self.home, "b")]
+        self.ix.scan(roots)
+        self.assertEqual(self.ix.count(), 2)
+
+        _a, _u, removed = self.ix.scan([roots[0]])       # b is "unplugged"
+        self.assertEqual(removed, 0)
+        self.assertEqual(self.ix.count(), 2)
+
+    def test_removing_a_folder_forgets_its_tracks(self):
+        """The other side of that: what is removed has to actually go."""
+        self._make("a", "one.mp3")
+        self._make("b", "two.mp3")
+        roots = [os.path.join(self.home, "a"), os.path.join(self.home, "b")]
+        self.ix.scan(roots)
+        self.assertEqual(self.ix.forget_outside([roots[0]]), 1)
+        self.assertEqual(self.ix.count(), 1)
+
+    def test_a_deleted_file_is_still_forgotten(self):
+        path = self._make("a", "one.mp3")
+        root = os.path.join(self.home, "a")
+        self.ix.scan([root])
+        os.remove(path)
+        _a, _u, removed = self.ix.scan([root])
+        self.assertEqual(removed, 1)
+        self.assertEqual(self.ix.count(), 0)
+
+
+class KeepingTheSourceFormat(unittest.TestCase):
+    """Every download was re-encoded to MP3 at 192kbps.
+
+    YouTube serves Opus at around 160, so that was a lossy source decoded
+    and encoded again into a lossy target -- a copy strictly worse than what
+    it was made from, and worse than what Spotify streams.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="eg-keep-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def _touch(self, name):
+        path = os.path.join(self.dir, name)
+        open(path, "wb").close()
+        return path
+
+    def test_the_default_download_is_never_re_encoded(self):
+        """The whole of the change, in the one place it is decided.
+
+        Nothing else can check this: it takes a real download to see, and by
+        then every track fetched has already been made worse.
+        """
+        post = downloader.audio_postprocessor("original")
+        self.assertEqual(post["preferredcodec"], "best")
+        self.assertNotIn("preferredquality", post)
+        for value in (None, "", "source", "best"):
+            self.assertEqual(
+                downloader.audio_postprocessor(value)["preferredcodec"],
+                "best", repr(value))
+
+    def test_asking_for_a_bitrate_still_gets_mp3(self):
+        post = downloader.audio_postprocessor("320")
+        self.assertEqual(post["preferredcodec"], "mp3")
+        self.assertEqual(post["preferredquality"], "320")
+
+    def test_original_is_the_default_and_a_bitrate_is_not(self):
+        for value in (None, "", "original", "ORIGINAL", "best", "source"):
+            self.assertTrue(downloader.keeps_original(value), repr(value))
+        for value in ("192", "320", "128"):
+            self.assertFalse(downloader.keeps_original(value), repr(value))
+
+    def test_the_finished_file_is_found_whatever_its_extension(self):
+        base = os.path.join(self.dir, "Artist - Title")
+        self.assertIsNone(downloader.downloaded_file(base))
+        path = self._touch("Artist - Title.opus")
+        self.assertEqual(downloader.downloaded_file(base), path)
+
+    def test_a_leftover_scrap_is_not_mistaken_for_the_download(self):
+        base = os.path.join(self.dir, "Artist - Title")
+        self._touch("Artist - Title.webm.part")
+        self._touch("Artist - Title.ytdl")
+        self.assertIsNone(downloader.downloaded_file(base))
+
+    def test_cleanup_keeps_the_audio_and_removes_the_rest(self):
+        base = os.path.join(self.dir, "Artist - Title")
+        keep = self._touch("Artist - Title.m4a")
+        self._touch("Artist - Title.webm.part")
+        self._touch("Artist - Title.info.json")
+        downloader._cleanup_partials(base)
+        self.assertTrue(os.path.exists(keep))
+        self.assertEqual(
+            sorted(os.listdir(self.dir)), ["Artist - Title.m4a"])
+
+
+class ImportSlotsFollowTheFormat(unittest.TestCase):
+    """A playlist slot is reserved before the file exists.
+
+    It was reserved as `<name>.mp3`, which is no longer what a download
+    produces -- so every imported playlist would have come out missing every
+    track it had to fetch.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="eg-slot-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.meta = spotify_import.as_metadata(_sp_track("Song", "Artist"))
+
+    def test_a_slot_resolves_to_whatever_landed(self):
+        predicted = spotify_import.predicted_path(self.meta, self.dir)
+        self.assertIsNone(spotify_import.resolve(predicted))
+
+        real = os.path.splitext(predicted)[0] + ".opus"
+        open(real, "wb").close()
+        self.assertEqual(spotify_import.resolve(predicted), real)
+
+    def test_a_track_owned_as_opus_is_not_queued_again(self):
+        predicted = spotify_import.predicted_path(self.meta, self.dir)
+        open(os.path.splitext(predicted)[0] + ".m4a", "wb").close()
+        paths, missing = spotify_import.plan([self.meta], {}, self.dir)
+        self.assertEqual(missing, [])
+        self.assertTrue(paths[0].endswith(".m4a"))
 
 
 if __name__ == "__main__":

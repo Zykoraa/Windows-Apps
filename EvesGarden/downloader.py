@@ -5,10 +5,11 @@ import sys
 import time
 import requests
 import yt_dlp
+
+import audio_files
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TRCK, TPOS, TDRC, APIC, error
 
 
 # Windows reserved device names -- a file called "CON.mp3" cannot be created.
@@ -420,7 +421,10 @@ def _cleanup_partials(output_path_base):
     except OSError:
         return ""
     for name in names:
-        if name == stem or (name.startswith(stem + ".") and not name.endswith(".mp3")):
+        # Anything that is a real audio file is the download, not a scrap of
+        # one -- which now includes .opus and .m4a, not only .mp3.
+        if name == stem or (name.startswith(stem + ".")
+                            and not audio_files.is_audio(name)):
             try:
                 os.remove(os.path.join(directory, name))
                 removed.append(name)
@@ -429,16 +433,64 @@ def _cleanup_partials(output_path_base):
     return ", ".join(removed)
 
 
-def download_audio(source_url, output_path_base, log_callback=print, quality="192"):
-    """Download `source_url` and transcode to `<output_path_base>.mp3`.
+# What `download_quality` means when it is not a bitrate: keep whatever the
+# source was.
+ORIGINAL = ("original", "source", "best")
 
-    Returns the mp3 path, or raises DownloadError with a real reason. The
-    previous version swallowed every exception and returned None, which left
-    undecoded .webm/.m4a streams with no extension sitting in the library.
+
+def keeps_original(quality):
+    return str(quality or ORIGINAL[0]).strip().lower() in ORIGINAL
+
+
+def downloaded_file(output_path_base):
+    """Whichever audio file sits at this stem, or None.
+
+    The output used to be `<stem>.mp3` and nothing else, so callers could
+    name it before it existed. It is now whatever the source turned out to
+    be, and has to be found rather than assumed.
+    """
+    directory = os.path.dirname(output_path_base) or "."
+    stem = os.path.basename(output_path_base)
+    for ext in audio_files.EXTENSIONS:
+        path = os.path.join(directory, stem + ext)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def audio_postprocessor(quality):
+    """How yt-dlp should be told to finish the download.
+
+    Split out from the download so that what it decides can be checked
+    without one. Going back to transcoding is a one-word change here, it
+    would apply silently to every track ever downloaded afterwards, and
+    nothing about the app would look any different.
+    """
+    if keeps_original(quality):
+        # "best" means keep the codec that was downloaded. ffmpeg still runs,
+        # but as a remux: the audio is copied, not encoded again.
+        return {"key": "FFmpegExtractAudio", "preferredcodec": "best"}
+    return {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+            "preferredquality": str(quality)}
+
+
+def download_audio(source_url, output_path_base, log_callback=print,
+                   quality="original"):
+    """Download `source_url` and return the file it left behind.
+
+    Every download used to be re-encoded to MP3 at 192kbps. YouTube serves
+    Opus at around 160, so that was a lossy source decoded and encoded again
+    into a lossy target -- a copy strictly worse than the thing it was made
+    from, and worse than what Spotify streams. Nothing was gained for it.
+
+    Now the stream is remuxed into a container that suits it, without being
+    re-encoded: Opus arrives as .opus and AAC as .m4a, bit for bit what the
+    source served. Set `download_quality` to a bitrate to get the old
+    behaviour, for a player that cannot read anything but MP3.
     """
     ffmpeg = _ffmpeg_exe()
     if not os.path.exists(ffmpeg):
-        raise DownloadError(f"ffmpeg is missing at {ffmpeg} -- cannot convert to MP3.")
+        raise DownloadError(f"ffmpeg is missing at {ffmpeg} -- cannot extract audio.")
 
     ydl_opts = dict(
         _base_ydl_opts(),
@@ -446,16 +498,9 @@ def download_audio(source_url, output_path_base, log_callback=print, quality="19
         # The %(ext)s matters: without it yt-dlp writes the raw stream to a
         # file with no extension, and a failed postprocess leaves it there.
         outtmpl=output_path_base + ".%(ext)s",
-        postprocessors=[
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": quality,
-            }
-        ],
+        postprocessors=[audio_postprocessor(quality)],
     )
 
-    final_path = output_path_base + ".mp3"
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.extract_info(source_url, download=True)
@@ -464,10 +509,11 @@ def download_audio(source_url, output_path_base, log_callback=print, quality="19
         detail = str(e).replace("\n", " ").strip()[:300]
         raise DownloadError(detail or type(e).__name__) from e
 
-    if not os.path.exists(final_path):
+    final_path = downloaded_file(output_path_base)
+    if not final_path:
         leftovers = _cleanup_partials(output_path_base)
         raise DownloadError(
-            "MP3 conversion produced no output"
+            "the download produced no audio file"
             + (f" (removed leftover {leftovers})" if leftovers else "")
         )
 
@@ -493,42 +539,15 @@ def _fetch_cover(url):
 
 
 def apply_metadata(file_path, metadata):
-    try:
-        audio = MP3(file_path, ID3=ID3)
-        if audio.tags is None:
-            audio.add_tags()
-    except error:
-        audio = MP3(file_path)
-        audio.add_tags()
+    """Tag a downloaded file. Works on whatever container it landed in.
 
-    tags = audio.tags
-    tags.add(TIT2(encoding=3, text=metadata["name"]))
-    tags.add(TPE1(encoding=3, text=", ".join(metadata["artists"])))
-    tags.add(TALB(encoding=3, text=metadata["album"]))
-
-    if metadata.get("album_artist"):
-        tags.add(TPE2(encoding=3, text=metadata["album_artist"]))
-    if metadata.get("track_number"):
-        tags.add(TRCK(encoding=3, text=str(metadata["track_number"])))
-    if metadata.get("disc_number"):
-        tags.add(TPOS(encoding=3, text=str(metadata["disc_number"])))
-    if metadata.get("release_date"):
-        tags.add(TDRC(encoding=3, text=str(metadata["release_date"])))
-
-    if metadata.get("cover_url"):
-        cover = _fetch_cover(metadata["cover_url"])
-        if cover:
-            tags.add(
-                APIC(
-                    encoding=3,
-                    mime="image/jpeg",
-                    type=3,  # 3 is for the cover image
-                    desc="Cover",
-                    data=cover,
-                )
-            )
-
-    audio.save(v2_version=3)
+    This wrote ID3 frames directly and so only ever worked on MP3s. The
+    format-specific part now lives in audio_files, which knows how each
+    container carries a title and a cover.
+    """
+    cover = (_fetch_cover(metadata["cover_url"])
+             if metadata.get("cover_url") else None)
+    return audio_files.write_tags(file_path, metadata, cover=cover)
 
 
 def sanitize_filename(filename):
@@ -542,14 +561,16 @@ def sanitize_filename(filename):
     if cleaned.split(".")[0].upper() in _RESERVED_NAMES:
         cleaned = "_" + cleaned
 
-    # Leave room for ".mp3" inside the 255-character path-component limit.
+    # Leave room for an extension inside the 255-character path-component
+    # limit.
     if len(cleaned) > 180:
         cleaned = cleaned[:180].rstrip(". ")
 
     return cleaned or "untitled"
 
 
-def process_track(sp, track, output_dir, log_callback=print, quality="192"):
+def process_track(sp, track, output_dir, log_callback=print,
+                  quality="original"):
     """Download one track. Returns a result dict.
 
     `track` is either a Spotify URL to look up, or a metadata dict that has
@@ -571,11 +592,13 @@ def process_track(sp, track, output_dir, log_callback=print, quality="192"):
     label = f"{', '.join(metadata['artists'])} - {metadata['name']}"
     safe_filename = sanitize_filename(label)
     output_path_base = os.path.join(output_dir, safe_filename)
-    final_path = output_path_base + ".mp3"
 
-    if os.path.exists(final_path):
-        log_callback(f"  = Already have {safe_filename}.mp3 -- skipping")
-        return {"ok": True, "skipped": True, "path": final_path, "metadata": metadata}
+    existing = downloaded_file(output_path_base)
+    if existing:
+        log_callback("  = Already have %s -- skipping"
+                     % os.path.basename(existing))
+        return {"ok": True, "skipped": True, "path": existing,
+                "metadata": metadata}
 
     try:
         log_callback(f"  > {label}")
@@ -584,7 +607,7 @@ def process_track(sp, track, output_dir, log_callback=print, quality="192"):
             source, output_path_base, log_callback=log_callback, quality=quality
         )
         apply_metadata(path, metadata)
-        log_callback(f"  + Done: {safe_filename}.mp3")
+        log_callback("  + Done: %s" % os.path.basename(path))
         return {"ok": True, "skipped": False, "path": path, "metadata": metadata}
     except DownloadError as e:
         log_callback(f"  x Failed: {label} -- {e}")
@@ -596,7 +619,7 @@ def process_track(sp, track, output_dir, log_callback=print, quality="192"):
 
 
 def download_many(sp, track_urls, output_dir, jobs=3, log_callback=print,
-                  quality="192", should_stop=None):
+                  quality="original", should_stop=None):
     """Download tracks concurrently, preserving input order in the results."""
     from concurrent.futures import ThreadPoolExecutor
 
@@ -657,7 +680,12 @@ def find_orphaned_downloads(library_dir):
         path = os.path.join(library_dir, name)
         if not os.path.isfile(path):
             continue
-        if os.path.splitext(name)[1].lower() in (".mp3", ".json"):
+        # A finished download is not an orphan whatever container it is in.
+        # Checking only for .mp3 here would have had repair convert every
+        # .opus and .m4a the downloader now keeps back into an MP3, undoing
+        # the point of keeping them.
+        if (audio_files.is_audio(name)
+                or os.path.splitext(name)[1].lower() == ".json"):
             continue
         if is_partial_download(name):
             continue
@@ -742,7 +770,9 @@ def main():
     parser = argparse.ArgumentParser(description="Spotify Downloader CLI")
     parser.add_argument("url", nargs="?", help="Spotify track, album or playlist URL")
     parser.add_argument("-o", "--output", default="downloads", help="Output directory")
-    parser.add_argument("-q", "--quality", default="192", help="MP3 bitrate, e.g. 320")
+    parser.add_argument("-q", "--quality", default="original",
+                        help="'original' to keep the source codec, "
+                             "or an MP3 bitrate such as 320")
     parser.add_argument("-j", "--jobs", type=int, default=3,
                         help="Parallel downloads (default 3)")
     parser.add_argument("--repair", action="store_true",

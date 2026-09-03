@@ -68,8 +68,6 @@ import random
 import json
 import syncedlyrics
 import random
-from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, APIC
 from PIL import Image
 import io
 import tkinter as tk
@@ -95,6 +93,8 @@ import app_icon
 from discord_presence import DiscordPresence
 import credentials
 import lyrics as lyrics_source
+import audio_files
+import downloader
 import spotify_auth
 import spotify_import
 from downloader import (
@@ -246,6 +246,14 @@ class App(ctk.CTk):
 
         self.dl_visible = False
         self.dl_overlay = None
+        # "192" was the default this app wrote for itself, never a choice
+        # anybody made in a dialog -- there has never been one. Re-encoding
+        # a 160kbps Opus stream into a 192kbps MP3 makes a copy worse than
+        # its source, so a setting that only ever said that is treated as
+        # unset. A bitrate typed into settings.json by hand is respected.
+        if str(self.settings.get("download_quality") or "") == "192":
+            self.settings.set("download_quality", downloader.ORIGINAL[0])
+
         self.visualizer_palette = self.settings.get("visualizer_palette") or "Accent"
         if self.visualizer_palette not in visualizers.palette_names():
             self.visualizer_palette = "Accent"
@@ -494,6 +502,8 @@ class App(ctk.CTk):
             ("Playlists", "Your playlists", lambda: self._go_to_view("Playlists")),
             ("Duplicates", "Find and remove duplicate downloads",
              lambda: self._go_to_view("Duplicates")),
+            ("Music folders", "Add folders you already keep music in",
+             self.choose_library_folders),
             ("Repair library", "Recover unconverted downloads",
              self.run_repair),
         ]
@@ -661,12 +671,9 @@ class App(ctk.CTk):
 
     def _extract_album_art_worker(self, file_path):
         try:
-            audio = MP3(file_path, ID3=ID3)
-            tags = audio.tags.values() if audio.tags else []
-            for tag in tags:
-                if not isinstance(tag, APIC):
-                    continue
-                image = Image.open(io.BytesIO(tag.data)).convert("RGB")
+            data = audio_files.cover_bytes(file_path)
+            for tag in ([data] if data else []):
+                image = Image.open(io.BytesIO(tag)).convert("RGB")
                 thumb = image.resize((64, 64), Image.Resampling.LANCZOS)
                 np_art = image.resize((400, 400), Image.Resampling.LANCZOS)
 
@@ -1990,7 +1997,8 @@ class App(ctk.CTk):
     def retry_failed(self):
         if self.downloads.retry_failed(LIBRARY_DIR,
                                        jobs=int(self.settings.get("download_jobs") or 3),
-                                       quality=self.settings.get("download_quality")):
+                                       quality=self.settings.get("download_quality")
+                                               or downloader.ORIGINAL[0]):
             self._sync_download_buttons()
             self._watch_downloads()
 
@@ -2838,6 +2846,37 @@ class App(ctk.CTk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def library_roots(self):
+        """Every folder the library is built from.
+
+        The download folder is always one of them and cannot be removed --
+        it is where new music lands, so dropping it would hide everything the
+        app fetches for you.
+        """
+        roots = [LIBRARY_DIR]
+        for path in (self.settings.get("library_roots") or []):
+            if path and path not in roots:
+                roots.append(path)
+        return roots
+
+    def choose_library_folders(self):
+        """Point the library at music that is already on the machine."""
+        chosen = dialogs.pick_folders(self, self.theme, self.library_roots(),
+                                      fixed=(LIBRARY_DIR,))
+        if chosen is None:
+            return
+        self.settings.set("library_roots",
+                          [r for r in chosen if r != LIBRARY_DIR])
+        # A folder that has just been removed leaves its tracks behind
+        # otherwise: a scan only forgets what is missing from a folder it
+        # actually looked at.
+        try:
+            self.index.forget_outside(self.library_roots())
+        except Exception as e:
+            print("Could not tidy the index: %s" % e)
+        self.library.invalidate()
+        self.load_library()
+
     def load_library(self):
         """Refresh the index in the background, then re-render."""
         if hasattr(self, "repair_btn"):
@@ -2845,7 +2884,7 @@ class App(ctk.CTk):
 
         def work():
             try:
-                added, _updated, removed = self.index.scan(LIBRARY_DIR)
+                added, _updated, removed = self.index.scan(self.library_roots())
             except Exception as e:
                 print(f"Library scan failed: {e}")
                 return
@@ -3184,7 +3223,7 @@ class App(ctk.CTk):
         here = 0
         for name, paths in plans:
             playlist_id = self._playlist_named(name)
-            have = [p for p in paths if os.path.exists(p)]
+            have = [q for q in (spotify_import.resolve(p) for p in paths) if q]
             if have:
                 self.index.add_to_playlist(playlist_id, have)
                 self.index.reorder_playlist(playlist_id, have)
@@ -3220,7 +3259,7 @@ class App(ctk.CTk):
             return
         pending, self._pending_imports = self._pending_imports, []
         for playlist_id, paths in pending:
-            have = [p for p in paths if os.path.exists(p)]
+            have = [q for q in (spotify_import.resolve(p) for p in paths) if q]
             if not have:
                 continue
             self.index.add_to_playlist(playlist_id, have)
@@ -4034,10 +4073,8 @@ class App(ctk.CTk):
                 return
 
             file_path = self.current_playlist[self.current_index]
-            audio = MP3(file_path, ID3=ID3)
-            tags = audio.tags
-            title = tags.get("TIT2").text[0] if tags and tags.get("TIT2") else None
-            artist = tags.get("TPE1").text[0] if tags and tags.get("TPE1") else None
+            tags = audio_files.read_tags(file_path)
+            title, artist = tags["title"], tags["artist"]
 
             if not title or not artist:
                 self._safe_after(0, self.suggestions_frame.place_forget)
@@ -4272,7 +4309,7 @@ class App(ctk.CTk):
         started = self.downloads.start(
             track_urls, LIBRARY_DIR,
             jobs=int(self.settings.get("download_jobs") or 3),
-            quality=self.settings.get("download_quality"),
+            quality=self.settings.get("download_quality") or downloader.ORIGINAL[0],
             labels=labels, meta=meta,
         )
         if not started:

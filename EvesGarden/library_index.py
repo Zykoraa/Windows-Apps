@@ -14,8 +14,7 @@ import sqlite3
 import threading
 import time
 
-from mutagen.mp3 import MP3
-from mutagen.id3 import ID3
+import audio_files
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tracks (
@@ -126,6 +125,10 @@ def normalise_artist(artist):
     return _SPACE.sub(" ", _PUNCT.sub(" ", first)).strip()
 
 
+# Folders that are never a music library and are often huge.
+_SKIP_DIRS = {"node_modules", "__pycache__", "$recycle.bin",
+              "system volume information", "windows", "appdata"}
+
 SORTS = {
     "Title":   "LOWER(COALESCE(NULLIF(title,''), path))",
     "Artist":  "LOWER(COALESCE(NULLIF(artist,''), '')), LOWER(COALESCE(album,'')), disc_no, track_no",
@@ -138,68 +141,11 @@ SORTS = {
 }
 
 
-def _first(tags, key):
-    frame = tags.get(key) if tags else None
-    if frame is None:
-        return None
-    try:
-        value = str(frame.text[0]).strip()
-    except (AttributeError, IndexError):
-        return None
-    return value or None
-
-
-def _int(value):
-    """ID3 numbers are strings and often "3/12"."""
-    if not value:
-        return None
-    head = str(value).split("/")[0].strip()
-    try:
-        return int(head)
-    except ValueError:
-        return None
-
-
-def read_tags(path):
-    """Pull the fields we index out of one file. Never raises."""
-    row = {
-        "title": None, "artist": None, "album": None, "albumartist": None,
-        "track_no": None, "disc_no": None, "year": None,
-        "duration": None, "bitrate": None, "has_art": 0,
-    }
-    try:
-        audio = MP3(path, ID3=ID3)
-    except Exception:
-        return row
-
-    try:
-        row["duration"] = float(audio.info.length)
-        row["bitrate"] = int(audio.info.bitrate)
-    except Exception:
-        pass
-
-    tags = audio.tags
-    if tags:
-        row["title"] = _first(tags, "TIT2")
-        row["artist"] = _first(tags, "TPE1")
-        row["album"] = _first(tags, "TALB")
-        row["albumartist"] = _first(tags, "TPE2")
-        row["track_no"] = _int(_first(tags, "TRCK"))
-        row["disc_no"] = _int(_first(tags, "TPOS"))
-        row["year"] = (_first(tags, "TDRC") or "")[:4] or None
-        row["has_art"] = 1 if any(
-            getattr(f, "FrameID", "") == "APIC" for f in tags.values()
-        ) else 0
-
-    # Fall back to the old "Artist - Title" filename convention so files
-    # without tags (hand-copied, or recovered by repair) still show sensibly.
-    stem = os.path.splitext(os.path.basename(path))[0]
-    if not row["title"]:
-        row["title"] = stem.partition(" - ")[2].strip() or stem if " - " in stem else stem
-    if not row["artist"] and " - " in stem:
-        row["artist"] = stem.partition(" - ")[0].strip() or None
-
-    return row
+# Reading a file is audio_files' job now. This module knew only about MP3
+# and ID3 -- it opened every file as MP3(path, ID3=ID3) and gave up on
+# anything that was not one, which is why a FLAC or m4a collection was
+# invisible to an app whose whole point is playing your music.
+read_tags = audio_files.read_tags
 
 
 class LibraryIndex:
@@ -232,25 +178,41 @@ class LibraryIndex:
 
     # ------------------------------------------------------------- scanning
 
-    def scan(self, library_dir, progress=None):
-        """Refresh the index against the folder. Returns (added, updated, removed).
+    def scan(self, roots, progress=None):
+        """Refresh the index against one or more folders.
 
-        Only files whose mtime or size changed are re-read, so a rescan of an
-        unchanged library costs one stat() per file.
+        Returns (added, updated, removed). Only files whose mtime or size
+        changed are re-read, so a rescan of an unchanged library costs one
+        stat() per file.
+
+        `roots` may be a single folder or a list of them. It walks into
+        subfolders, because a collection that anyone has kept for any length
+        of time is in Artist/Album folders rather than in one flat pile --
+        which is the only shape this understood when the only files in it
+        were ones the app had downloaded itself.
         """
-        if not os.path.isdir(library_dir):
+        if isinstance(roots, str):
+            roots = [roots]
+        roots = [r for r in roots if r and os.path.isdir(r)]
+        if not roots:
             return (0, 0, 0)
 
         on_disk = {}
-        for name in os.listdir(library_dir):
-            if not name.lower().endswith(".mp3"):
-                continue
-            path = os.path.join(library_dir, name)
-            try:
-                st = os.stat(path)
-            except OSError:
-                continue
-            on_disk[path] = (st.st_mtime, st.st_size)
+        for root in roots:
+            for folder, dirs, names in os.walk(root):
+                # Nothing anybody wants indexed lives in these, and some of
+                # them are enormous.
+                dirs[:] = [d for d in dirs
+                           if not d.startswith(".") and d.lower() not in _SKIP_DIRS]
+                for name in names:
+                    if not audio_files.is_audio(name):
+                        continue
+                    path = os.path.join(folder, name)
+                    try:
+                        st = os.stat(path)
+                    except OSError:
+                        continue
+                    on_disk[path] = (st.st_mtime, st.st_size)
 
         with self._lock:
             known = {
@@ -259,7 +221,14 @@ class LibraryIndex:
             }
 
         stale = [p for p, v in on_disk.items() if known.get(p) != v]
-        removed = [p for p in known if p not in on_disk]
+        # Only forget a file that is missing from a folder actually looked
+        # at. A library root on a drive that is not plugged in today should
+        # not empty half the library.
+        inside = tuple(os.path.normcase(os.path.abspath(r)) + os.sep
+                       for r in roots)
+        removed = [p for p in known
+                   if p not in on_disk
+                   and os.path.normcase(os.path.abspath(p)).startswith(inside)]
 
         now = time.time()
         rows = []
@@ -454,6 +423,28 @@ class LibraryIndex:
                 continue
             table.setdefault(key, []).append((row["path"], row["duration"]))
         return table
+
+    def forget_outside(self, roots):
+        """Drop tracks that no longer sit under any library folder.
+
+        A scan only forgets files missing from a folder it looked at, so that
+        a drive being unplugged does not empty the library. The other side of
+        that is this: when somebody removes a folder, its tracks have to go,
+        and nothing else will take them.
+        """
+        inside = tuple(os.path.normcase(os.path.abspath(r)) + os.sep
+                       for r in roots if r)
+        with self._lock:
+            paths = [r["path"] for r in
+                     self._conn.execute("SELECT path FROM tracks")]
+        gone = [p for p in paths
+                if not os.path.normcase(os.path.abspath(p)).startswith(inside)]
+        if gone:
+            with self._lock:
+                self._conn.executemany("DELETE FROM tracks WHERE path = ?",
+                                       [(p,) for p in gone])
+                self._conn.commit()
+        return len(gone)
 
     def forget(self, path):
         """Drop a row after its file is deleted."""

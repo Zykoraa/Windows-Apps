@@ -14,6 +14,9 @@ Because a toplevel is a real window, the open and close transitions can use
 overlays have to settle for.
 """
 
+import os
+from tkinter import filedialog
+
 import customtkinter as ctk
 
 import motion
@@ -344,3 +347,108 @@ class PlaylistPicker(ModalDialog):
 def pick_playlists(parent, theme, playlists):
     """Ask which playlists to import. Returns a list, or None if cancelled."""
     return PlaylistPicker(parent, theme, playlists).show()
+
+
+class FolderPicker(ModalDialog):
+    """Which folders the library is built from.
+
+    The app used to index exactly one folder: the one it downloaded into.
+    Anyone arriving with music they already owned could not see a note of it,
+    which made this a downloader with a player attached rather than a music
+    player.
+    """
+
+    def __init__(self, parent, theme, roots, fixed=()):
+        super().__init__(parent, theme, "Music folders", size=(640, 460))
+        t = theme
+        self.fixed = set(fixed)
+        self.roots = list(roots)
+
+        ctk.CTkLabel(
+            self.body, justify="left", wraplength=580, anchor="w",
+            font=theme_ui.font("body"), text_color=t["text_secondary"],
+            text=("Everything in these folders is in your library, including "
+                  "what is in their subfolders. MP3, FLAC, M4A, Opus, Ogg and "
+                  "WAV are all read.")
+        ).pack(fill="x", pady=(0, 14))
+
+        self.list = ctk.CTkScrollableFrame(
+            self.body, fg_color=t["surface"], corner_radius=theme_ui.RADIUS,
+            height=250)
+        self.list.pack(fill="both", expand=True)
+
+        row = ctk.CTkFrame(self.body, fg_color="transparent")
+        row.pack(fill="x", pady=(16, 0))
+        ctk.CTkButton(row, text="Add a folder...", width=150, height=36,
+                      corner_radius=theme_ui.RADIUS_PILL, border_width=1,
+                      fg_color="transparent", border_color=t["accent"],
+                      hover_color=t["surface_hover"], text_color=t["text"],
+                      font=theme_ui.font("body_med"),
+                      command=self._add).pack(side="left")
+        ctk.CTkButton(row, text="Done", width=110, height=36,
+                      corner_radius=theme_ui.RADIUS_PILL,
+                      fg_color=t["accent"], hover_color=t["accent_hover"],
+                      text_color=t["bg"], font=theme_ui.font("body_med"),
+                      command=self._submit).pack(side="right")
+
+        self._redraw()
+
+    def _redraw(self):
+        for widget in self.list.winfo_children():
+            widget.destroy()
+        t = self.theme
+        for path in self.roots:
+            row = ctk.CTkFrame(self.list, fg_color="transparent", height=40)
+            row.pack(fill="x", pady=2)
+            row.pack_propagate(False)
+            locked = path in self.fixed
+            if not locked:
+                ctk.CTkButton(
+                    row, text="Remove", width=84, height=28,
+                    corner_radius=theme_ui.RADIUS_PILL, border_width=1,
+                    fg_color="transparent", border_color=t["surface_hover"],
+                    hover_color=t["surface_hover"],
+                    text_color=t["text_secondary"],
+                    font=theme_ui.font("caption"),
+                    command=lambda p=path: self._remove(p)).pack(
+                        side="right", padx=(8, 12))
+            else:
+                # The download folder is where new music lands, so removing
+                # it would hide everything the app fetches from itself.
+                ctk.CTkLabel(row, text="downloads here",
+                             font=theme_ui.font("caption"),
+                             text_color=t["text_secondary"]).pack(
+                                 side="right", padx=(8, 14))
+            missing = not os.path.isdir(path)
+            ctk.CTkLabel(
+                row, text=path if not missing else path + "   (not found)",
+                anchor="w", font=theme_ui.font("body"),
+                text_color=t["text"] if not missing else t["text_secondary"]
+            ).pack(side="left", padx=(14, 0), fill="x", expand=True)
+
+        if not self.roots:
+            ctk.CTkLabel(self.list, text="No folders yet.",
+                         font=theme_ui.font("body"),
+                         text_color=t["text_secondary"]).pack(pady=30)
+
+    def _add(self):
+        chosen = filedialog.askdirectory(parent=self,
+                                         title="Choose a music folder")
+        if not chosen:
+            return
+        chosen = os.path.normpath(chosen)
+        if chosen not in self.roots:
+            self.roots.append(chosen)
+            self._redraw()
+
+    def _remove(self, path):
+        self.roots = [r for r in self.roots if r != path]
+        self._redraw()
+
+    def _submit(self):
+        self.close(list(self.roots))
+
+
+def pick_folders(parent, theme, roots, fixed=()):
+    """Edit the library folders. Returns the new list, or None if cancelled."""
+    return FolderPicker(parent, theme, roots, fixed).show()
