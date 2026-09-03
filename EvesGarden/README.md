@@ -5,8 +5,14 @@ A Windows music player and downloader. It plays the music you already have
 fetches what you do not, looking up track, album and artwork details and
 tagging the result properly.
 
+Paste a Bandcamp, Internet Archive or SoundCloud link and it is fetched from
+there -- which is how you get lossless, since YouTube has never served any:
+its best is Opus at about 170kbps, and wrapping that in a FLAC would be four
+times the size for not one bit more music.
+
 Downloads keep the quality they were served at instead of being re-encoded
-into something smaller and worse. Playback is gapless, with crossfade, a
+into something smaller and worse, and every track says what it actually is
+-- "Opus 141 kbps", "FLAC 16/44.1 kHz" -- in the queue and while it plays. Playback is gapless, with crossfade, a
 10-band EQ, synced lyrics, nine visualisers and Discord Rich Presence -- and
 volume levelling, so a loudness-war master and a quiet remaster sit at the
 same level instead of sending you to the volume knob between tracks.
