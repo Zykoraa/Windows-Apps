@@ -183,6 +183,10 @@ def as_metadata(track):
         "release_date": (album.get("release_date") or "")[:4] or None,
         "duration_ms": track.get("duration_ms"),
         "spotify_url": (track.get("external_urls") or {}).get("spotify"),
+        # Whether Spotify will actually play it. A track whose licensing has
+        # lapsed stays in the playlist and turns grey, so its absence is not
+        # what tells you it has gone -- this is.
+        "is_playable": track.get("is_playable"),
     }
 
 

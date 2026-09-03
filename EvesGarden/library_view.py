@@ -92,6 +92,7 @@ class LibraryView:
         self.playlist_id = None      # set while viewing one playlist
         self.playlist_name = None
         self.smart = None            # set while viewing one smart playlist
+        self.vanished = False        # set while viewing what has gone
         self._art_pool = ThreadPoolExecutor(max_workers=4,
                                             thread_name_prefix="cover")
 
@@ -108,6 +109,7 @@ class LibraryView:
         self.view = name
         self.filter = None
         self.smart = None
+        self.vanished = False
         self.render()
 
     def set_sort(self, name):
@@ -194,6 +196,13 @@ class LibraryView:
                 self._render(rows, self._track_row,
                              ("playlist", self.playlist_id, query), "track")
                 return
+            if self.vanished:
+                rows = self.index.vanished()
+                self.crumb_label.configure(text="Gone from Spotify")
+                self._show_crumb_bar()
+                self._render(rows, self._vanished_row,
+                             ("vanished", len(rows), query), "track")
+                return
             # Smart playlists lead: they are the ones whose contents move.
             rows = []
             for rule in smart_playlists.RULES:
@@ -204,6 +213,19 @@ class LibraryView:
                              "hint": rule.hint, "n": summary["n"],
                              "total": summary["total"],
                              "cover_path": summary["cover_path"]})
+            # What has gone sits with the playlists it went from, because
+            # that is where somebody would look for it.
+            missing = self.index.vanished()
+            if missing:
+                kept = sum(1 for row in missing
+                           if row["path"] and os.path.exists(row["path"]))
+                rows.append({
+                    "gone": True, "id": "vanished",
+                    "name": "Gone from Spotify",
+                    "hint": ("you still have %d of them" % kept if kept
+                             else "none of them were downloaded"),
+                    "n": len(missing), "total": 0, "cover_path": None,
+                })
             rows.extend(self.index.playlists())
             self._render(rows, self._playlist_row, ("playlists", query),
                          "playlist")
@@ -589,12 +611,63 @@ class LibraryView:
                      font=theme_ui.font("caption"),
                      text_color=self.theme["text_secondary"]).pack(anchor="w")
 
+        if playlist.get("gone"):
+            self._clickable(row, self.open_vanished)
+            return
         rule = playlist.get("smart")
         if rule is not None:
             self._clickable(row, lambda r=rule: self.open_smart(r))
         else:
             self._clickable(row, lambda pid=playlist["id"],
                             name=playlist["name"]: self.open_playlist(pid, name))
+
+    def _vanished_row(self, entry):
+        """One track that is no longer on Spotify.
+
+        Playable if it was downloaded before it went, which is the entire
+        point of noticing; dimmed and unplayable if it was not, because
+        saying so is more use than leaving a row that does nothing.
+        """
+        path = entry.get("path")
+        have = bool(path and os.path.exists(path))
+        row = self._row()
+
+        art = ctk.CTkLabel(row, text="", width=ART, height=ART)
+        art.pack(side="left", padx=(10, 12))
+        self.request_thumb(path if have else None, ART, art)
+
+        ctk.CTkLabel(row, text="kept" if have else "lost", width=44,
+                     anchor="e", font=theme_ui.font("caption"),
+                     text_color=(self.theme["accent"] if have
+                                 else self.theme["text_secondary"])).pack(
+                                     side="right", padx=(6, 14))
+
+        box = ctk.CTkFrame(row, fg_color="transparent")
+        box.pack(side="left", fill="both", expand=True)
+        ctk.CTkLabel(box, text=entry.get("title") or "Unknown track",
+                     anchor="w", font=theme_ui.font("heading"),
+                     text_color=(self.theme["text"] if have
+                                 else self.theme["text_secondary"])).pack(
+                                     anchor="w", pady=(8, 0))
+        went = ("went grey on Spotify" if entry.get("reason") == "unavailable"
+                else "no longer in the playlist")
+        ctk.CTkLabel(box, text="%s  \u00b7  %s  \u00b7  %s"
+                              % (entry.get("artist") or "", went,
+                                 entry.get("playlist") or ""),
+                     anchor="w", font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+        if have:
+            self._rows_by_path[path] = row
+            self._clickable(row, lambda p=path: self.on_play(p))
+            self._menuable(row, path)
+
+    def open_vanished(self):
+        self.vanished = True
+        self.playlist_id = None
+        self.smart = None
+        self.invalidate()
+        self.render()
 
     def open_playlist(self, playlist_id, name):
         self.playlist_id = playlist_id
@@ -611,6 +684,7 @@ class LibraryView:
     def close_playlist(self):
         self.playlist_id = None
         self.playlist_name = None
+        self.vanished = False
         self.smart = None
         self.invalidate()
         self.render()

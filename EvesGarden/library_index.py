@@ -61,6 +61,37 @@ CREATE TABLE IF NOT EXISTS playlist_items (
     FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_pl_items ON playlist_items(playlist_id, position);
+
+-- Which local playlists came from somewhere else, so they can be looked at
+-- again later.
+CREATE TABLE IF NOT EXISTS playlist_sources (
+    playlist_id INTEGER PRIMARY KEY,
+    provider    TEXT NOT NULL,
+    remote_id   TEXT NOT NULL,
+    name        TEXT,
+    checked     REAL,
+    FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
+);
+
+-- What that playlist held the last time anybody looked. This is the whole
+-- point: a Spotify playlist quietly loses tracks as licensing lapses, and
+-- once one has gone there is nothing left to say what it was. Written down
+-- at import, it can be missed when it goes -- and the file is still here.
+CREATE TABLE IF NOT EXISTS playlist_snapshot (
+    playlist_id INTEGER NOT NULL,
+    track_url   TEXT NOT NULL,
+    title       TEXT,
+    artist      TEXT,
+    path        TEXT,
+    first_seen  REAL,
+    last_seen   REAL,
+    gone_at     REAL,
+    reason      TEXT,
+    PRIMARY KEY (playlist_id, track_url),
+    FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_snapshot_gone
+    ON playlist_snapshot(playlist_id, gone_at);
 """
 
 # Featured-artist tracks carry "Tom Misch, De La Soul" in TPE1, and files
@@ -428,6 +459,100 @@ class LibraryIndex:
                 continue
             table.setdefault(key, []).append((row["path"], row["duration"]))
         return table
+
+    # ------------------------------------------------ watched playlists
+
+    def watch_playlist(self, playlist_id, provider, remote_id, name=None):
+        """Remember where a playlist came from, so it can be re-read."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO playlist_sources(playlist_id, provider, remote_id,"
+                " name, checked) VALUES(?,?,?,?,?)"
+                " ON CONFLICT(playlist_id) DO UPDATE SET"
+                "   provider=excluded.provider, remote_id=excluded.remote_id,"
+                "   name=excluded.name",
+                (playlist_id, provider, str(remote_id), name, None))
+            self._conn.commit()
+
+    def unwatch_playlist(self, playlist_id):
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM playlist_sources WHERE playlist_id = ?",
+                (playlist_id,))
+            self._conn.commit()
+
+    def watched_playlists(self):
+        """Every playlist that came from somewhere, with its local name."""
+        return self._query(
+            "SELECT s.playlist_id, s.provider, s.remote_id, s.checked,"
+            "       COALESCE(p.name, s.name) AS name"
+            "  FROM playlist_sources s"
+            "  JOIN playlists p ON p.id = s.playlist_id"
+            " ORDER BY LOWER(COALESCE(p.name, s.name))")
+
+    def mark_checked(self, playlist_id, when=None):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE playlist_sources SET checked = ? WHERE playlist_id = ?",
+                (when if when is not None else time.time(), playlist_id))
+            self._conn.commit()
+
+    def snapshot(self, playlist_id):
+        """What this playlist held when it was last read, keyed by track."""
+        rows = self._query(
+            "SELECT * FROM playlist_snapshot WHERE playlist_id = ?",
+            (playlist_id,))
+        return {r["track_url"]: r for r in rows}
+
+    def record_seen(self, playlist_id, entries):
+        """Note that these tracks are in the playlist right now.
+
+        Anything already recorded has its last_seen moved on and any note of
+        it having gone cleared -- a track can come back, and when it does the
+        playlist should stop saying it is missing.
+        """
+        now = time.time()
+        with self._lock:
+            for entry in entries:
+                self._conn.execute(
+                    "INSERT INTO playlist_snapshot(playlist_id, track_url,"
+                    " title, artist, path, first_seen, last_seen, gone_at,"
+                    " reason) VALUES(?,?,?,?,?,?,?,NULL,NULL)"
+                    " ON CONFLICT(playlist_id, track_url) DO UPDATE SET"
+                    "   title=excluded.title, artist=excluded.artist,"
+                    "   path=COALESCE(excluded.path, playlist_snapshot.path),"
+                    "   last_seen=excluded.last_seen,"
+                    "   gone_at=NULL, reason=NULL",
+                    (playlist_id, entry["url"], entry.get("title"),
+                     entry.get("artist"), entry.get("path"), now, now))
+            self._conn.commit()
+
+    def mark_gone(self, playlist_id, urls, reason):
+        """Note that these tracks are no longer available. Returns how many."""
+        now = time.time()
+        changed = 0
+        with self._lock:
+            for url in urls:
+                cur = self._conn.execute(
+                    "UPDATE playlist_snapshot SET gone_at = ?, reason = ?"
+                    " WHERE playlist_id = ? AND track_url = ?"
+                    "   AND gone_at IS NULL",
+                    (now, reason, playlist_id, url))
+                changed += cur.rowcount
+            self._conn.commit()
+        return changed
+
+    def vanished(self, playlist_id=None):
+        """Tracks that have gone from the playlist they were imported from."""
+        sql = ("SELECT s.*, COALESCE(p.name, '') AS playlist"
+               "  FROM playlist_snapshot s"
+               "  JOIN playlists p ON p.id = s.playlist_id"
+               " WHERE s.gone_at IS NOT NULL")
+        params = ()
+        if playlist_id is not None:
+            sql += " AND s.playlist_id = ?"
+            params = (playlist_id,)
+        return self._query(sql + " ORDER BY s.gone_at DESC", params)
 
     # -------------------------------------------------------- loudness
 

@@ -95,6 +95,7 @@ import credentials
 import lyrics as lyrics_source
 import audio_files
 import downloader
+import playlist_watch
 import spotify_auth
 import spotify_import
 from downloader import (
@@ -311,6 +312,7 @@ class App(ctk.CTk):
 
         # Start GUI update loops
         self._pump_ui_calls()
+        self._safe_after(9000, self._watch_playlists_quietly)
         self.update_progress_loop()
         self.update_visualizer_loop()
         self.setup_overlay = None
@@ -506,6 +508,8 @@ class App(ctk.CTk):
             ("Playlists", "Your playlists", lambda: self._go_to_view("Playlists")),
             ("Duplicates", "Find and remove duplicate downloads",
              lambda: self._go_to_view("Duplicates")),
+            ("Check playlists", "See what Spotify has taken away",
+             self.check_playlists),
             ("Volume levelling", "Even out loud and quiet tracks",
              self.toggle_normalise),
             ("Music folders", "Add folders you already keep music in",
@@ -3249,7 +3253,7 @@ class App(ctk.CTk):
                 self._gui_log("Could not read %s: %s" % (playlist["name"], e))
                 continue
             paths, gaps = spotify_import.plan(tracks, owned, LIBRARY_DIR)
-            plans.append((playlist["name"], paths))
+            plans.append((playlist, paths, tracks))
             for track in gaps:
                 # Keyed so a song sitting on three playlists is downloaded
                 # once rather than three times.
@@ -3263,6 +3267,146 @@ class App(ctk.CTk):
                 missing.append(key)
         self._safe_after(0, self._finish_import, plans, missing, labels, meta,
                          refused)
+
+    # How long before an imported playlist is worth looking at again. A
+    # playlist does not decay quickly, and nobody wants an app that phones
+    # Spotify every launch.
+    CHECK_INTERVAL = 7 * 24 * 3600
+
+    def _watch_playlists_quietly(self):
+        """Look again, on a schedule, and say nothing unless there is news.
+
+        A feature that only works when you remember to ask is not watching
+        anything. This runs a week after the last look and reports into the
+        status line -- never a dialog on startup, because the answer is
+        almost always "nothing has changed" and that is not worth a click.
+        """
+        try:
+            stale = [row for row in self.index.watched_playlists()
+                     if not row["checked"]
+                     or time.time() - row["checked"] > self.CHECK_INTERVAL]
+        except Exception:
+            return
+        if not stale or not self._refresh_user_client():
+            return
+        threading.Thread(target=self._check_worker, args=(stale, True),
+                         daemon=True).start()
+
+    def check_playlists(self):
+        """Re-read the Spotify playlists this library was built from.
+
+        Playlists decay. Licensing lapses and a track turns grey, or leaves
+        the listing altogether, and nothing anywhere tells you -- the
+        playlist is simply shorter than you remember and there is no longer
+        anything to say what it was. This app wrote down what was in it and
+        downloaded the audio, so it is the one thing that can still say.
+        """
+        watched = self.index.watched_playlists()
+        if not watched:
+            self._import_status("Nothing imported yet -- nothing to check.")
+            return
+        if self.user_sp is None and not self._refresh_user_client():
+            self._import_status("Sign in to Spotify to check your playlists.")
+            self.open_downloader()
+            return
+
+        self.import_pl_btn.configure(state="disabled")
+        self._import_status("Checking %d playlist%s on Spotify..."
+                            % (len(watched), "" if len(watched) == 1 else "s"))
+        threading.Thread(target=self._check_worker, args=(watched,),
+                         daemon=True).start()
+
+    def _check_worker(self, watched, quiet=False):
+        report = []
+        for row in watched:
+            if row["provider"] != "spotify":
+                continue
+            playlist = {
+                "id": row["remote_id"], "name": row["name"],
+                "liked": row["remote_id"] == spotify_import.LIKED_ID,
+            }
+            try:
+                tracks = spotify_import.read_playlist(self.user_sp, playlist)
+            except Exception as e:
+                report.append({"name": row["name"], "error": str(e)[:120]})
+                continue
+
+            recorded = self.index.snapshot(row["playlist_id"])
+            changes = playlist_watch.compare(recorded, tracks)
+
+            self.index.record_seen(
+                row["playlist_id"],
+                playlist_watch.entries_for([t for _u, t in changes.still_here]))
+            for reason in (playlist_watch.UNAVAILABLE, playlist_watch.REMOVED):
+                urls = [u for u, _t, r in changes.gone if r == reason]
+                if urls:
+                    self.index.mark_gone(row["playlist_id"], urls, reason)
+            self.index.mark_checked(row["playlist_id"])
+
+            losses = []
+            for url, _track, reason in changes.gone:
+                was = recorded.get(url) or {}
+                path = was.get("path")
+                losses.append({
+                    "title": was.get("title") or "Unknown track",
+                    "artist": was.get("artist") or "",
+                    "reason": reason,
+                    "kept": bool(path and spotify_import.resolve(path)),
+                })
+            report.append({
+                "name": row["name"], "error": None, "losses": losses,
+                "added": changes.added, "returned": len(changes.returned),
+            })
+        self._safe_after(0, self._finish_check, report, quiet)
+
+    def _finish_check(self, report, quiet=False):
+        self.import_pl_btn.configure(state="normal")
+        if not report:
+            if not quiet:
+                self._import_status("Nothing could be read from Spotify.")
+            return
+
+        lost = sum(len(r.get("losses") or []) for r in report)
+        kept = sum(1 for r in report for row in (r.get("losses") or [])
+                   if row["kept"])
+        added = sum(len(r.get("added") or []) for r in report)
+
+        if not lost and not added:
+            if not quiet:
+                self._import_status(
+                    "Checked %d playlist%s -- nothing has changed."
+                    % (len(report), "" if len(report) == 1 else "s"))
+            return
+
+        self._import_status(
+            "%d gone from Spotify (you have %d), %d new."
+            % (lost, kept, added))
+        if quiet:
+            # Found on a scheduled look, so it is said and left there. The
+            # list of what went is under Playlists, whenever they want it.
+            return
+        wanted = dialogs.show_playlist_changes(self, self.theme, report)
+        if wanted:
+            self._download_new_tracks(report)
+
+    def _download_new_tracks(self, report):
+        """Fetch the tracks that have appeared since the last look."""
+        keys, labels, meta = [], {}, {}
+        for entry in report:
+            for track in entry.get("added") or []:
+                key = track.get("spotify_url")
+                if not key or key in meta:
+                    continue
+                keys.append(key)
+                meta[key] = track
+                labels[key] = "%s - %s" % (", ".join(track["artists"]),
+                                           track["name"])
+        if not keys:
+            self._import_status("Nothing new to download.")
+            return
+        self._import_status("Downloading %d new track%s."
+                            % (len(keys), "" if len(keys) == 1 else "s"))
+        self._start_batch(keys, labels=labels, meta=meta)
 
     def _playlist_named(self, name):
         """Reuse a playlist of this name, or make one.
@@ -3285,8 +3429,16 @@ class App(ctk.CTk):
             return
 
         here = 0
-        for name, paths in plans:
+        for playlist, paths, tracks in plans:
+            name = playlist["name"]
             playlist_id = self._playlist_named(name)
+            # From here on this playlist is watched: what Spotify held at
+            # this moment is written down, so that when it stops holding it
+            # there is something to compare against.
+            self.index.watch_playlist(playlist_id, "spotify", playlist["id"],
+                                      name)
+            self.index.record_seen(
+                playlist_id, playlist_watch.entries_for(tracks, paths))
             have = [q for q in (spotify_import.resolve(p) for p in paths) if q]
             if have:
                 self.index.add_to_playlist(playlist_id, have)
@@ -3403,7 +3555,8 @@ class App(ctk.CTk):
 
     def clear_library_filter(self):
         if self.library.view == "Playlists" and (self.library.playlist_id
-                                                 or self.library.smart):
+                                                 or self.library.smart
+                                                 or self.library.vanished):
             self.library.close_playlist()
             self.render_library()
             return

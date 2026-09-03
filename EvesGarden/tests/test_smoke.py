@@ -301,6 +301,58 @@ class SurfaceWalk:
         picker.close()
         yield 260
 
+        # What Spotify took. Neither of these can be reached without an
+        # account and a playlist that has actually lost something, so both
+        # are built here with the losses they are meant to describe.
+        self.mark("what changed on Spotify")
+        report = [
+            {"name": "Late night", "error": None, "returned": 0,
+             "losses": [
+                 {"title": "A Song", "artist": "An Artist",
+                  "reason": "unavailable", "kept": True},
+                 {"title": "Another", "artist": "Someone Else",
+                  "reason": "removed", "kept": False},
+             ],
+             "added": [{"name": "New One", "artists": ["Third"],
+                        "spotify_url": "u/new"}]},
+            {"name": "Unreadable", "error": "403 Forbidden"},
+        ]
+        changes = self.gui.dialogs.PlaylistChanges(app, app.theme, report)
+        changes.present()
+        yield 320
+        self.mark("close what changed")
+        changes.close()
+        yield 260
+
+        # And the same thing where it lives afterwards: a playlist of what is
+        # gone, with the ones still on disk playable and the rest dimmed.
+        self.mark("gone from Spotify")
+        playlist = app.index.create_playlist("Late night")
+        app.index.watch_playlist(playlist, "spotify", "abc", "Late night")
+        app.index.record_seen(playlist, [
+            {"url": "u/a", "title": "A Song", "artist": "An Artist",
+             "path": None},
+            {"url": "u/b", "title": "Another", "artist": "Someone Else",
+             "path": None},
+        ])
+        app.index.mark_gone(playlist, ["u/a"], "unavailable")
+        app.index.mark_gone(playlist, ["u/b"], "removed")
+        app.library.invalidate()
+        app.set_library_view("Playlists")
+        yield 260
+        app.library.open_vanished()
+        yield 320
+        assert len(app.library.rows) == 2, (
+            "two tracks have gone; the list shows %d" % len(app.library.rows))
+        self.mark("back out of gone from Spotify")
+        app.clear_library_filter()
+        yield 200
+        assert not app.library.vanished, "Back did not leave the list"
+        app.index.delete_playlist(playlist)
+        app.library.invalidate()
+        app.set_library_view("Songs")
+        yield 200
+
         # The library folder picker, which is the only way in for anybody
         # who already owns music.
         self.mark("music folders")

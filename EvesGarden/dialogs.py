@@ -452,3 +452,121 @@ class FolderPicker(ModalDialog):
 def pick_folders(parent, theme, roots, fixed=()):
     """Edit the library folders. Returns the new list, or None if cancelled."""
     return FolderPicker(parent, theme, roots, fixed).show()
+
+
+class PlaylistChanges(ModalDialog):
+    """What Spotify has taken away since you imported.
+
+    The losses lead. A playlist quietly getting shorter is the thing nobody
+    is ever told about, and the only good news available -- that the track is
+    still on this machine -- is only sayable by something that both imported
+    the playlist and kept the audio.
+    """
+
+    def __init__(self, parent, theme, report):
+        super().__init__(parent, theme, "What changed on Spotify",
+                         size=(660, 620))
+        t = theme
+        self.report = report
+        added = sum(len(r.get("added") or []) for r in report)
+        losses = [row for r in report for row in (r.get("losses") or [])]
+        kept = sum(1 for row in losses if row["kept"])
+
+        ctk.CTkLabel(
+            self.body, justify="left", wraplength=600, anchor="w",
+            font=theme_ui.font("body"), text_color=t["text"],
+            text=self._headline(losses, kept, added)
+        ).pack(fill="x", pady=(0, 14))
+
+        self.list = ctk.CTkScrollableFrame(
+            self.body, fg_color=t["surface"], corner_radius=theme_ui.RADIUS,
+            height=390)
+        self.list.pack(fill="both", expand=True)
+
+        for entry in report:
+            self._playlist_block(entry)
+        if not losses and not added:
+            ctk.CTkLabel(self.list, text="Nothing has changed.",
+                         font=theme_ui.font("body"),
+                         text_color=t["text_secondary"]).pack(pady=40)
+
+        row = ctk.CTkFrame(self.body, fg_color="transparent")
+        row.pack(fill="x", pady=(16, 0))
+        ctk.CTkButton(row, text="Close", width=100, height=36,
+                      corner_radius=theme_ui.RADIUS_PILL, border_width=1,
+                      fg_color="transparent", border_color=t["surface_hover"],
+                      hover_color=t["surface_hover"], text_color=t["text"],
+                      font=theme_ui.font("body_med"),
+                      command=self.close).pack(side="right")
+        if added:
+            ctk.CTkButton(
+                row, text="Download the %d new" % added, width=170, height=36,
+                corner_radius=theme_ui.RADIUS_PILL, fg_color=t["accent"],
+                hover_color=t["accent_hover"], text_color=t["bg"],
+                font=theme_ui.font("body_med"),
+                command=lambda: self.close(True)).pack(side="right", padx=(0, 10))
+
+    @staticmethod
+    def _headline(losses, kept, added):
+        if not losses:
+            return ("Nothing has gone. %d new track%s since you last looked."
+                    % (added, "" if added == 1 else "s")) if added else \
+                   "Nothing has changed since you last looked."
+        what = "track" if len(losses) == 1 else "tracks"
+        if kept == len(losses):
+            head = ("%d %s have gone from Spotify. You still have every one "
+                    "of them." % (len(losses), what))
+        elif kept:
+            head = ("%d %s have gone from Spotify. You still have %d of them."
+                    % (len(losses), what, kept))
+        else:
+            head = "%d %s have gone from Spotify." % (len(losses), what)
+        if added:
+            head += "  %d new since you last looked." % added
+        return head
+
+    def _playlist_block(self, entry):
+        t = self.theme
+        losses = entry.get("losses") or []
+        added = entry.get("added") or []
+        if entry.get("error"):
+            self._line(entry["name"], entry["error"], t["text_secondary"])
+            return
+        if not losses and not added:
+            return
+
+        ctk.CTkLabel(self.list, text=entry["name"], anchor="w",
+                     font=theme_ui.font("heading"),
+                     text_color=t["text"]).pack(fill="x", padx=14,
+                                                pady=(12, 2))
+        for row in losses:
+            # "still here" is the whole reason for looking.
+            mark = "kept" if row["kept"] else "gone"
+            colour = t["accent"] if row["kept"] else t["text_secondary"]
+            reason = ("went grey on Spotify"
+                      if row["reason"] == "unavailable"
+                      else "no longer in the playlist")
+            self._line("%s - %s" % (row["artist"], row["title"]),
+                       "%s  ·  %s" % (reason, mark), colour)
+        for track in added[:20]:
+            self._line("%s - %s" % (", ".join(track["artists"]),
+                                    track["name"]), "new", t["text_secondary"])
+        if len(added) > 20:
+            self._line("... and %d more new" % (len(added) - 20), "",
+                       t["text_secondary"])
+
+    def _line(self, left, right, colour):
+        t = self.theme
+        row = ctk.CTkFrame(self.list, fg_color="transparent", height=26)
+        row.pack(fill="x", pady=1)
+        row.pack_propagate(False)
+        ctk.CTkLabel(row, text=right, anchor="e", font=theme_ui.font("caption"),
+                     text_color=colour).pack(side="right", padx=(8, 14))
+        ctk.CTkLabel(row, text=left, anchor="w", font=theme_ui.font("body"),
+                     text_color=t["text_secondary"]).pack(
+                         side="left", padx=(26, 0), fill="x", expand=True)
+
+
+def show_playlist_changes(parent, theme, report):
+    """Show what changed. Returns True if the new tracks should be fetched."""
+    return bool(PlaylistChanges(parent, theme, report).show())

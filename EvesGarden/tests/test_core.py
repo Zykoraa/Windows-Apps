@@ -25,6 +25,7 @@ import metadata
 import audio_files
 import loudness
 import lyrics
+import playlist_watch
 import smart_playlists
 import visualizers
 import spotify_import
@@ -2116,6 +2117,150 @@ class DownloadsGoWhereTheLinkPoints(unittest.TestCase):
                                  log_callback=lambda m: None)
         self.assertEqual(self.fetched, ["https://youtube.example/found"])
         self.assertEqual(len(self.searched), 1)
+
+
+def _watched(name, artist, url, playable=True):
+    return {"name": name, "artists": [artist], "spotify_url": url,
+            "is_playable": playable, "album": "", "duration_ms": 200000}
+
+
+class PlaylistDecay(unittest.TestCase):
+    """A Spotify playlist loses tracks and nothing tells you.
+
+    Two different things happen and they need telling apart: a track can go
+    grey where it is -- still listed, no longer playable -- or leave the
+    listing altogether.
+    """
+
+    def _recorded(self, *urls):
+        return {u: {"track_url": u, "title": u, "artist": "A", "path": None,
+                    "gone_at": None} for u in urls}
+
+    def test_a_track_that_went_grey_is_noticed(self):
+        changes = playlist_watch.compare(
+            self._recorded("u/a", "u/b"),
+            [_watched("A", "A", "u/a", playable=False),
+             _watched("B", "B", "u/b")])
+        self.assertEqual([(u, r) for u, _t, r in changes.gone],
+                         [("u/a", playlist_watch.UNAVAILABLE)])
+
+    def test_a_track_that_left_the_listing_is_noticed(self):
+        changes = playlist_watch.compare(
+            self._recorded("u/a", "u/b"), [_watched("B", "B", "u/b")])
+        self.assertEqual([(u, r) for u, _t, r in changes.gone],
+                         [("u/a", playlist_watch.REMOVED)])
+
+    def test_no_opinion_is_not_the_same_as_unplayable(self):
+        """is_playable is only sent when Spotify has something to say."""
+        track = _watched("A", "A", "u/a")
+        del track["is_playable"]
+        self.assertEqual(
+            playlist_watch.compare(self._recorded("u/a"), [track]).gone, [])
+
+    def test_something_already_known_to_be_gone_is_not_reported_twice(self):
+        """Otherwise every check announces the same losses again."""
+        recorded = self._recorded("u/a")
+        recorded["u/a"]["gone_at"] = 1234.0
+        self.assertEqual(playlist_watch.compare(recorded, []).gone, [])
+
+    def test_a_track_that_comes_back_is_reported_as_back(self):
+        recorded = self._recorded("u/a")
+        recorded["u/a"]["gone_at"] = 1234.0
+        changes = playlist_watch.compare(recorded, [_watched("A", "A", "u/a")])
+        self.assertEqual(changes.returned, ["u/a"])
+        self.assertEqual(changes.gone, [])
+
+    def test_new_tracks_are_the_ones_never_recorded(self):
+        changes = playlist_watch.compare(
+            self._recorded("u/a"),
+            [_watched("A", "A", "u/a"), _watched("B", "B", "u/b")])
+        self.assertEqual([t["name"] for t in changes.added], ["B"])
+
+    def test_a_track_with_no_url_cannot_be_followed(self):
+        track = _watched("A", "A", None)
+        changes = playlist_watch.compare({}, [track])
+        self.assertEqual(changes.added, [])
+        self.assertEqual(changes.still_here, [])
+
+    def test_entries_pair_tracks_with_the_files_they_became(self):
+        tracks = [_watched("A", "Artist", "u/a"), _watched("B", "Artist", "u/b")]
+        entries = playlist_watch.entries_for(tracks, ["C:/a.mp3", None])
+        self.assertEqual(entries[0]["path"], "C:/a.mp3")
+        self.assertEqual(entries[0]["artist"], "Artist")
+        self.assertIsNone(entries[1]["path"])
+
+    def test_the_summary_leads_with_what_you_still_have(self):
+        both = [{"kept": True}, {"kept": True}]
+        self.assertIn("all of them", playlist_watch.summarise(both))
+        self.assertIn("1 of them",
+                      playlist_watch.summarise([{"kept": True},
+                                                {"kept": False}]))
+        self.assertNotIn("you have",
+                         playlist_watch.summarise([{"kept": False}]))
+        self.assertEqual(playlist_watch.summarise([]), "")
+
+
+class WatchedPlaylists(unittest.TestCase):
+    """The remembering half, which is what makes the noticing possible."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="eg-watched-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.ix = LibraryIndex(os.path.join(self.home, "t.db"))
+        self.addCleanup(self.ix.close)
+        self.pid = self.ix.create_playlist("Late night")
+        self.ix.watch_playlist(self.pid, "spotify", "abc", "Late night")
+
+    def _seen(self, *entries):
+        self.ix.record_seen(self.pid, [
+            {"url": u, "title": t, "artist": "A", "path": p}
+            for u, t, p in entries])
+
+    def test_a_playlist_remembers_where_it_came_from(self):
+        watched = self.ix.watched_playlists()
+        self.assertEqual(len(watched), 1)
+        self.assertEqual(watched[0]["remote_id"], "abc")
+        self.assertEqual(watched[0]["name"], "Late night")
+
+    def test_it_keeps_the_local_name_when_the_playlist_is_renamed(self):
+        self.ix.rename_playlist(self.pid, "Very late night")
+        self.assertEqual(self.ix.watched_playlists()[0]["name"],
+                         "Very late night")
+
+    def test_what_went_is_remembered_with_the_file_it_became(self):
+        self._seen(("u/a", "Song A", "C:/a.mp3"), ("u/b", "Song B", None))
+        self.assertEqual(self.ix.mark_gone(self.pid, ["u/a"], "unavailable"), 1)
+        gone = self.ix.vanished()
+        self.assertEqual(len(gone), 1)
+        self.assertEqual(gone[0]["title"], "Song A")
+        self.assertEqual(gone[0]["path"], "C:/a.mp3")
+        self.assertEqual(gone[0]["playlist"], "Late night")
+
+    def test_marking_the_same_loss_twice_changes_nothing(self):
+        self._seen(("u/a", "Song A", None))
+        self.assertEqual(self.ix.mark_gone(self.pid, ["u/a"], "removed"), 1)
+        self.assertEqual(self.ix.mark_gone(self.pid, ["u/a"], "removed"), 0)
+
+    def test_seeing_a_track_again_clears_the_loss(self):
+        self._seen(("u/a", "Song A", "C:/a.mp3"))
+        self.ix.mark_gone(self.pid, ["u/a"], "removed")
+        self.assertEqual(len(self.ix.vanished()), 1)
+        self._seen(("u/a", "Song A", None))
+        self.assertEqual(self.ix.vanished(), [])
+
+    def test_a_later_read_does_not_forget_the_file(self):
+        """Spotify has no idea where the download went; the snapshot does."""
+        self._seen(("u/a", "Song A", "C:/a.mp3"))
+        self._seen(("u/a", "Song A", None))
+        self.ix.mark_gone(self.pid, ["u/a"], "removed")
+        self.assertEqual(self.ix.vanished()[0]["path"], "C:/a.mp3")
+
+    def test_deleting_the_playlist_takes_its_history_with_it(self):
+        self._seen(("u/a", "Song A", None))
+        self.ix.mark_gone(self.pid, ["u/a"], "removed")
+        self.ix.delete_playlist(self.pid)
+        self.assertEqual(self.ix.vanished(), [])
+        self.assertEqual(self.ix.watched_playlists(), [])
 
 
 if __name__ == "__main__":
