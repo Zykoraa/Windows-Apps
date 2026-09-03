@@ -18,7 +18,11 @@ volume levelling, so a loudness-war master and a quiet remaster sit at the
 same level instead of sending you to the volume knob between tracks.
 
 No account or API key is needed to search and download. Connecting Spotify is
-optional and adds your own playlists and liked songs.
+optional and adds your own playlists and liked songs -- and then watches them.
+Spotify playlists lose tracks as licensing lapses, and nothing tells you: the
+playlist is just shorter than you remember and the name of the song is gone.
+This wrote down what was in it and kept the audio, so it can say what went,
+and that you still have it.
 
 ![icon](assets/icon.png)
 

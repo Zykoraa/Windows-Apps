@@ -139,7 +139,9 @@ jobs:
             Connecting Spotify is optional, and adds your own library on
             top. Import from Spotify, on the Playlists tab, brings your
             playlists and your liked songs across as real playlists here and
-            downloads whatever is missing. Playlists you follow but do not
+            downloads whatever is missing -- and then watches them. Spotify
+            playlists lose tracks as licensing lapses and nothing tells you;
+            this says what went, and whether you still have it. Playlists you follow but do not
             own cannot be read -- Spotify closed that to apps in 2024, so
             copy one into a playlist of your own to import it. Create a free
             app at
