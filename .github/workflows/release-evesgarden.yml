@@ -127,6 +127,10 @@ jobs:
             away -- track details come from Apple's iTunes catalogue, which
             needs no account.
 
+            Already have music? Ctrl+K, then Music folders, and point it at
+            wherever you keep it. MP3, FLAC, M4A, Opus, Ogg and WAV are all
+            read, including everything in subfolders.
+
             Connecting Spotify is optional, and adds your own library on
             top. Import from Spotify, on the Playlists tab, brings your
             playlists and your liked songs across as real playlists here and

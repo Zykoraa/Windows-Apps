@@ -1,9 +1,15 @@
 # Eve's Garden
 
-A Windows music player and downloader. It looks up track, album and artwork
-details, pulls the audio from YouTube, tags the result properly, and plays it
-back with gapless playback, a 10-band EQ, synced lyrics, 32 visualisers and
-Discord Rich Presence.
+A Windows music player and downloader. It plays the music you already have
+-- MP3, FLAC, M4A, Opus, Ogg and more, from wherever you keep it -- and
+fetches what you do not, looking up track, album and artwork details and
+tagging the result properly.
+
+Downloads keep the quality they were served at instead of being re-encoded
+into something smaller and worse. Playback is gapless, with crossfade, a
+10-band EQ, synced lyrics, nine visualisers and Discord Rich Presence -- and
+volume levelling, so a loudness-war master and a quiet remaster sit at the
+same level instead of sending you to the volume knob between tracks.
 
 No account or API key is needed to search and download. Connecting Spotify is
 optional and adds your own playlists and liked songs.
