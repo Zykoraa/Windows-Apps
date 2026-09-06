@@ -80,6 +80,7 @@ import dialogs
 import metadata
 import palette
 import motion
+import radio as radio_source
 import ui_widgets
 import recycle
 from discover import Discover
@@ -300,6 +301,13 @@ class App(ctk.CTk):
 
         self.dl_visible = False
         self.dl_overlay = None
+        self.radio_visible = False
+        self.radio_overlay = None
+        self.radio = radio_source.RadioBrowser()
+        self.radio_favourites = radio_source.Favourites(self.settings)
+        self.radio_results = []
+        self._radio_timer = None
+        self._radio_station = None
         # "192" was the default this app wrote for itself, never a choice
         # anybody made in a dialog -- there has never been one. Re-encoding
         # a 160kbps Opus stream into a 192kbps MP3 makes a copy worse than
@@ -518,6 +526,7 @@ class App(ctk.CTk):
             ("<Up>", volume(0.05)), ("<Down>", volume(-0.05)),
             ("<m>", self._toggle_mute),
             ("<v>", self.toggle_now_playing_overlay),
+            ("<r>", self.open_radio),
             ("<s>", self.toggle_shuffle), ("<r>", self.toggle_repeat),
             ("<n>", self.toggle_now_playing_overlay),
             ("<l>", self.like_now_playing),
@@ -552,6 +561,7 @@ class App(ctk.CTk):
             ("Add music", "Search Spotify and download", self.open_downloader),
             ("Visualiser", "Open Now Playing, where the spectrum is",
              self.toggle_now_playing_overlay),
+            ("Radio", "Live stations, nothing downloaded", self.open_radio),
             ("Up next", "Show the queue", self.toggle_queue),
             ("Shuffle", "Toggle shuffle", self.toggle_shuffle),
             ("Repeat", "Toggle repeat", self.toggle_repeat),
@@ -616,6 +626,8 @@ class App(ctk.CTk):
             self.close_setup()
         elif getattr(self, "dl_visible", False):
             self.close_downloader()
+        elif getattr(self, "radio_visible", False):
+            self.close_radio()
         elif getattr(self, "np_overlay_visible", False):
             self.toggle_now_playing_overlay()
         elif self.library_filter:
@@ -926,6 +938,12 @@ class App(ctk.CTk):
             corner_radius=theme_ui.RADIUS_PILL, height=36, width=132,
             font=theme_ui.font("body_med"))
         self.nav_dl_btn.pack(side="left", padx=6)
+
+        self.nav_radio_btn = ctk.CTkButton(
+            self.library_actions, text="Radio", command=self.open_radio,
+            corner_radius=theme_ui.RADIUS_PILL, height=36, width=92,
+            font=theme_ui.font("body_med"))
+        self.nav_radio_btn.pack(side="left", padx=6)
 
         self.new_pl_btn = ctk.CTkButton(
             self.library_actions, text="+  New",
@@ -1242,6 +1260,8 @@ class App(ctk.CTk):
     def toggle_now_playing_overlay(self, event=None):
         if getattr(self, "dl_visible", False):
             self.close_downloader()
+        if getattr(self, "radio_visible", False):
+            self.close_radio()
         if hasattr(self, 'np_overlay_visible') and self.np_overlay_visible:
             self._slide_out(self.np_overlay)
             self.np_overlay_visible = False
@@ -1306,6 +1326,8 @@ class App(ctk.CTk):
             return
 
         # One overlay at a time, so panels never stack on each other.
+        if getattr(self, "radio_visible", False):
+            self.close_radio()
         if getattr(self, "np_overlay_visible", False):
             self.toggle_now_playing_overlay()
 
@@ -1319,6 +1341,278 @@ class App(ctk.CTk):
         if getattr(self, "dl_overlay", None) is not None:
             self._slide_out(self.dl_overlay)
         self.dl_visible = False
+
+    # ===================== RADIO =====================
+
+    def open_radio(self):
+        """Show the radio panel, building it the first time."""
+        if getattr(self, "radio_overlay", None) is None:
+            self.radio_overlay = ctk.CTkFrame(self.main_area, corner_radius=0,
+                                              fg_color=self.theme["bg"])
+            self.build_radio_view(self.radio_overlay)
+
+        if self.radio_visible:
+            self.close_radio()
+            return
+
+        # One overlay at a time, so panels never stack on each other.
+        if getattr(self, "dl_visible", False):
+            self.close_downloader()
+        if getattr(self, "np_overlay_visible", False):
+            self.toggle_now_playing_overlay()
+
+        self._slide_in(self.radio_overlay)
+        self.radio_visible = True
+        self.radio_entry.focus_set()
+        self._render_radio_default()
+
+    def close_radio(self):
+        if getattr(self, "radio_overlay", None) is not None:
+            self._slide_out(self.radio_overlay)
+        self.radio_visible = False
+
+    def _radio_alive(self):
+        panel = getattr(self, "radio_overlay", None)
+        try:
+            return panel is not None and panel.winfo_exists()
+        except Exception:
+            return False
+
+    def build_radio_view(self, parent):
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.pack(fill="both", expand=True)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(2, weight=1)
+        self.radio_frame = frame
+
+        header = ctk.CTkFrame(frame, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=36, pady=(22, 6))
+        self.radio_heading = ctk.CTkLabel(header, text="Radio",
+                                          font=theme_ui.font("display"))
+        self.radio_heading.pack(side="left")
+        self.radio_close_btn = ctk.CTkButton(
+            header, text="Back to library", width=150, height=36,
+            corner_radius=theme_ui.RADIUS_PILL,
+            font=theme_ui.font("body_med"), command=self.close_radio)
+        self.radio_close_btn.pack(side="right")
+        self.radio_hint = ctk.CTkLabel(
+            header, text="Live stations. Nothing is downloaded.",
+            font=theme_ui.font("caption"))
+        self.radio_hint.pack(side="right", padx=16)
+
+        self.radio_search_row = ctk.CTkFrame(
+            frame, height=52, corner_radius=theme_ui.RADIUS_PILL,
+            fg_color=self.theme["surface"])
+        self.radio_search_row.grid(row=1, column=0, padx=36, pady=(6, 10),
+                                   sticky="ew")
+        self.radio_search_row.pack_propagate(False)
+        ui_widgets.GlyphButton(self.radio_search_row, self.theme, "search",
+                               size=34, background=self.theme["surface"]).pack(
+                                   side="left", padx=(14, 4))
+        self.radio_entry = ctk.CTkEntry(
+            self.radio_search_row, border_width=0, fg_color="transparent",
+            font=theme_ui.font("body"),
+            placeholder_text="Station, genre or country")
+        self.radio_entry.pack(side="left", fill="both", expand=True,
+                              padx=(0, 20))
+        self.radio_entry.bind("<KeyRelease>", self._on_radio_key)
+
+        self.radio_results_frame = ctk.CTkScrollableFrame(
+            frame, corner_radius=theme_ui.RADIUS, label_text="Stations",
+            fg_color=self.theme["surface"])
+        self.radio_results_frame.grid(row=2, column=0, padx=36, pady=(6, 18),
+                                      sticky="nsew")
+
+    # --------------------------------------------------------- radio search
+
+    def _on_radio_key(self, _event=None):
+        if self._radio_timer:
+            try:
+                self.after_cancel(self._radio_timer)
+            except Exception:
+                pass
+        self._radio_timer = self._safe_after(350, self.run_radio_search)
+
+    def run_radio_search(self):
+        query = self.radio_entry.get().strip()
+        if not query:
+            self._render_radio_default()
+            return
+        self._radio_message("Searching...")
+
+        def work():
+            found = self.radio.search(query)
+            self._safe_after(0, self._render_radio, found,
+                             "Nothing matching %s." % query)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_radio_default(self):
+        """An empty box shows what you kept, then what is popular."""
+        saved = self.radio_favourites.all()
+        if saved:
+            self._render_radio(saved, "", heading="Saved stations")
+        else:
+            self._radio_message("Finding stations...")
+
+        def work():
+            found = self.radio.popular()
+            self._safe_after(0, self._append_popular, found, bool(saved))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _append_popular(self, stations, had_saved):
+        if not self._radio_alive():
+            return
+        if not had_saved:
+            self._render_radio(stations, "No stations came back. Check the "
+                                         "connection and try again.",
+                               heading="Popular")
+            return
+        kept = {s.get("url") for s in self.radio_favourites.all()}
+        rest = [s for s in stations if s["url"] not in kept]
+        if not rest:
+            return
+        self._radio_heading("Popular")
+        for station in rest:
+            self._radio_row(station)
+        self.radio_results = self.radio_favourites.all() + rest
+
+    def _radio_message(self, text):
+        if not self._radio_alive():
+            return
+        for widget in self.radio_results_frame.winfo_children():
+            widget.destroy()
+        ctk.CTkLabel(self.radio_results_frame, text=text, justify="center",
+                     wraplength=460, font=theme_ui.font("body"),
+                     text_color=self.theme["text_secondary"]).pack(
+                         pady=64, padx=30)
+
+    def _radio_heading(self, text):
+        ctk.CTkLabel(self.radio_results_frame, text=text, anchor="w",
+                     font=theme_ui.font("heading"),
+                     text_color=self.theme["text_secondary"]).pack(
+                         anchor="w", padx=12, pady=(10, 2))
+
+    def _render_radio(self, stations, empty_message, heading=None):
+        if not self._radio_alive():
+            return
+        self.radio_results = list(stations)
+        for widget in self.radio_results_frame.winfo_children():
+            widget.destroy()
+        if not stations:
+            self._radio_message(empty_message or "Nothing found.")
+            return
+        if heading:
+            self._radio_heading(heading)
+        for station in stations:
+            self._radio_row(station)
+
+    def _radio_row(self, station):
+        row = ctk.CTkFrame(self.radio_results_frame, fg_color="transparent",
+                           corner_radius=theme_ui.RADIUS, height=58)
+        row.pack(fill="x", padx=4, pady=2)
+        row.pack_propagate(False)
+
+        art = ctk.CTkLabel(row, text="", width=42, height=42, corner_radius=5)
+        art.pack(side="left", padx=(8, 12))
+        if station.get("favicon"):
+            self.discover.fetch_cover(
+                station["favicon"], 42,
+                lambda img, lbl=art: self._safe_after(
+                    0, self._set_discover_art, lbl, img))
+        else:
+            art.configure(text=(station["name"] or "?")[:1].upper(),
+                          font=theme_ui.font("title"),
+                          text_color=self.theme["text_secondary"])
+
+        kept = self.radio_favourites.has(station)
+        keep = ui_widgets.GlyphButton(
+            row, self._row_glyph_theme(
+                accent=self.theme["accent"] if kept else None),
+            "heart", size=30)
+        # Assigned rather than passed: the callback needs the button it is
+        # on, to repaint it, and that does not exist until it is built.
+        keep.command = lambda s=station, b=keep: self._toggle_station(s, b)
+        keep.pack(side="right", padx=(6, 10))
+
+        play = ui_widgets.GlyphButton(
+            row, self._row_glyph_theme(), "play", size=30,
+            command=lambda s=station: self.play_station(s))
+        play.pack(side="right", padx=4)
+
+        box = ctk.CTkFrame(row, fg_color="transparent")
+        box.pack(side="left", fill="both", expand=True)
+        ctk.CTkLabel(box, text=station["name"], anchor="w", justify="left",
+                     font=theme_ui.font("body_med"),
+                     text_color=self.theme["text"]).pack(anchor="w",
+                                                         pady=(10, 0))
+        ctk.CTkLabel(box, text=radio_source.describe(station), anchor="w",
+                     justify="left", font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+    def play_station(self, station):
+        """Open a station. There is nothing to resolve and nothing to keep."""
+        self._radio_station = station
+        self._streaming_track = None
+        self._set_now_playing_text(station["name"], "Radio  \u00b7  live")
+        self.log("Tuning in to %s..." % station["name"])
+
+        def work():
+            ok = self.player.load_stream(station["url"], duration=0.0,
+                                         title=station["name"])
+            self._safe_after(0, self._station_started, station, ok)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _station_started(self, station, ok):
+        if not ok:
+            self._radio_station = None
+            self.log("Could not open %s: %s"
+                     % (station["name"],
+                        self.player.last_error or "the station did not answer"))
+            # Put back whatever was in the bar, rather than leaving the
+            # name of a station that is not playing.
+            row = self._now_playing_row or {}
+            self._set_now_playing_text(row.get("title", "No track selected"),
+                                       row.get("artist", ""))
+            return
+        self.player.play()
+        self.play_btn.set_glyph("pause")
+        # A station is not a track: no path, no album, nothing to like.
+        self._now_playing_row = {"path": None, "title": station["name"],
+                                 "artist": "Radio", "album": "",
+                                 "cover_url": station.get("favicon")}
+        self._show_station_art(station)
+        self._push_discord(playing=True)
+        self.log("Playing %s." % station["name"])
+
+    def _show_station_art(self, station):
+        """A station's logo in the bar, or a placeholder rather than the
+        cover of whatever was playing before it."""
+        url = station.get("favicon")
+        if not url:
+            self._apply_album_art(None, None, None)
+            return
+
+        def arrived(image):
+            try:
+                thumb = image.resize((64, 64), Image.Resampling.LANCZOS)
+                self._safe_after(0, self._apply_album_art, thumb, image, None)
+            except Exception:
+                self._safe_after(0, self._apply_album_art, None, None, None)
+
+        self.discover.fetch_cover(url, 400, arrived)
+
+    def _toggle_station(self, station, button):
+        kept = self.radio_favourites.toggle(station)
+        try:
+            button.set_palette(self._row_glyph_theme(
+                accent=self.theme["accent"] if kept else None))
+        except Exception:
+            pass
+        self.log("%s %s." % (station["name"],
+                             "saved" if kept else "removed from your stations"))
 
     def build_eq_overlay(self):
         # EQ Frame (Overlay/Hidden)
@@ -2217,6 +2511,8 @@ class App(ctk.CTk):
             ("queue_panel", "surface"),
             ("results_frame", "surface"), ("jobs_frame", "surface"),
             ("dl_search_row", "surface"),
+            ("radio_search_row", "surface"),
+            ("radio_results_frame", "surface"), ("radio_overlay", "bg"),
         ):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -2256,7 +2552,8 @@ class App(ctk.CTk):
                                  dropdown_hover_color=t["surface_hover"],
                                  text_color=t["text"])
 
-        for name in ("nav_dl_btn", "eq_toggle_btn", "viz_toggle_btn",
+        for name in ("nav_dl_btn", "nav_radio_btn", "eq_toggle_btn",
+                     "viz_toggle_btn",
                      "repair_btn", "dedupe_btn", "new_pl_btn", "queue_btn"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -2874,7 +3171,8 @@ class App(ctk.CTk):
         for masthead, strip in (
                 ("word", True), ("mark", True), ("none", True),
                 ("none", False)):
-            cost = (base + (strip_w if strip else menu_w) + width(self.nav_dl_btn)
+            cost = (base + (strip_w if strip else menu_w)
+                    + width(self.nav_dl_btn) + width(self.nav_radio_btn)
                     + (mark_w if masthead in ("mark", "word") else 0)
                     + (word_w if masthead == "word" else 0))
             if cost <= available:
@@ -4232,7 +4530,12 @@ class App(ctk.CTk):
             self._discord_tick += 1
             if self._discord_tick % 150 == 0:
                 self._push_discord()
-            self.time_total.configure(text=fmt_time(self.player.get_duration()))
+            total = self.player.get_duration()
+            # A station has no end: "0:00" reads as a broken track rather
+            # than as the point of the thing.
+            self.time_total.configure(
+                text="Live" if self.player.is_streaming and not total
+                else fmt_time(total))
 
             if self.parsed_lyrics:
                 new_idx = -1

@@ -1,0 +1,12 @@
+--- gui.py
++++ gui.py
+@@ -3247,7 +3544,8 @@ class App(ctk.CTk):
+         if None in (head, word, mark, tabs, actions):
+             return
+         for name in ("sort_dropdown", "new_pl_btn", "import_pl_btn",
+-                     "dedupe_btn", "repair_btn", "nav_dl_btn", "view_menu",
++                     "dedupe_btn", "repair_btn", "nav_dl_btn",
++                     "nav_radio_btn", "view_menu",
+                      "lib_search_entry", "brand"):
+             if getattr(self, name, None) is None:
+                 return

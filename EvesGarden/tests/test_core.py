@@ -23,6 +23,7 @@ from play_queue import PlayQueue
 import colorsys
 import downloader
 import metadata
+import radio
 import discover
 import audio_files
 import loudness
@@ -625,10 +626,14 @@ class FakeSession:
         self.explode = explode
         self.calls = 0
         self.params = {}
+        self.headers = {}
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, headers=None):
+        # headers, because the radio directory requires a User-Agent and the
+        # provider that talks to it sends one.
         self.calls += 1
         self.params = dict(params or {})
+        self.headers = dict(headers or {})
         if self.explode:
             raise IOError("no network")
         return FakeResponse(self.payload)
@@ -2931,3 +2936,184 @@ class AlreadyOwned(unittest.TestCase):
         for name in ("_owned_fingerprints", "_already_owned"):
             setattr(stub, name, gui.App.__dict__[name].__get__(stub, gui.App))
         self.assertFalse(stub._already_owned(self.track("Gravity", "John Mayer")))
+
+
+ITEM = {"stationuuid": "uuid-1", "name": "SomaFM Groove Salad",
+        "url": "https://example.test/gs.pls",
+        "url_resolved": "https://ice6.somafm.com/groovesalad-128-mp3",
+        "tags": "ambient,chillout,downtempo", "country": "United States",
+        "codec": "MP3", "bitrate": 128, "favicon": "https://x/icon.png",
+        "homepage": "https://somafm.com"}
+
+
+class RadioDirectory(unittest.TestCase):
+    """Reading the station directory, without one."""
+
+    def provider(self, payload, explode=False):
+        session = FakeSession(payload, explode=explode)
+        return radio.RadioBrowser(session=session, host="test.invalid"), session
+
+    def test_a_station_maps_to_what_the_player_needs(self):
+        rb, _ = self.provider([ITEM])
+        station = rb.search("soma")[0]
+        self.assertEqual(station["source"], "radio")
+        self.assertEqual(station["name"], "SomaFM Groove Salad")
+        # url_resolved, not url: the plain one can be a .pls the directory
+        # has already followed for us.
+        self.assertEqual(station["url"],
+                         "https://ice6.somafm.com/groovesalad-128-mp3")
+        self.assertEqual(station["tags"], ["ambient", "chillout", "downtempo"])
+        self.assertEqual(station["bitrate"], 128)
+
+    def test_an_entry_with_no_url_is_not_a_station(self):
+        rb, _ = self.provider([{"name": "Nowhere"}, dict(ITEM)])
+        self.assertEqual(len(rb.search("x")), 1)
+
+    def test_an_entry_with_no_name_is_not_a_station(self):
+        rb, _ = self.provider([dict(ITEM, name="", stationuuid="u2"), dict(ITEM)])
+        self.assertEqual(len(rb.search("x")), 1)
+
+    def test_the_same_station_twice_is_one_row(self):
+        # The directory carries one entry per submitter, and one per bitrate
+        # variant, so a search for a well-known station is mostly repeats.
+        low = dict(ITEM, stationuuid="u-low", bitrate=64)
+        high = dict(ITEM, stationuuid="u-high", bitrate=320)
+        rb, _ = self.provider([low, high, dict(ITEM)])
+        found = rb.search("soma")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["bitrate"], 320)
+
+    def test_a_word_with_no_station_of_that_name_is_tried_as_a_genre(self):
+        # "jazz" finding nothing because no station is called Jazz is a poor
+        # answer when hundreds are tagged with it.
+        calls = []
+
+        class Session:
+            def get(self, url, params=None, timeout=None, headers=None):
+                calls.append(dict(params or {}))
+                payload = [] if "name" in (params or {}) else [ITEM]
+                return FakeResponse(payload)
+
+        rb = radio.RadioBrowser(session=Session(), host="test.invalid")
+        self.assertEqual(len(rb.search("jazz")), 1)
+        self.assertIn("name", calls[0])
+        self.assertIn("tag", calls[1])
+
+    def test_an_empty_query_never_asks(self):
+        rb, session = self.provider([ITEM])
+        self.assertEqual(rb.search("  "), [])
+        self.assertEqual(rb.by_tag(""), [])
+        self.assertEqual(session.calls, 0)
+
+    def test_a_dead_directory_is_an_empty_list_not_a_crash(self):
+        rb, _ = self.provider([ITEM], explode=True)
+        self.assertEqual(rb.search("soma"), [])
+        self.assertEqual(rb.popular(), [])
+
+    def test_nonsense_from_the_directory_is_survivable(self):
+        for payload in ({"not": "a list"}, [None], ["string"], []):
+            rb, _ = self.provider(payload)
+            self.assertEqual(rb.search("x"), [])
+
+    def test_repeat_searches_do_not_ask_again(self):
+        rb, session = self.provider([ITEM])
+        rb.search("soma")
+        rb.search("soma")
+        self.assertEqual(session.calls, 1)
+
+    def test_the_client_identifies_itself(self):
+        seen = {}
+
+        class Session:
+            def get(self, url, params=None, timeout=None, headers=None):
+                seen.update(headers or {})
+                return FakeResponse([ITEM])
+
+        radio.RadioBrowser(session=Session(), host="test.invalid").search("x")
+        # A condition of using the directory, not decoration.
+        self.assertIn("EvesGarden", seen.get("User-Agent", ""))
+
+    def test_a_mirror_is_chosen_when_none_was_given(self):
+        class Session:
+            def get(self, url, params=None, timeout=None, headers=None):
+                if url.endswith("/json/servers"):
+                    return FakeResponse([{"name": "de1.api.radio-browser.info"},
+                                         {"name": "at1.api.radio-browser.info"}])
+                return FakeResponse([ITEM])
+
+        rb = radio.RadioBrowser(session=Session())
+        self.assertIn("radio-browser.info", rb.base())
+
+    def test_an_unreachable_directory_still_yields_a_mirror(self):
+        rb = radio.RadioBrowser(session=FakeSession([], explode=True))
+        self.assertTrue(rb.base().startswith("https://"))
+
+    def test_the_description_says_what_the_station_is(self):
+        line = radio.describe(radio._as_station(ITEM))
+        for part in ("128 kbps", "MP3", "United States", "ambient"):
+            self.assertIn(part, line)
+
+    def test_a_station_with_nothing_to_say_describes_as_nothing(self):
+        bare = radio._as_station(dict(ITEM, bitrate=0, codec="", country="",
+                                      tags=""))
+        self.assertEqual(radio.describe(bare), "")
+
+
+class RadioFavourites(unittest.TestCase):
+    """The stations you keep, across restarts."""
+
+    def store(self):
+        class FakeSettings:
+            def __init__(self): self.data = {}
+            def get(self, key, default=None): return self.data.get(key, default)
+            def set(self, key, value): self.data[key] = value
+        return radio.Favourites(FakeSettings())
+
+    def station(self, name="Groove Salad", url="https://x/gs"):
+        return {"source": "radio", "id": name, "name": name, "url": url,
+                "tags": [], "country": "", "codec": "MP3", "bitrate": 128,
+                "favicon": "", "homepage": ""}
+
+    def test_keeping_one_and_finding_it_again(self):
+        keep = self.store()
+        self.assertFalse(keep.has(self.station()))
+        self.assertTrue(keep.add(self.station()))
+        self.assertTrue(keep.has(self.station()))
+        self.assertEqual(len(keep.all()), 1)
+
+    def test_keeping_the_same_station_twice_keeps_it_once(self):
+        keep = self.store()
+        keep.add(self.station())
+        self.assertFalse(keep.add(self.station()))
+        self.assertEqual(len(keep.all()), 1)
+
+    def test_toggling_says_where_it_ended_up(self):
+        keep = self.store()
+        self.assertTrue(keep.toggle(self.station()))
+        self.assertFalse(keep.toggle(self.station()))
+        self.assertEqual(keep.all(), [])
+
+    def test_a_station_is_kept_whole_so_it_plays_without_the_directory(self):
+        keep = self.store()
+        keep.add(self.station())
+        # The URL is the thing that matters, and we already have it.
+        self.assertEqual(keep.all()[0]["url"], "https://x/gs")
+
+    def test_removing_one_leaves_the_others(self):
+        keep = self.store()
+        keep.add(self.station("A", "https://x/a"))
+        keep.add(self.station("B", "https://x/b"))
+        keep.remove(self.station("A", "https://x/a"))
+        self.assertEqual([s["name"] for s in keep.all()], ["B"])
+
+    def test_a_hand_edited_settings_file_cannot_break_it(self):
+        keep = self.store()
+        keep._settings.set(radio.Favourites.KEY, "not a list")
+        self.assertEqual(keep.all(), [])
+        keep._settings.set(radio.Favourites.KEY, [None, {"no": "url"}, 7])
+        self.assertEqual(keep.all(), [])
+
+    def test_a_station_with_no_url_is_never_kept(self):
+        keep = self.store()
+        self.assertFalse(keep.add({"name": "Broken"}))
+        self.assertEqual(keep.all(), [])

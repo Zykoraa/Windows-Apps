@@ -738,6 +738,29 @@ def _g_download(c, cx, cy, s, col, w):
                           width=w, capstyle=tk.ROUND)]
 
 
+def _g_heart(c, cx, cy, s, col, w):
+    """Kept or not kept. Outline, so set_active can fill it with the accent."""
+    pts = [(12, 19), (5.5, 12.2), (5.5, 8.6), (8.4, 6.2), (12, 8.2),
+           (15.6, 6.2), (18.5, 8.6), (18.5, 12.2)]
+    return [c.create_polygon(_pts(pts, cx, cy, s), fill="", outline=col,
+                             width=w, smooth=True, joinstyle=tk.ROUND)]
+
+
+def _g_radio(c, cx, cy, s, col, w):
+    """A broadcast mast: the one thing here that is not a file."""
+    return [c.create_line(_pts([(12, 19), (12, 11)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND),
+            c.create_oval(_pts([(10, 8), (14, 12)], cx, cy, s)[0],
+                          _pts([(10, 8), (14, 12)], cx, cy, s)[1],
+                          _pts([(10, 8), (14, 12)], cx, cy, s)[2],
+                          _pts([(10, 8), (14, 12)], cx, cy, s)[3],
+                          outline=col, width=w),
+            c.create_line(_pts([(7.5, 6), (6, 10)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND),
+            c.create_line(_pts([(16.5, 6), (18, 10)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND)]
+
+
 def _g_check(c, cx, cy, s, col, w):
     """A tick: this one is already in the library."""
     return [c.create_line(_pts([(6, 12.5), (10.5, 17), (18, 7.5)], cx, cy, s),
@@ -749,6 +772,8 @@ GLYPHS = {
     "close": _g_close,
     "download": _g_download,
     "check": _g_check,
+    "heart": _g_heart,
+    "radio": _g_radio,
     "search": _g_search,
     "leaf": _g_leaf,
     "play": _g_play,

@@ -32,6 +32,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WALK_TIMEOUT_MS = 90_000
 
 
+class OfflineDirectory:
+    """Canned stations, so the walk does not depend on radio-browser."""
+
+    STATION = {"source": "radio", "id": "uuid-1", "name": "Offline FM",
+               "url": "https://example.test/stream", "tags": ["ambient"],
+               "country": "Nowhere", "codec": "MP3", "bitrate": 128,
+               "favicon": "", "homepage": ""}
+
+    def base(self):
+        return "https://test.invalid"
+
+    def search(self, query, limit=40):
+        return [dict(self.STATION, name="Offline FM for %s" % query)]
+
+    def popular(self, limit=40):
+        return [dict(self.STATION, id="p%d" % i, name="Popular %d" % i)
+                for i in range(3)]
+
+    def by_tag(self, tag, limit=40):
+        return self.popular(limit)
+
+
 class OfflineCatalogue:
     """Stands in for the keyless metadata provider.
 
@@ -173,6 +195,46 @@ class SurfaceWalk:
         # Searching an artist's name used to answer with their loose tracks
         # only, so there was no way through to an album. Walk the whole path:
         # the results, the discography, one album opened, and back again.
+        # Radio is the one thing here that is neither a file nor something
+        # to fetch: a URL ffmpeg opens. The panel is walked, but no station
+        # is opened -- that would be a real connection to a real broadcaster.
+        self.mark("open radio")
+        app.open_radio()
+        yield from self._until("the radio panel never listed anything",
+                               lambda: len(self._labels(app.radio_results_frame)) > 1)
+        assert app.radio_visible, "the radio panel did not open"
+
+        self.mark("radio search")
+        app.radio_entry.delete(0, "end")
+        app.radio_entry.insert(0, "ambient")
+        app.run_radio_search()
+        yield from self._until(
+            "the radio search never answered",
+            lambda: any("ambient" in t for t in
+                        self._labels(app.radio_results_frame)))
+
+        self.mark("keeping a station, and dropping it again")
+        station = app.radio_results[0]
+        assert not app.radio_favourites.has(station)
+        keep_btn = self._button(app.radio_results_frame, "")
+        app._toggle_station(station, keep_btn)
+        assert app.radio_favourites.has(station), "the station was not kept"
+        app._toggle_station(station, keep_btn)
+        assert not app.radio_favourites.has(station), "the station stayed kept"
+        yield 160
+
+        self.mark("an empty box goes back to the listing")
+        app.radio_entry.delete(0, "end")
+        app.run_radio_search()
+        yield from self._until(
+            "the radio panel did not come back",
+            lambda: len(self._labels(app.radio_results_frame)) > 1)
+
+        self.mark("close radio")
+        app.close_radio()
+        yield 320
+        assert not app.radio_visible
+
         self.mark("open downloader for search")
         app.open_downloader()
         yield 400
@@ -892,6 +954,9 @@ class Smoke(unittest.TestCase):
             app.discover.fallback = OfflineCatalogue()
             app.discover.prefetch = lambda track: None
             app.catalogue = OfflineCatalogue()
+            # The station directory is a live third-party service; the walk
+            # exercises the panel, not their uptime.
+            app.radio = OfflineDirectory()
             walk = SurfaceWalk(gui, app)
             walk.run()
             noise = sys.stderr.getvalue()

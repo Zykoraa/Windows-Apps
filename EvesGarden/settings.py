@@ -29,6 +29,9 @@ DEFAULTS = {
     "download_quality": "192",
     "discord_presence": True,
     "discord_client_id": "",
+    # Stations are kept whole rather than by id, so one you have saved still
+    # plays when the directory is unreachable or has withdrawn the entry.
+    "radio_favourites": [],
 }
 
 

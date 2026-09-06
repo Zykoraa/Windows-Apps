@@ -69,6 +69,12 @@ editions folded into one row. Take a whole album in a click, or open it and
 pick individual tracks. Works without a Spotify account — the keyless
 provider browses too, so this is not gated behind setup.
 
+**Radio** — live stations from the community-run radio-browser directory:
+no key, no account. Search by station, genre or country, keep the ones you
+like, and they are stored whole so a kept station still plays when the
+directory is unreachable. Nothing is downloaded, and nothing is reported
+back about what you listen to.
+
 **Playback** — a serial cascade of RBJ peaking biquads for the EQ (unity at
 0 dB, so "flat" really is flat), soft-clipping to round off peaks, volume,
 seek, shuffle, repeat, and resume where you left off.
@@ -170,6 +176,7 @@ and the base64 copy embedded in `app_icon.py`.
 | `library_view.py` | Songs / Albums / Artists browser |
 | `downloader.py` | Spotify metadata, YouTube sourcing, tagging |
 | `discover.py` | Search, artist and album browsing, preview streams |
+| `radio.py` | The station directory, and the stations you keep |
 | `metadata.py` | The keyless catalogue, used when Spotify is not set up |
 | `download_manager.py` | Download queue with per-track state |
 | `player_engine.py` | Decoding, EQ, playback |
