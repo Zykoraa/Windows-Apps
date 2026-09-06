@@ -2716,8 +2716,8 @@ class App(ctk.CTk):
         row = getattr(self, "_now_playing_row", None) or {}
         if not row:
             return
-        self.open_album_of(row.get("title"), row.get("artist"),
-                           row.get("album"))
+        self.browse_album(row.get("title"), row.get("artist"),
+                          row.get("album"))
 
     def _browse_playing_artist(self):
         """The discography of whoever is in the bar."""
@@ -4576,8 +4576,14 @@ class App(ctk.CTk):
         for album in remaining:
             self._album_row(album)
 
-    def open_album_of(self, title, artist, album):
-        """Open the record a track came from, from its name alone."""
+    def browse_album(self, title, artist, album):
+        """Open the record a track came from, from its name alone.
+
+        Not open_album_of: LibraryView already has one of those, and it
+        means something else -- filtering the local library to an album you
+        already own, in the other argument order. This one goes out to the
+        catalogue.
+        """
         if not album:
             self.log("No album is recorded for %s." % (title or "this track"))
             return
