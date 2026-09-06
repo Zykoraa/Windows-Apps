@@ -50,3 +50,7 @@ EvesGarden/tests/__pycache__/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Rejected-hunk files from porting patches between the two builds.
+*.rej
+*.orig

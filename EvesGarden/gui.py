@@ -3172,7 +3172,9 @@ class App(ctk.CTk):
                 ("word", True), ("mark", True), ("none", True),
                 ("none", False)):
             cost = (base + (strip_w if strip else menu_w)
-                    + width(self.nav_dl_btn) + width(self.nav_radio_btn)
+                    + width(self.nav_dl_btn)
+                    + (width(self.nav_radio_btn)
+                       if getattr(self, "nav_radio_btn", None) else 0)
                     + (mark_w if masthead in ("mark", "word") else 0)
                     + (word_w if masthead == "word" else 0))
             if cost <= available:
