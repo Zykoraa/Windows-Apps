@@ -279,12 +279,15 @@ def get_spotify_playlist_tracks(sp, playlist_url, user_sp=None):
                     "browser, then paste the playlist link again."
                 ) from e
             raise SpotifyAuthError(
-                "That playlist could not be read even while signed in.\n\n"
-                "Playlists made by Spotify itself are blocked from the API, "
-                "and someone else's private or collaborative playlist is only "
-                "readable by an account it is shared with.\n\n"
-                "Your own playlists should work -- if this is one of yours, "
-                "tell me the link."
+                "That playlist could not be read, even while signed in.\n\n"
+                "Nearly always this means it belongs to another account. "
+                "Spotify serves a playlist's contents only to the account "
+                "that owns it, or one added to it as a collaborator -- "
+                "whether the playlist is public makes no difference.\n\n"
+                "Sign in as the account that owns it, or copy the tracks "
+                "into a playlist of your own and paste that instead.\n\n"
+                "Spotify's own playlists -- Discover Weekly and the like -- "
+                "are blocked from the API for everybody."
             ) from e
         raise
 

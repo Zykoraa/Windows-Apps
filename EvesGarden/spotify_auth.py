@@ -55,6 +55,12 @@ def _auth_manager(client_id, client_secret, config_dir, open_browser):
         scope=SCOPES,
         cache_path=cache_path(config_dir),
         open_browser=open_browser,
+        # Without this Spotify silently re-approves whoever the browser is
+        # already logged in as, so signing out and back in hands back the
+        # same account and there is no way to change it from inside the app.
+        # Only sign_in() opens a browser, and only that call needs asking --
+        # a token refresh never reaches the authorize URL at all.
+        show_dialog=open_browser,
     )
 
 

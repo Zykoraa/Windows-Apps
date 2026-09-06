@@ -250,10 +250,13 @@ class PlaylistPicker(ModalDialog):
             ctk.CTkLabel(
                 self.body, justify="left", wraplength=560, anchor="w",
                 font=theme_ui.font("caption"), text_color=t["text_secondary"],
-                text=("%d playlist%s you follow but do not own cannot be "
-                      "read: Spotify closed that to apps in 2024. Copying one "
-                      "into a playlist of your own makes it importable."
-                      % (len(blocked), "" if len(blocked) == 1 else "s"))
+                text=("%d playlist%s here %s not owned by you and "
+                      "cannot be read: Spotify serves a playlist's contents "
+                      "only to its owner or a collaborator, however public "
+                      "it is. Sign in as that account, or copy one into a "
+                      "playlist of your own."
+                      % (len(blocked), "" if len(blocked) == 1 else "s",
+                         "is" if len(blocked) == 1 else "are"))
             ).pack(fill="x", pady=(10, 0))
         if not playlists:
             ctk.CTkLabel(self.list, font=theme_ui.font("body"),

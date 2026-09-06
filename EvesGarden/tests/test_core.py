@@ -32,6 +32,7 @@ import playlist_watch
 import smart_playlists
 import visualizers
 import spotify_import
+import spotify_auth
 import themes
 import ui_widgets
 
@@ -1049,6 +1050,32 @@ class PastedPlaylistLink(unittest.TestCase):
         got = downloader.get_spotify_playlist_tracks(
             None, "https://open.spotify.com/collection/tracks", user_sp=sp)
         self.assertEqual(len(got), 2)
+
+
+class SpotifyAccountSwitching(unittest.TestCase):
+    """Signing in has to be able to reach a different account.
+
+    Spotify re-approves whoever the browser is already logged in as, without
+    asking, unless the authorize URL says otherwise. Signing out and back in
+    therefore handed back the same account every time, and an account with a
+    second one alongside it could not be changed from inside the app at all.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def _url(self, open_browser):
+        return spotify_auth._auth_manager(
+            "id", "secret", self.dir, open_browser).get_authorize_url()
+
+    def test_signing_in_asks_which_account(self):
+        self.assertIn("show_dialog=True", self._url(True))
+
+    def test_a_refresh_does_not_ask(self):
+        # Refreshing a cached token is not interactive and never reaches the
+        # authorize URL; asking there would be a prompt nobody asked for.
+        self.assertNotIn("show_dialog", self._url(False))
 
 
 class SpotifyImportReading(unittest.TestCase):
