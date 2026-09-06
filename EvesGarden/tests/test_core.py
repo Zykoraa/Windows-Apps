@@ -32,6 +32,7 @@ import playlist_watch
 import smart_playlists
 import visualizers
 import spotify_import
+import library_view
 import spotify_auth
 import themes
 import ui_widgets
@@ -2871,6 +2872,59 @@ class NowPlayingGeometry(unittest.TestCase):
             L = gui.np_layout(w, h, 52)
             self.assertGreater(L["cover"], 0)
             self.assertGreater(L["lyrics"][2], 0)
+
+
+class VisibleRows(unittest.TestCase):
+    """Which rows the library list bothers to build.
+
+    A track row is eight CustomTkinter widgets and costs about 12ms, so a
+    483 track library spent over four seconds building rows to show eleven
+    of them -- and it grew with the library. Only what is on screen, plus a
+    buffer either side so a flick of the wheel lands on something drawn, is
+    built now. This is the arithmetic that decides, kept pure so the edges
+    can be checked without a display.
+    """
+
+    STRIDE = 58
+
+    def span(self, top, height=700, count=483):
+        return library_view.LibraryView.visible_range(
+            None, top, height, self.STRIDE, count)
+
+    def test_the_top_of_a_long_list_starts_at_the_top(self):
+        # Not at minus six, which is what the buffer alone would give.
+        first, last = self.span(0)
+        self.assertEqual(first, 0)
+        self.assertLess(last, 30)
+
+    def test_only_a_screenful_and_its_buffer_are_built(self):
+        first, last = self.span(10000)
+        built = last - first + 1
+        on_screen = 700 // self.STRIDE + 1
+        self.assertLessEqual(built, on_screen + 2 * library_view.BUFFER_ROWS + 1)
+        self.assertGreaterEqual(built, on_screen)
+
+    def test_the_window_follows_the_scroll(self):
+        self.assertLess(self.span(0)[1], self.span(10000)[0])
+
+    def test_the_end_of_the_list_is_not_run_past(self):
+        # Scrolled to the bottom, the buffer would ask for rows that are not
+        # there; index 488 of 483 would raise rather than draw nothing.
+        first, last = self.span(483 * self.STRIDE)
+        self.assertEqual(last, 482)
+        self.assertLessEqual(first, 482)
+
+    def test_scrolling_beyond_the_end_still_names_real_rows(self):
+        first, last = self.span(99999)
+        self.assertEqual((first, last), (482, 482))
+
+    def test_an_empty_list_asks_for_nothing(self):
+        first, last = self.span(0, count=0)
+        self.assertGreater(first, last)      # an empty range
+
+    def test_a_list_shorter_than_the_window_is_built_whole(self):
+        first, last = self.span(0, height=700, count=4)
+        self.assertEqual((first, last), (0, 3))
 
 
 class SpotifyRetryPolicy(unittest.TestCase):

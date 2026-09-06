@@ -33,6 +33,20 @@ import audio_files
 CHUNK = 12
 ROW_H = theme_ui.ROW_H
 ART = theme_ui.ROW_ART
+
+# Rows built above and below the part of the list you can actually see, so
+# a flick of the wheel lands on something already drawn rather than on a
+# gap that fills in afterwards.
+BUFFER_ROWS = 6
+
+# The gap a row leaves around itself, matching the pady it used to pack with.
+STRIDE_PAD = 2
+
+# How often the scroll position is looked at. A CustomTkinter scroll frame is
+# driven from a scrollbar, two mousewheel bindings and the keyboard, and
+# wrapping every one of those is more fragile than asking where we are: the
+# check is one Tk call and does nothing at all unless the answer moved.
+SCROLL_POLL_MS = 60
 FADE_H = 14  # the header tint's fade-out into the list below it
 
 
@@ -59,6 +73,16 @@ class LibraryView:
     def __init__(self, frame, crumb_bar, crumb_label, status_label,
                  index, theme, schedule, on_play, get_query):
         self.frame = frame
+        # Only the rows you can see are built. See _sync_visible: a track row
+        # costs about 9ms in CustomTkinter widgets, so a 483 track library
+        # spent 4.3 seconds building rows to show eleven of them, and it grew
+        # with the library rather than staying put.
+        self._virtual = None
+        self._place_y = None          # set while a row is being placed
+        self._last_row = None         # the row _row() just made
+        self._last_row_h = ROW_H
+        self._scroll_at = None
+        self._polling = False
         self.crumb_bar = crumb_bar
         self.crumb_label = crumb_label
         self.status = status_label
@@ -278,11 +302,10 @@ class LibraryView:
         stale = [w for w in self.frame.winfo_children()
                  if w not in self._discarding]
         for widget in stale:
-            try:
-                widget.pack_forget()
-            except Exception:
-                pass
+            self._detach(widget)
         self._discard(stale)
+        self._virtual = None
+        self._resize_to_fit()   # release the height a previous list pinned
 
         self.rows = rows
         self.paths = [r["path"] for r in rows if r.get("path")]
@@ -305,16 +328,157 @@ class LibraryView:
             self._set_status(f"{self.index.count()} tracks indexed")
             return
 
-        def chunk(start):
-            if token != self._token or not self.frame.winfo_exists():
-                return
-            for row in rows[start:start + CHUNK]:
-                builder(row)
-            if start + CHUNK < len(rows):
-                self.schedule(1, chunk, start + CHUNK)
-
-        chunk(0)
+        self._virtual = {"rows": rows, "builder": builder, "token": token,
+                         "stride": ROW_H + STRIDE_PAD, "built": {}}
+        self._sync_visible()
+        self._start_polling()
         self._set_status(plural(len(rows), noun.rstrip("s")))
+
+    # ------------------------------------------------------------ virtual
+
+    def _detach(self, widget):
+        for forget in (widget.place_forget, widget.pack_forget):
+            try:
+                forget()
+            except Exception:
+                pass
+
+    def _viewport(self):
+        """Where the list has been scrolled to, and how tall the window is.
+
+        None when there is no canvas to ask -- a bare frame in a test, say --
+        which _sync_visible reads as "build the lot", since without a
+        viewport there is no way to know what is off screen.
+        """
+        canvas = getattr(self.frame, "_parent_canvas", None)
+        if canvas is None:
+            return None
+        try:
+            if not canvas.winfo_exists():
+                return None
+            return (float(canvas.canvasy(0)), int(canvas.winfo_height()),
+                    int(canvas.winfo_width()))
+        except Exception:
+            return None
+
+    def visible_range(self, top, height, stride, count):
+        """The rows worth having built, given where we are. Pure, so tested."""
+        if stride <= 0 or count <= 0:
+            return 0, -1
+        first = int(top // stride) - BUFFER_ROWS
+        last = int((top + max(height, 0)) // stride) + BUFFER_ROWS
+        # Clamped to the list at both ends, so scrolling past the bottom asks
+        # for rows that exist rather than for index 500 of 483.
+        first = max(0, min(first, count - 1))
+        last = max(first, min(last, count - 1))
+        return first, last
+
+    def _sync_visible(self):
+        v = self._virtual
+        if not v or v["token"] != self._token:
+            return
+        try:
+            if not self.frame.winfo_exists():
+                return
+        except Exception:
+            return
+
+        rows, built, stride = v["rows"], v["built"], v["stride"]
+        seen = self._viewport()
+        if seen is None:
+            first, last = 0, len(rows) - 1
+        else:
+            first, last = self.visible_range(seen[0], seen[1], stride,
+                                             len(rows))
+
+        for index in [i for i in built if i < first or i > last]:
+            widget = built.pop(index)
+            self._detach(widget)
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+
+        fresh = []
+        for index in range(first, last + 1):
+            if index in built:
+                continue
+            row = self._build_at(index)
+            if row is not None:
+                built[index] = row
+                fresh.append(row)
+                if index == 0 and self._last_row_h + STRIDE_PAD != stride:
+                    # The first row of this view says how tall its kind is --
+                    # an album row is taller than a track row -- and row 0
+                    # sits at the same y whatever the answer, so learning it
+                    # here costs nothing.
+                    stride = v["stride"] = self._last_row_h + STRIDE_PAD
+
+        if seen is not None:
+            width = max(1, seen[2] - 12)
+            # Every row when the window has been resized, otherwise only the
+            # ones just made: configure() on a CTk frame forces a redraw, and
+            # doing it to thirty rows on every scroll tick is exactly the
+            # cost this whole change exists to avoid.
+            for row in (built.values() if width != v.get("width") else fresh):
+                try:
+                    row.configure(width=width)
+                except Exception:
+                    pass
+            v["width"] = width
+        self._resize_to_fit()
+
+    def _build_at(self, index):
+        v = self._virtual
+        self._place_y = index * v["stride"] + STRIDE_PAD // 2
+        self._last_row = None
+        try:
+            v["builder"](v["rows"][index])
+        finally:
+            self._place_y = None
+        return self._last_row
+
+    def _resize_to_fit(self):
+        """Give the scrollbar the whole list to scroll, not just what is built.
+
+        Placed children never enlarge their parent, so the frame has to be
+        told how tall the list is. Not with configure(height=): a
+        CTkScrollableFrame forwards that to the outer container and the
+        scrolling frame inside never hears about it. The frame is a window
+        item on the canvas, so the item is what carries the height -- the
+        same lever CustomTkinter uses itself to pin the width.
+        """
+        v = self._virtual
+        canvas = getattr(self.frame, "_parent_canvas", None)
+        item = getattr(self.frame, "_create_window_id", None)
+        if canvas is None or item is None:
+            return
+        try:
+            if not v:
+                canvas.itemconfigure(item, height=0)   # back to its own size
+                return
+            total = max(1, len(v["rows"]) * v["stride"])
+            canvas.itemconfigure(item, height=total)
+            canvas.configure(scrollregion=(0, 0, canvas.winfo_width(), total))
+        except Exception:
+            pass
+
+    def _start_polling(self):
+        if self._polling:
+            return
+        self._polling = True
+        self._scroll_at = None
+        self._poll_scroll()
+
+    def _poll_scroll(self):
+        if self._virtual is None:
+            self._polling = False
+            return
+        seen = self._viewport()
+        if seen is not None and seen != self._scroll_at:
+            self._scroll_at = seen
+            self._sync_visible()
+        self.schedule(SCROLL_POLL_MS, self._poll_scroll)
 
     # Long enough to be worth a turn of the loop, short enough that a frame
     # is never missed for it.
@@ -355,6 +519,12 @@ class LibraryView:
         if not self.on_like:
             return
         liked = self.on_like(path)
+        # The row this belongs to may be destroyed and built again when it
+        # scrolls out and back, and it is built from this data -- so without
+        # writing the change down here, the heart would empty itself again.
+        for row in self.rows or []:
+            if row.get("path") == path:
+                row["liked"] = liked
         try:
             label.configure(text=HEART_FULL if liked else HEART_EMPTY,
                             text_color=(self.theme["accent"] if liked
@@ -405,8 +575,21 @@ class LibraryView:
     def _row(self, height=ROW_H):
         row = ctk.CTkFrame(self.frame, fg_color="transparent",
                            corner_radius=theme_ui.RADIUS, height=height)
-        row.pack(fill="x", padx=6, pady=1)
+        # Placed rather than packed when the list is virtual: pack stacks
+        # whatever exists, which is the wrong answer when row 300 is on
+        # screen and rows 0-299 are not built. y is arithmetic instead.
+        if self._place_y is None:
+            row.pack(fill="x", padx=6, pady=1)
+        else:
+            # CustomTkinter refuses width/height on place -- they belong to
+            # the constructor -- so the height came from there and the width
+            # is applied by _sync_visible, which is the thing that knows how
+            # wide the viewport currently is.
+            row.place(x=6, y=self._place_y)
         row.pack_propagate(False)
+        # Builders do not return their row, and there are six of them; this
+        # is how the caller gets hold of one without touching any of them.
+        self._last_row, self._last_row_h = row, height
         # Rows gave no feedback at all before; a hover tint makes it obvious
         # what is about to be clicked in a long list.
         self._hoverable(row)
