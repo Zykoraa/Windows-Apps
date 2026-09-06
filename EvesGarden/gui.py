@@ -99,9 +99,8 @@ import playlist_watch
 import spotify_auth
 import spotify_import
 from downloader import (
-    setup_spotify, search_spotify_track, search_spotify_artist,
-    get_artist_albums, get_spotify_album_tracks, get_spotify_playlist_tracks,
-    get_spotify_album_tracks_info, process_track, download_many, get_config_dir,
+    setup_spotify, search_spotify_track, get_spotify_album_tracks,
+    get_spotify_playlist_tracks, process_track, download_many, get_config_dir,
     is_liked_songs, _base_ydl_opts, _score_candidate,
     get_related_tracks, repair_library, find_orphaned_downloads,
     SpotifyAuthError,
@@ -115,6 +114,53 @@ CONFIG_DIR = LOG_DIR
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 INDEX_PATH = os.path.join(CONFIG_DIR, "library.db")
 VIZ_MODES = visualizers.names()
+
+
+def np_layout(w, h, margin):
+    """Where everything goes in Now Playing, at a given canvas size.
+
+    Free of Tk so it can be checked at sizes this machine will not produce.
+    That matters more than it sounds: under a tiling compositor the app does
+    not choose its own size. Every geometry() call Eve's Garden makes on
+    Hyprland is ignored and the window is whatever the layout says, which can
+    be far wider and shorter than anything the minimum size implies.
+
+    The queue is still the first thing to go. What changed is that nothing is
+    given a minimum size larger than the room it has: the lyrics card used to
+    be floored at 200px wide and placed to the right of the cover, so on a
+    narrow window it was positioned past the right-hand edge and was simply
+    not on screen.
+    """
+    w, h = max(1, int(w)), max(1, int(h))
+    # The margin is the first thing to shrink, before any panel gives up
+    # width of its own.
+    m = margin if w >= 720 else max(12, int(w * 0.045))
+    top = m
+
+    # Never zero, or the title wraps against nothing: the text column is
+    # measured from the cover.
+    cover = int(min(340, max(120, h - 280), max(1, w - m * 2) * 0.30))
+    cover = max(60, cover)
+
+    show_queue = w >= 1080
+    queue_w = 292 if show_queue else 0
+    gap = 26
+
+    # Kept inside the canvas even when the cover column alone is wider than
+    # the window, which is only reachable at sizes no compositor produces --
+    # but this runs on whatever size it is handed.
+    lyr_x = min(m + cover + 54, max(m, w - m - 1))
+    room = w - lyr_x - m - (queue_w + gap if show_queue else 0)
+    lyr_w = max(1, min(room, w - lyr_x - m))
+    panel_h = max(1, h - top - m)
+
+    return {
+        "w": w, "h": h, "cover": cover, "cover_xy": (m, top),
+        "text_x": m, "text_y": top + cover + 28,
+        "lyrics": (lyr_x, top, lyr_w, panel_h),
+        "queue": (w - m - queue_w, top, queue_w, panel_h),
+        "show_queue": show_queue,
+    }
 
 
 def fmt_time(seconds):
@@ -242,6 +288,11 @@ class App(ctk.CTk):
         self.discover = Discover(self.sp, _base_ydl_opts, _score_candidate,
                                  fallback=self.catalogue)
         self.discover_results = []
+        self.discover_artists = []
+        # What the results panel is showing: the search, or one artist's
+        # releases. Going back re-renders the stored search rather than
+        # running it again.
+        self._discover_artist = None
         self._discover_timer = None
         self._streaming_track = None
 
@@ -258,7 +309,6 @@ class App(ctk.CTk):
         self.visualizer_palette = self.settings.get("visualizer_palette") or "Accent"
         if self.visualizer_palette not in visualizers.palette_names():
             self.visualizer_palette = "Accent"
-        self.visualizer_visible = False   # toggled on after build_ui
 
         # Deliberately not wiring visualizer_callback: the engine exposes
         # smoothed_bands and the UI samples it on its own clock.
@@ -294,6 +344,8 @@ class App(ctk.CTk):
         self._setup_media_keys()
         self.parsed_lyrics = []
         self.current_lyric_index = -1
+        self._lyrics_synced = False
+        self._lyrics_touched_at = 0.0
 
         # Build UI layout
         self.build_ui()
@@ -463,7 +515,7 @@ class App(ctk.CTk):
             ("<Control-Right>", self.play_next), ("<Control-Left>", self.play_prev),
             ("<Up>", volume(0.05)), ("<Down>", volume(-0.05)),
             ("<m>", self._toggle_mute),
-            ("<v>", self.toggle_visualizer_visibility),
+            ("<v>", self.toggle_now_playing_overlay),
             ("<s>", self.toggle_shuffle), ("<r>", self.toggle_repeat),
             ("<n>", self.toggle_now_playing_overlay),
             ("<l>", self.like_now_playing),
@@ -496,8 +548,8 @@ class App(ctk.CTk):
             ("Now playing", "Full-screen cover, lyrics and queue",
              self.toggle_now_playing_overlay),
             ("Add music", "Search Spotify and download", self.open_downloader),
-            ("Visualiser", "Toggle the spectrum view",
-             self.toggle_visualizer_visibility),
+            ("Visualiser", "Open Now Playing, where the spectrum is",
+             self.toggle_now_playing_overlay),
             ("Up next", "Show the queue", self.toggle_queue),
             ("Shuffle", "Toggle shuffle", self.toggle_shuffle),
             ("Repeat", "Toggle repeat", self.toggle_repeat),
@@ -562,8 +614,6 @@ class App(ctk.CTk):
             self.close_setup()
         elif getattr(self, "dl_visible", False):
             self.close_downloader()
-        elif self.visualizer_visible:
-            self.toggle_visualizer_visibility()
         elif getattr(self, "np_overlay_visible", False):
             self.toggle_now_playing_overlay()
         elif self.library_filter:
@@ -1044,7 +1094,7 @@ class App(ctk.CTk):
         self.eq_toggle_btn = ctk.CTkButton(self.bottom_bar, text="EQ", width=40, height=40, corner_radius=20, command=self.toggle_eq)
         self.eq_toggle_btn.grid(row=0, column=2, sticky="e", padx=(10, 0))
 
-        self.viz_toggle_btn = ctk.CTkButton(self.bottom_bar, text="VIZ", width=40, height=40, corner_radius=20, command=self.toggle_visualizer_visibility)
+        self.viz_toggle_btn = ctk.CTkButton(self.bottom_bar, text="VIZ", width=40, height=40, corner_radius=20, command=self.toggle_now_playing_overlay)
         self.viz_toggle_btn.grid(row=0, column=3, sticky="e", padx=(10, 20))
 
         # Volume: the engine had no gain stage at all, so the only way to turn
@@ -1094,7 +1144,7 @@ class App(ctk.CTk):
 
         # Build Overlays
         self.build_now_playing_overlay()
-        self.build_viz_overlay()
+        self.build_eq_overlay()
 
         self.load_library()
 
@@ -1183,12 +1233,17 @@ class App(ctk.CTk):
         if hasattr(self, 'np_overlay_visible') and self.np_overlay_visible:
             self._slide_out(self.np_overlay)
             self.np_overlay_visible = False
+            try:
+                self.np_canvas.delete(visualizers.TAG)
+            except Exception:
+                pass
         else:
             self.np_overlay_visible = True
             self._np_place()
             self._np_redraw_stage()
             self._render_np_queue()
             self._slide_in(self.np_overlay)
+        self._sync_visualizer_enabled()
 
     # --------------------------------------------------------- overlay motion
 
@@ -1239,8 +1294,6 @@ class App(ctk.CTk):
             return
 
         # One overlay at a time, so panels never stack on each other.
-        if self.visualizer_visible:
-            self.toggle_visualizer_visibility()
         if getattr(self, "np_overlay_visible", False):
             self.toggle_now_playing_overlay()
 
@@ -1256,42 +1309,7 @@ class App(ctk.CTk):
         self.dl_visible = False
         self.suggestions_frame.place_forget()
 
-    def build_viz_overlay(self):
-        self.viz_overlay = ctk.CTkFrame(self.main_area, corner_radius=0, fg_color=self.theme["bg"])
-        # Canvas
-        self.canvas = ctk.CTkCanvas(self.viz_overlay, highlightthickness=0, bg=self.theme["bg"])
-        self.canvas.pack(fill="both", expand=True)
-
-        self.viz_dropdown = ctk.CTkOptionMenu(
-            self.viz_overlay,
-            values=VIZ_MODES,
-            command=self.set_visualizer_mode_by_name,
-            fg_color=self.theme["surface"],
-            button_color=self.theme["surface"],
-            button_hover_color=self.theme["surface_hover"],
-            dropdown_fg_color=self.theme["surface"],
-            dropdown_hover_color=self.theme["surface_hover"],
-            text_color=self.theme["text"]
-        )
-        self.viz_dropdown.place(relx=0.98, rely=0.05, anchor="ne")
-
-        # Colour is a separate axis from the mode, so every visualiser can be
-        # rendered as a single hue, a spectrum or a gradient.
-        self.viz_palette_dropdown = ctk.CTkOptionMenu(
-            self.viz_overlay,
-            values=visualizers.palette_names(),
-            command=self.set_visualizer_palette,
-            fg_color=self.theme["surface"],
-            button_color=self.theme["surface"],
-            button_hover_color=self.theme["surface_hover"],
-            dropdown_fg_color=self.theme["surface"],
-            dropdown_hover_color=self.theme["surface_hover"],
-            text_color=self.theme["text"]
-        )
-        self.viz_palette_dropdown.set(self.visualizer_palette)
-        self.viz_palette_dropdown.place(relx=0.98, rely=0.13, anchor="ne")
-
-
+    def build_eq_overlay(self):
         # EQ Frame (Overlay/Hidden)
         self.eq_frame = ctk.CTkFrame(self.main_area, corner_radius=15)
         self.eq_header = ctk.CTkFrame(self.eq_frame, fg_color="transparent")
@@ -1422,7 +1440,22 @@ class App(ctk.CTk):
                                                     fg_color=self._np_card)
         self.lyrics_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 14))
         self.lyrics_scroll.grid_columnconfigure(0, weight=1)
-        self.lyrics_scroll.bind("<Configure>", self._on_lyrics_resize)
+        # add="+", or this replaces the binding CTkScrollableFrame puts on
+        # itself -- the one that keeps the canvas scrollregion in step with
+        # the content. Without a scrollregion the canvas reports the whole
+        # song as already visible, so yview_moveto did nothing, the wheel did
+        # nothing, and a long lyric simply ran off the bottom of the pane.
+        self.lyrics_scroll.bind("<Configure>", self._on_lyrics_resize, add="+")
+        # Scrolling back to re-read a line you just sang should not be undone
+        # by the next line arriving a second later, so any hand on the pane
+        # holds it for a few seconds.
+        canvas = self.lyrics_scroll._parent_canvas
+        for sequence in ("<Button-4>", "<Button-5>", "<MouseWheel>",
+                         "<Button-1>"):
+            canvas.bind(sequence, self._lyrics_user_took_over, add="+")
+        for sequence in ("<Button-1>", "<B1-Motion>"):
+            self.lyrics_scroll._scrollbar.bind(
+                sequence, self._lyrics_user_took_over, add="+")
 
         self.np_queue_card = ctk.CTkFrame(self.np_canvas, corner_radius=18,
                                           width=292, height=400,
@@ -1439,6 +1472,33 @@ class App(ctk.CTk):
         self.np_close_btn = ui_widgets.GlyphButton(
             self.np_canvas, self._np_theme(), "close", size=38,
             command=self.toggle_now_playing_overlay, background=self.NP_FLOOR)
+
+        # The mode and palette pickers moved here with the visualiser. They
+        # were the only reason the spectrum needed a page of its own.
+        self.viz_dropdown = ctk.CTkOptionMenu(
+            self.np_canvas, values=VIZ_MODES,
+            command=self.set_visualizer_mode_by_name,
+            width=182, height=30, corner_radius=15,
+            font=theme_ui.font("small"),
+            fg_color=self._np_card, button_color=self._np_card,
+            button_hover_color=self.theme["surface_hover"],
+            text_color=self.NP_INK,
+            dropdown_fg_color=self._np_card,
+            dropdown_hover_color=self.theme["surface_hover"],
+            dropdown_text_color=self.NP_INK)
+        self.viz_palette_dropdown = ctk.CTkOptionMenu(
+            self.np_canvas, values=visualizers.palette_names(),
+            command=self.set_visualizer_palette,
+            width=182, height=30, corner_radius=15,
+            font=theme_ui.font("small"),
+            fg_color=self._np_card, button_color=self._np_card,
+            button_hover_color=self.theme["surface_hover"],
+            text_color=self.NP_INK,
+            dropdown_fg_color=self._np_card,
+            dropdown_hover_color=self.theme["surface_hover"],
+            dropdown_text_color=self.NP_INK)
+        self.viz_dropdown.set(VIZ_MODES[self.visualizer_mode])
+        self.viz_palette_dropdown.set(self.visualizer_palette)
 
         self.lyrics_labels = []
         self._lyrics_wrap = 0
@@ -1461,24 +1521,7 @@ class App(ctk.CTk):
         if w <= 1 or h <= 1:
             w = max(w, self.main_area.winfo_width())
             h = max(h, self.main_area.winfo_height())
-        w, h = max(1, w), max(1, h)
-        m = self.NP_MARGIN
-        cover = int(min(340, max(160, h - 320), (w - m * 2) * 0.30))
-        top = m
-        # The queue is the first thing to go when there is no room for three
-        # columns; the lyrics then take the whole right-hand side.
-        show_queue = w >= 1080
-        queue_w = 292 if show_queue else 0
-        gap = 26
-        lyr_x = m + cover + 54
-        lyr_w = w - lyr_x - m - (queue_w + gap if show_queue else 0)
-        return {
-            "w": w, "h": h, "cover": cover, "cover_xy": (m, top),
-            "text_x": m, "text_y": top + cover + 28,
-            "lyrics": (lyr_x, top, max(200, lyr_w), max(120, h - top - m)),
-            "queue": (w - m - queue_w, top, queue_w, max(120, h - top - m)),
-            "show_queue": show_queue,
-        }
+        return np_layout(w, h, self.NP_MARGIN)
 
     def _np_place(self):
         """Position everything that is cheap to move, without re-rendering."""
@@ -1513,6 +1556,21 @@ class App(ctk.CTk):
             self.np_queue_card.place_forget()
 
         self.np_close_btn.place(x=L["w"] - 50, y=12)
+        # In the strip above the cards, not beside them. Under the close
+        # button they landed on top of the queue card and covered its
+        # heading, because that card starts further left than it looks.
+        # Bottom of the cover column, sitting on the band they control.
+        # Above the cards they covered the queue heading, and there is no
+        # strip above them to use anyway once the margin shrinks on a
+        # narrow window -- the cards start at the margin.
+        gap, left = 8, L["cover_xy"][0]
+        column_w = max(90, L["lyrics"][0] - left - gap)
+        picker_w = int(min(182, (column_w - gap) / 2))
+        row_y = max(L["text_y"] + 96, L["h"] - L["cover_xy"][1] - 34)
+        for column, widget in enumerate((self.viz_dropdown,
+                                         self.viz_palette_dropdown)):
+            widget.configure(width=picker_w)
+            widget.place(x=left + column * (picker_w + gap), y=row_y)
 
     def _paint_stage(self, image):
         self._np_stage_photo = ImageTk.PhotoImage(image)
@@ -1741,6 +1799,8 @@ class App(ctk.CTk):
         along, so the pane says so rather than looking stuck.
         """
         lines, synced = found
+        self._lyrics_synced = synced
+        self._lyrics_touched_at = 0.0
         for lbl in self.lyrics_labels:
             lbl.destroy()
         for spacer in getattr(self, "_lyric_spacers", []):
@@ -1771,7 +1831,8 @@ class App(ctk.CTk):
         if not synced:
             note = ctk.CTkLabel(
                 self.lyrics_scroll,
-                text="No timings for this one \u2014 the words will not follow along.",
+                text="No timings for this one \u2014 the page drifts with the "
+                     "song rather than following the line.",
                 font=theme_ui.font("caption"), text_color=self.NP_DIM,
                 fg_color="transparent", anchor="w", justify="left",
                 wraplength=wrap)
@@ -2143,7 +2204,7 @@ class App(ctk.CTk):
 
         for name, key in (
             ("main_area", "bg"), ("title_bar", "surface"), ("bottom_bar", "surface"),
-            ("eq_frame", "surface"), ("viz_overlay", "bg"),
+            ("eq_frame", "surface"),
             # Scrolling frames have to be repainted by name: they own a canvas
             # that keeps whatever colour it was built with.
             ("library_frame", "bg"), ("queue_list", "surface"),
@@ -2155,9 +2216,6 @@ class App(ctk.CTk):
             if widget is not None:
                 widget.configure(fg_color=t[key])
 
-        if hasattr(self, 'canvas'):
-            self.canvas.configure(bg=t["bg"])
-            self._viz_idle = False        # the idle text needs repainting
         if getattr(self, "brand_word", None) is not None:
             self.brand_word.configure(text_color=t["text"])
         if getattr(self, "brand_mark", None) is not None:
@@ -2292,18 +2350,10 @@ class App(ctk.CTk):
             view.invalidate()
             view.render()
 
-    def toggle_visualizer_visibility(self, event=None):
-        if getattr(self, "dl_visible", False):
-            self.close_downloader()
-        self.visualizer_visible = not self.visualizer_visible
-        # Skip the per-chunk FFT entirely while the overlay is hidden.
-        self.player.visualizer_enabled = self.visualizer_visible
-        self._viz_idle = False
-        if self.visualizer_visible:
-            self._slide_in(self.viz_overlay)
-            self.viz_dropdown.set(VIZ_MODES[self.visualizer_mode])
-        else:
-            self._slide_out(self.viz_overlay)
+    def _sync_visualizer_enabled(self):
+        """Run the per-chunk FFT only while the backdrop is on screen."""
+        self.player.visualizer_enabled = bool(
+            getattr(self, "np_overlay_visible", False))
 
     def toggle_visualizer_mode(self, event=None):
         self.set_visualizer_mode(self.visualizer_mode + 1)
@@ -2320,25 +2370,63 @@ class App(ctk.CTk):
         except ValueError:
             self.set_visualizer_mode(0)
 
+    # Drawn across the whole of Now Playing, every mode became a wall of
+    # colour with the title somewhere inside it. It gets a band along the
+    # bottom instead: still full width, still the backdrop, but clear of the
+    # cover and the words. Dimming on top of that, because it sits under the
+    # cards rather than on a page of its own.
+    NP_VIZ_BAND = 0.40
+    NP_VIZ_DIM = 0.28
+
+    def _viz_surface(self):
+        """Where the spectrum should be drawn, and how strongly.
+
+        Now Playing owns it when that view is open: the visualiser is the
+        backdrop there, sharing the canvas with the blurred cover, the
+        titles and the cards. It draws only tagged items, so everything
+        already on that canvas survives the frame.
+        """
+        if getattr(self, "np_overlay_visible", False):
+            canvas = getattr(self, "np_canvas", None)
+            if canvas is not None and canvas.winfo_exists():
+                return canvas, self.NP_VIZ_DIM, self._np_tint
+        return None, 0.0, self.theme["bg"]
+
     def _draw_bands(self, bands):
         """Delegate to the visualiser registry.
 
         This was a 180-line if/elif chain over sixteen inlined renderers.
         """
-        if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
-            return
-        if not self.visualizer_visible:
+        canvas, dim, behind = self._viz_surface()
+        if canvas is None:
             return
         palette = self.visualizer_palette
         if palette == "Album art":
             base = getattr(self, "dynamic_accent", None) or self.theme["accent"]
         else:
             base = self.theme["accent"]
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        backdrop = canvas is getattr(self, "np_canvas", None)
+        if backdrop:
+            # Every mode draws from (0, 0) to the size it is given, so the
+            # band is made by drawing into a short canvas and sliding the
+            # result down. No mode has to know it is being used this way.
+            height = max(80, int(height * self.NP_VIZ_BAND))
         visualizers.draw(
-            self.canvas, self.visualizer_mode, bands, base,
-            self.canvas.winfo_width(), self.canvas.winfo_height(), time.time(),
-            palette=palette,
+            canvas, self.visualizer_mode, bands, base,
+            width, height, time.time(),
+            palette=palette, dim=dim, dim_to=behind,
         )
+        if backdrop:
+            try:
+                canvas.move(visualizers.TAG, 0,
+                            canvas.winfo_height() - height)
+                # Just above the blurred cover and below everything else.
+                # Cards are canvas windows, which Tk always draws on top
+                # regardless of stacking order.
+                canvas.tag_raise(visualizers.TAG, self._np_stage_id)
+            except Exception:
+                pass
 
     def set_visualizer_palette(self, name):
         self.visualizer_palette = name
@@ -2354,37 +2442,20 @@ class App(ctk.CTk):
 
     def update_visualizer_loop(self):
         """Redraw at ~30 fps from the Tk thread, reading the engine's state."""
-        if self.visualizer_visible:
+        canvas, _, _ = self._viz_surface()
+        if canvas is not None:
             if self.player.playing and not self.player.paused:
                 self._viz_idle = False
                 self._draw_bands(self.player.smoothed_bands.tolist())
             elif not self._viz_idle:
+                # Nothing playing: drop the last frame rather than leaving it
+                # frozen over the cover.
                 self._viz_idle = True
-                self._draw_idle_visualizer()
+                try:
+                    canvas.delete(visualizers.TAG)
+                except Exception:
+                    pass
         self._safe_after(33, self.update_visualizer_loop)
-
-    def _draw_idle_visualizer(self):
-        """Something to look at when there are no bands to draw.
-
-        The loop only drew while audio was running, so opening the visualiser
-        with nothing playing left the last frame frozen on screen, or on a
-        fresh launch a black rectangle with two dropdowns floating in the
-        corner and no indication of what it was for.
-        """
-        canvas = getattr(self, "canvas", None)
-        if canvas is None or not canvas.winfo_exists():
-            return
-        width, height = canvas.winfo_width(), canvas.winfo_height()
-        if width <= 1 or height <= 1:
-            return
-        canvas.delete("all")
-        canvas.create_text(width / 2, height / 2 - 14, text="Nothing playing",
-                           fill=self.theme["text"],
-                           font=theme_ui.font("title"))
-        canvas.create_text(width / 2, height / 2 + 16,
-                           text="Start a track and the spectrum appears here.",
-                           fill=self.theme["text_secondary"],
-                           font=theme_ui.font("body"))
 
     def set_appwindow(self):
         hwnd = self._hwnd()
@@ -4021,23 +4092,100 @@ class App(ctk.CTk):
             self._lyric_fonts[size] = ctk.CTkFont(size=size, weight="bold")
         return self._lyric_fonts[size]
 
-    def _scroll_lyric_into_view(self, index):
+    # How long a hand on the pane holds it before the song takes it back.
+    LYRIC_GRACE = 6.0
+
+    def _lyrics_canvas(self):
+        try:
+            canvas = self.lyrics_scroll._parent_canvas
+            return canvas if canvas.winfo_exists() else None
+        except Exception:
+            return None
+
+    def _lyrics_user_took_over(self, _event=None):
+        """Hand the pane back to the reader for a few seconds."""
+        self._lyrics_touched_at = time.time()
+
+    def _lyrics_following(self):
+        """Whether the song still owns the scroll position."""
+        return (time.time() - getattr(self, "_lyrics_touched_at", 0.0)
+                > self.LYRIC_GRACE)
+
+    def _glide_lyrics(self, canvas, target, smooth=True):
+        """Move the pane to `target`, over a moment rather than in one jump.
+
+        A jump is disorienting when the thing you are tracking is a line of
+        words you are in the middle of singing.
+        """
+        target = min(1.0, max(0.0, target))
+        try:
+            start = canvas.yview()[0]
+        except Exception:
+            return
+        if not smooth or abs(target - start) < 0.001:
+            try:
+                canvas.yview_moveto(target)
+            except Exception:
+                pass
+            return
+        motion.animate(
+            canvas, motion.SLOW,
+            lambda t: canvas.yview_moveto(start + (target - start) * t),
+            easing=motion.ease_in_out_cubic, name="lyrics")
+
+    def _scroll_lyric_into_view(self, index, smooth=True):
         """Centre the active line using its real position.
 
         The old ratio (index - 3) / line-count assumed every line was the
         same height, but wraplength makes long lines taller, so the active
         line drifted further off-centre the wordier the song was.
         """
+        if not self._lyrics_following():
+            return
+        canvas = self._lyrics_canvas()
+        if canvas is None:
+            return
         try:
             label = self.lyrics_labels[index]
-            canvas = self.lyrics_scroll._parent_canvas
             content = self.lyrics_scroll.winfo_height()
             viewport = canvas.winfo_height()
             if content <= viewport or content <= 1:
                 return
             centre = label.winfo_y() + label.winfo_height() / 2
             target = (centre - viewport / 2) / (content - viewport)
-            canvas.yview_moveto(min(1.0, max(0.0, target)))
+        except Exception:
+            return
+        self._glide_lyrics(canvas, target, smooth)
+
+    def _drift_unsynced_lyrics(self):
+        """Pace untimed words by how far through the song we are.
+
+        There are no timings, so this cannot land on the right line and does
+        not pretend to. But a page that never moves is certainly wrong by the
+        last verse, and this at least keeps the words on screen for someone
+        singing along.
+        """
+        if not self._lyrics_following():
+            return
+        canvas = self._lyrics_canvas()
+        if canvas is None:
+            return
+        duration = self.player.get_duration() or 0
+        if duration <= 0:
+            return
+        try:
+            if self.lyrics_scroll.winfo_height() <= canvas.winfo_height():
+                return
+            now = canvas.yview()[0]
+        except Exception:
+            return
+        progress = min(1.0, max(0.0, self.player.get_position() / duration))
+        # Ease toward it rather than tracking it exactly, so the page creeps
+        # rather than stepping ten times a second.
+        if abs(progress - now) < 0.002:
+            return
+        try:
+            canvas.yview_moveto(now + (progress - now) * 0.08)
         except Exception:
             pass
 
@@ -4077,6 +4225,8 @@ class App(ctk.CTk):
                             self._lyric_style(i, "past")
                     self._lyric_style(new_idx, "active")
                     self._scroll_lyric_into_view(new_idx)
+            elif self.lyrics_labels and not self._lyrics_synced:
+                self._drift_unsynced_lyrics()
 
         self._safe_after(100, self.update_progress_loop)  # faster updates for smooth lyrics
 
@@ -4128,7 +4278,15 @@ class App(ctk.CTk):
                 self._safe_after(0, self._render_discover_message,
                                  f"Search failed: {e}")
                 return
-            self._safe_after(0, self._render_discover, results)
+            # Searching for a person used to answer only with their loose
+            # tracks, which is not what someone typing an artist's name is
+            # looking for. The artists come back too, and each one opens onto
+            # a discography.
+            try:
+                artists = self.discover.search_artists(query)
+            except Exception:
+                artists = []
+            self._safe_after(0, self._render_discover, results, artists)
             # Warm the top few so pressing play does not wait on YouTube.
             for track in results[:4]:
                 self.discover.prefetch(track)
@@ -4145,17 +4303,79 @@ class App(ctk.CTk):
                      text_color=self.theme["text_secondary"]).pack(
                          pady=64, padx=30)
 
-    def _render_discover(self, results):
+    def _render_discover(self, results, artists=None):
         if not self._dl_alive():
             return
         self.discover_results = results
-        for widget in self.results_frame.winfo_children():
-            widget.destroy()
-        if not results:
+        if artists is not None:
+            self.discover_artists = artists
+        artists = self.discover_artists
+        self._clear_results()
+        if not results and not artists:
             self._render_discover_message("Nothing found.")
             return
-        for track in results:
-            self._discover_row(track)
+
+        if artists:
+            self._results_heading("Artists")
+            for artist in artists[:3]:
+                self._artist_row(artist)
+
+        if results:
+            if artists:
+                self._results_heading("Songs")
+            for track in results:
+                self._discover_row(track)
+
+    def _clear_results(self):
+        for widget in self.results_frame.winfo_children():
+            widget.destroy()
+
+    def _results_heading(self, text):
+        ctk.CTkLabel(self.results_frame, text=text, anchor="w",
+                     font=theme_ui.font("heading"),
+                     text_color=self.theme["text_secondary"]).pack(
+                         anchor="w", padx=12, pady=(10, 2))
+
+    def _artist_row(self, artist):
+        """One artist in the results, opening onto their releases."""
+        row = ctk.CTkFrame(self.results_frame, fg_color="transparent",
+                           corner_radius=theme_ui.RADIUS, height=58)
+        row.pack(fill="x", padx=4, pady=2)
+        row.pack_propagate(False)
+
+        art = ctk.CTkLabel(row, text="", width=42, height=42, corner_radius=21,
+                           fg_color=self.theme["surface_hover"])
+        art.pack(side="left", padx=(8, 12))
+        if artist.get("image_url"):
+            self.discover.fetch_cover(
+                artist["image_url"], 42,
+                lambda img, lbl=art: self._safe_after(0, self._set_discover_art,
+                                                      lbl, img))
+        else:
+            # Apple returns no portrait, so an initial stands in rather than
+            # leaving a hole where every other row has artwork.
+            art.configure(text=(artist["name"] or "?")[:1].upper(),
+                          font=theme_ui.font("title"),
+                          text_color=self.theme["text_secondary"])
+
+        ctk.CTkButton(row, text="Discography", width=104, height=30,
+                      corner_radius=15, font=theme_ui.font("small"),
+                      command=lambda a=artist: self.open_artist(a)).pack(
+                          side="right", padx=(6, 10))
+
+        box = ctk.CTkFrame(row, fg_color="transparent")
+        box.pack(side="left", fill="both", expand=True)
+        name = ctk.CTkLabel(box, text=artist["name"], anchor="w", justify="left",
+                            font=theme_ui.font("body_med"),
+                            text_color=self.theme["text"])
+        name.pack(anchor="w", pady=(10, 0))
+        detail = ", ".join(artist.get("genres") or []) or "Artist"
+        ctk.CTkLabel(box, text=detail, anchor="w", justify="left",
+                     font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+        for widget in (row, art, box, name):
+            self._click_through(widget, lambda a=artist: self.open_artist(a))
 
     def _discover_row(self, track):
         row = ctk.CTkFrame(self.results_frame, fg_color="transparent",
@@ -4190,11 +4410,23 @@ class App(ctk.CTk):
         ctk.CTkLabel(box, text=track["title"], anchor="w", justify="left",
                      font=theme_ui.font("body_med"),
                      text_color=self.theme["text"]).pack(anchor="w", pady=(10, 0))
-        detail = "  ·  ".join(x for x in (track["artist"], track["album"],
-                                          track["year"]) if x)
-        ctk.CTkLabel(box, text=detail, anchor="w", justify="left",
-                     font=theme_ui.font("caption"),
-                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+        line = ctk.CTkFrame(box, fg_color="transparent")
+        line.pack(anchor="w", fill="x")
+        # The credit is the way in to the rest of the artist's work, the way
+        # it is anywhere else music is browsed.
+        credit = ctk.CTkLabel(line, text=track["artist"], anchor="w",
+                              justify="left", font=theme_ui.font("caption"),
+                              text_color=self.theme["text_secondary"])
+        credit.pack(side="left")
+        first = (track.get("artists") or [track["artist"]])[0]
+        self._click_through(credit,
+                            lambda n=first: self.open_artist_by_name(n),
+                            hover=self.theme["text"])
+        rest = "  ·  ".join(x for x in (track["album"], track["year"]) if x)
+        if rest:
+            ctk.CTkLabel(line, text="  ·  " + rest, anchor="w", justify="left",
+                         font=theme_ui.font("caption"),
+                         text_color=self.theme["text_secondary"]).pack(side="left")
 
     def _set_discover_art(self, label, image):
         try:
@@ -4206,6 +4438,269 @@ class App(ctk.CTk):
             label.configure(image=label._art)
         except Exception:
             pass
+
+    # ---------------------------------------------------------- discography
+
+    def _click_through(self, widget, command, hover=None):
+        """Make a plain label or frame behave like a link.
+
+        CTk only gives buttons a click and a cursor, and a row built out of
+        labels is not a button. Binding the whole row means the click lands
+        wherever it is aimed rather than only on the one word that happens to
+        be a button.
+        """
+        try:
+            widget.configure(cursor="hand2")
+        except Exception:
+            pass
+        widget.bind("<Button-1>", lambda _e: command())
+        if hover is not None:
+            base = widget.cget("text_color")
+            widget.bind("<Enter>", lambda _e: widget.configure(text_color=hover))
+            widget.bind("<Leave>", lambda _e: widget.configure(text_color=base))
+
+    def open_artist_by_name(self, name):
+        """Open a discography from a credit, which carries no artist id."""
+        if not name:
+            return
+        self._render_discover_message("Finding %s..." % name)
+
+        def work():
+            try:
+                found = self.discover.search_artists(name, limit=1)
+            except Exception:
+                found = []
+            if not found:
+                self._safe_after(0, self._render_discover_message,
+                                 "Could not find an artist called %s." % name)
+                return
+            self._load_artist(found[0])
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_artist(self, artist):
+        self._render_discover_message("Loading %s..." % artist["name"])
+        threading.Thread(target=self._load_artist, args=(artist,),
+                         daemon=True).start()
+
+    def _load_artist(self, artist):
+        try:
+            albums = self.discover.artist_albums(artist)
+        except Exception as e:
+            self._safe_after(0, self._render_discover_message,
+                             "Could not load that discography: %s" % e)
+            return
+        self._safe_after(0, self._render_artist, artist, albums)
+
+    # Spotify labels a release by how the artist appears on it. Grouped, so a
+    # discography reads as one rather than as a hundred undifferentiated rows.
+    _ALBUM_GROUPS = (("album", "Albums"),
+                     ("single", "Singles & EPs"),
+                     ("compilation", "Compilations"),
+                     ("appears_on", "Appears on"))
+
+    def _render_artist(self, artist, albums):
+        if not self._dl_alive():
+            return
+        self._discover_artist = artist
+        self._clear_results()
+
+        header = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        header.pack(fill="x", padx=4, pady=(4, 8))
+        ctk.CTkButton(header, text="\u2190  Back to results", width=150, height=30,
+                      corner_radius=15, font=theme_ui.font("small"),
+                      fg_color="transparent", border_width=1,
+                      text_color=self.theme["text"],
+                      hover_color=self.theme["surface_hover"],
+                      command=self._back_to_results).pack(anchor="w", padx=8)
+
+        title = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        title.pack(fill="x", padx=12, pady=(0, 4))
+        ctk.CTkLabel(title, text=artist["name"], anchor="w",
+                     font=theme_ui.font("title"),
+                     text_color=self.theme["text"]).pack(anchor="w")
+        if not albums:
+            ctk.CTkLabel(title, text="No releases listed for this artist.",
+                         anchor="w", font=theme_ui.font("caption"),
+                         text_color=self.theme["text_secondary"]).pack(anchor="w")
+            return
+        ctk.CTkLabel(title,
+                     text="%d release%s" % (len(albums),
+                                            "" if len(albums) == 1 else "s"),
+                     anchor="w", font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+        remaining = list(albums)
+        for group, heading in self._ALBUM_GROUPS:
+            batch = [a for a in remaining if a.get("album_type") == group]
+            if not batch:
+                continue
+            remaining = [a for a in remaining if a.get("album_type") != group]
+            # Only worth a heading when there is more than one kind of thing.
+            if len(batch) != len(albums):
+                self._results_heading(heading)
+            for album in batch:
+                self._album_row(album)
+        for album in remaining:
+            self._album_row(album)
+
+    def _back_to_results(self):
+        self._discover_artist = None
+        self._render_discover(self.discover_results, self.discover_artists)
+
+    def _album_row(self, album):
+        """One release: take the whole thing, or open it and pick."""
+        container = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        container.pack(fill="x", pady=1)
+
+        row = ctk.CTkFrame(container, fg_color="transparent",
+                           corner_radius=theme_ui.RADIUS, height=58)
+        row.pack(fill="x", padx=4)
+        row.pack_propagate(False)
+
+        art = ctk.CTkLabel(row, text="", width=42, height=42, corner_radius=5)
+        art.pack(side="left", padx=(8, 12))
+        self.discover.fetch_cover(
+            album.get("cover_url"), 42,
+            lambda img, lbl=art: self._safe_after(0, self._set_discover_art,
+                                                  lbl, img))
+
+        tracks_frame = ctk.CTkFrame(container, fg_color="transparent")
+        toggle = ctk.CTkButton(row, text="\u25bc", width=34, height=30,
+                               corner_radius=15, font=theme_ui.font("small"),
+                               fg_color="transparent", border_width=1,
+                               text_color=self.theme["text"],
+                               hover_color=self.theme["surface_hover"])
+        toggle.configure(command=lambda: self._toggle_album(album, tracks_frame,
+                                                            toggle))
+        toggle.pack(side="right", padx=(6, 10))
+
+        ctk.CTkButton(row, text="Download album", width=124, height=30,
+                      corner_radius=15, font=theme_ui.font("small"),
+                      command=lambda a=album: self.download_album(a)).pack(
+                          side="right", padx=4)
+
+        box = ctk.CTkFrame(row, fg_color="transparent")
+        box.pack(side="left", fill="both", expand=True)
+        ctk.CTkLabel(box, text=album["name"], anchor="w", justify="left",
+                     font=theme_ui.font("body_med"),
+                     text_color=self.theme["text"]).pack(anchor="w", pady=(10, 0))
+        count = album.get("total_tracks") or 0
+        detail = "  \u00b7  ".join(
+            x for x in (album.get("year"),
+                        "%d track%s" % (count, "" if count == 1 else "s")
+                        if count else "") if x)
+        ctk.CTkLabel(box, text=detail, anchor="w", justify="left",
+                     font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+        self._click_through(box, lambda: self._toggle_album(album, tracks_frame,
+                                                            toggle))
+
+    def _toggle_album(self, album, frame, button):
+        if frame.winfo_ismapped():
+            frame.pack_forget()
+            button.configure(text="\u25bc")
+            return
+        frame.pack(fill="x", padx=(58, 14), pady=(0, 6))
+        button.configure(text="\u25b2")
+        if frame.winfo_children():
+            return
+        ctk.CTkLabel(frame, text="Loading tracks...", anchor="w",
+                     font=theme_ui.font("caption"),
+                     text_color=self.theme["text_secondary"]).pack(anchor="w")
+
+        def work():
+            try:
+                tracks = self.discover.album_tracks(album)
+            except Exception:
+                tracks = []
+            self._safe_after(0, self._render_album_track_list, frame, tracks)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_album_track_list(self, frame, tracks):
+        try:
+            if not frame.winfo_exists():
+                return
+        except Exception:
+            return
+        for widget in frame.winfo_children():
+            widget.destroy()
+        if not tracks:
+            ctk.CTkLabel(frame, text="Could not load this album's tracks.",
+                         anchor="w", font=theme_ui.font("caption"),
+                         text_color=self.theme["text_secondary"]).pack(anchor="w")
+            return
+        for index, track in enumerate(tracks, 1):
+            self._album_track_row(frame, index, track)
+
+    def _album_track_row(self, parent, index, track):
+        row = ctk.CTkFrame(parent, fg_color="transparent", height=30)
+        row.pack(fill="x", pady=1)
+        row.pack_propagate(False)
+
+        ctk.CTkLabel(row, text="%d." % index, width=26, anchor="e",
+                     font=theme_ui.font("time"),
+                     text_color=self.theme["text_secondary"]).pack(side="left")
+
+        ctk.CTkButton(row, text="Download", width=80, height=24,
+                      corner_radius=12, font=theme_ui.font("small"),
+                      command=lambda t=track: self.download_discovered(t)).pack(
+                          side="right", padx=(6, 4))
+        preview = ctk.CTkButton(row, text="\u25b6", width=32, height=24,
+                                corner_radius=12, font=theme_ui.font("small"),
+                                fg_color="transparent", border_width=1,
+                                command=lambda t=track: self.preview_track(t))
+        preview.pack(side="right", padx=2)
+        track["_preview_btn"] = preview
+
+        ctk.CTkLabel(row, text=fmt_time(track["duration"]), width=48, anchor="e",
+                     font=theme_ui.font("time"),
+                     text_color=self.theme["text_secondary"]).pack(side="right")
+
+        ctk.CTkLabel(row, text=track["title"], anchor="w", justify="left",
+                     font=theme_ui.font("caption"),
+                     text_color=self.theme["text"]).pack(side="left", padx=(8, 0),
+                                                         fill="x", expand=True)
+
+    def download_album(self, album):
+        """Take a whole release in one go."""
+        self.log("Reading %s..." % album["name"])
+
+        def work():
+            try:
+                tracks = self.discover.album_tracks(album)
+            except Exception as e:
+                self._gui_log("Could not read %s: %s" % (album["name"], e))
+                return
+            if not tracks:
+                self._gui_log("No tracks listed for %s." % album["name"])
+                return
+            self._gui_log("Downloading %s -- %d track%s."
+                          % (album["name"], len(tracks),
+                             "" if len(tracks) == 1 else "s"))
+            self._safe_after(0, self._download_tracks, tracks)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _download_tracks(self, tracks):
+        """Queue search results, whichever provider they came from.
+
+        A Spotify track is looked up again from its URL by the pipeline; one
+        from a provider with no Spotify URL has to carry its own metadata,
+        and its key is then only an identity for the job list.
+        """
+        keys, labels, meta = [], {}, {}
+        for track in tracks:
+            key = track.get("url") or track.get("id")
+            if not key or key in labels:
+                continue
+            keys.append(key)
+            labels[key] = "%s - %s" % (track["artist"], track["title"])
+            if track.get("source") == "itunes":
+                meta[key] = metadata.ITunesProvider.track_info(track)
+        self._start_batch(keys, labels=labels, meta=meta or None)
 
     # ------------------------------------------------------------- preview
 
@@ -4265,17 +4760,7 @@ class App(ctk.CTk):
 
     def download_discovered(self, track):
         """Keep a previewed track: download and tag it properly."""
-        label = f"{track['artist']} - {track['title']}"
-        if track.get("source") == "itunes":
-            # There is no Spotify URL to look up, so the metadata that came
-            # back with the search result goes down the pipeline instead. The
-            # key is only an identity for the job list.
-            key = track.get("url") or track["id"]
-            self._start_batch(
-                [key], labels={key: label},
-                meta={key: metadata.ITunesProvider.track_info(track)})
-            return
-        self._start_batch([track["url"]], labels={track["url"]: label})
+        self._download_tracks([track])
 
     def on_key_release(self, event):
         if self.search_timer:
@@ -4284,16 +4769,16 @@ class App(ctk.CTk):
 
     def perform_search(self):
         query = self.url_entry.get().strip()
-        if not query:
-            # If search is empty, fetch recommendations based on now playing
-            threading.Thread(target=self.fetch_recommendations, daemon=True).start()
-            return
-
-        if "http" in query:
+        if query:
+            # A typed query belongs to the results panel, which answers with
+            # artists and their releases as well as loose tracks. This
+            # dropdown used to answer the same query at the same time, laying
+            # a shorter and worse copy of the list over the top of it.
             self.suggestions_frame.place_forget()
             return
-
-        threading.Thread(target=self.fetch_suggestions, args=(query,), daemon=True).start()
+        # An empty box is the one thing the results panel has nothing to say
+        # about, so this stays: more from whoever is playing.
+        threading.Thread(target=self.fetch_recommendations, daemon=True).start()
 
     def fetch_recommendations(self):
         try:
@@ -4327,28 +4812,17 @@ class App(ctk.CTk):
             # Named for what it can actually deliver. Spotify closed the
             # endpoints that made real recommendations possible, so calling
             # these "suggested for you" would be overselling a search.
-            self._safe_after(0, self.show_suggestions, None, tracks,
+            self._safe_after(0, self.show_suggestions, tracks,
                              f"More from {artist}")
         except Exception as e:
             print(f"Recommendation error: {e}")
             self._safe_after(0, self.suggestions_frame.place_forget)
 
-    def fetch_suggestions(self, query):
-        if not self.sp:
-            return
-        try:
-            artists = search_spotify_artist(self.sp, query)
-            results = self.sp.search(q=query, limit=3, type='track')
-            tracks = results['tracks']['items']
-            self._safe_after(0, self.show_suggestions, artists, tracks)
-        except Exception:
-            pass
-
-    def show_suggestions(self, artists, tracks, tracks_title="Tracks"):
+    def show_suggestions(self, tracks, tracks_title="Tracks"):
         for widget in self.suggestions_frame.winfo_children():
             widget.destroy()
 
-        if not artists and not tracks:
+        if not tracks:
             self.suggestions_frame.place_forget()
             return
 
@@ -4364,16 +4838,6 @@ class App(ctk.CTk):
                                     command=lambda u=url, t=btn_text: self.select_suggestion(u, t))
                 btn.pack(fill="x", padx=5, pady=2)
 
-        if artists:
-            ctk.CTkLabel(self.suggestions_frame, text="Artists", font=ctk.CTkFont(weight="bold"), text_color=self.theme["text_secondary"]).pack(anchor="w", padx=10, pady=(10,0))
-            for artist in artists[:3]: # Only show top 3 artists to save space
-                name = artist['name']
-                url = artist['external_urls']['spotify']
-                btn = ctk.CTkButton(self.suggestions_frame, text=name, anchor="w", fg_color="transparent",
-                                    text_color=self.theme["text"], hover_color=self.theme["surface_hover"], corner_radius=8,
-                                    command=lambda u=url, t=name, aid=artist['id']: self.select_artist(u, t, aid))
-                btn.pack(fill="x", padx=5, pady=2)
-
         self.suggestions_frame.configure(width=self.url_entry.winfo_width())
         self.suggestions_frame.place(x=self.url_entry.winfo_x(), y=self.url_entry.winfo_y() + self.url_entry.winfo_height() + 5)
         self.suggestions_frame.lift()
@@ -4383,153 +4847,8 @@ class App(ctk.CTk):
         self.url_entry.delete(0, "end")
         self.url_entry.insert(0, url)
 
-    def select_artist(self, url, name, artist_id):
-        self.suggestions_frame.place_forget()
-        self.log(f"Fetching albums for {name}...")
-        threading.Thread(target=self.prompt_artist_albums, args=(name, artist_id), daemon=True).start()
-
-    def prompt_artist_albums(self, artist_name, artist_id):
-        try:
-            albums = get_artist_albums(self.sp, artist_id)
-
-            # Pre-fetch thumbnails so we don't freeze the UI
-            import requests
-            from PIL import Image
-            import io
-
-            for album in albums:
-                try:
-                    if album.get('images'):
-                        # Grab the smallest image to save bandwidth (usually the last one, 64x64)
-                        img_url = album['images'][-1]['url']
-                        r = requests.get(img_url, timeout=5)
-                        if r.status_code == 200:
-                            img = Image.open(io.BytesIO(r.content))
-                            album['ctk_image'] = ctk.CTkImage(img, size=(40, 40))
-                except:
-                    pass
-
-            self._safe_after(0, self.show_album_selector, artist_name, albums)
-        except Exception as e:
-            self._safe_after(0, self.log, f"Failed to fetch albums: {e}")
-
-    def show_album_selector(self, artist_name, albums):
-        dialog = dialogs.ModalDialog(
-            self, self.theme, f"Albums by {artist_name}", size=(520, 660),
-            body_pad=(18, 16))
-        # Not modal: the downloads it starts report into the window behind it.
-        panel = dialog.body
-
-        ctk.CTkLabel(panel, text="Select albums or tracks to download",
-                     font=theme_ui.font("title"), anchor="w",
-                     text_color=self.theme["text"]).pack(fill="x", pady=(0, 12))
-
-        scroll = ctk.CTkScrollableFrame(panel, fg_color=self.theme["surface"],
-                                        corner_radius=theme_ui.RADIUS)
-        scroll.pack(fill="both", expand=True)
-
-        vars_dict = {}
-
-        for album in albums:
-            album_url = album['external_urls']['spotify']
-            var = ctk.BooleanVar(value=False)
-            vars_dict[album_url] = var
-
-            # Container for the album and its tracks
-            album_container = ctk.CTkFrame(scroll, fg_color="transparent")
-            album_container.pack(fill="x", pady=2)
-
-            row = ctk.CTkFrame(album_container, fg_color="transparent")
-            row.pack(fill="x", pady=5, padx=10)
-
-            cb = ctk.CTkCheckBox(row, text="", variable=var, width=28,
-                                 fg_color=self.theme["accent"], hover_color=self.theme["accent_hover"])
-            cb.pack(side="left", padx=(0, 5))
-
-            if 'ctk_image' in album:
-                img_lbl = ctk.CTkLabel(row, text="", image=album['ctk_image'])
-                img_lbl.pack(side="left", padx=(0, 10))
-
-            # Without a wraplength these ran off the edge of the dialog, so a
-            # title like "Where the Light Is: John Mayer Live In Los Angeles"
-            # was cut off mid-word.
-            text_lbl = ctk.CTkLabel(row, text=album['name'], text_color=self.theme["text"],
-                                    font=ctk.CTkFont(size=14, weight="bold"),
-                                    justify="left", anchor="w", wraplength=300)
-            text_lbl.pack(side="left", fill="x", expand=True)
-
-            tracks_frame = ctk.CTkFrame(album_container, fg_color="transparent")
-
-            def toggle_expand(a_url=album_url, tf=tracks_frame):
-                if tf.winfo_ismapped():
-                    tf.pack_forget()
-                else:
-                    tf.pack(fill="x", padx=(40, 10))
-                    # If empty, fetch tracks
-                    if not tf.winfo_children():
-                        ctk.CTkLabel(tf, text="Loading tracks...", text_color=self.theme["text_secondary"]).pack(pady=5)
-                        threading.Thread(target=self._fetch_and_show_tracks, args=(a_url, tf, vars_dict), daemon=True).start()
-
-            expand_btn = ctk.CTkButton(row, text="▼", width=30, height=30, fg_color="transparent", hover_color=self.theme["surface_hover"],
-                                       text_color=self.theme["text"], command=toggle_expand)
-            expand_btn.pack(side="right")
-
-        def download_selected():
-            selected_urls = [url for url, var in vars_dict.items() if var.get()]
-            dialog.close()
-            if selected_urls:
-                threading.Thread(target=self.download_selected_items, args=(selected_urls,), daemon=True).start()
-
-        ctk.CTkButton(panel, text="Download selected", height=44,
-                      corner_radius=theme_ui.RADIUS_PILL,
-                      font=theme_ui.font("body_med"),
-                      fg_color=self.theme["accent"],
-                      text_color=self.theme["bg"],
-                      hover_color=self.theme["accent_hover"],
-                      command=download_selected).pack(fill="x", pady=(14, 0))
-        dialog.present()
-
-    def _fetch_and_show_tracks(self, album_url, frame, vars_dict):
-        try:
-            tracks_info = get_spotify_album_tracks_info(self.sp, album_url)
-            self._safe_after(0, self._render_album_tracks, frame, tracks_info, vars_dict)
-        except Exception as e:
-            self._safe_after(0, lambda: ctk.CTkLabel(frame, text="Failed to load tracks", text_color="red").pack())
-
-    def _render_album_tracks(self, frame, tracks_info, vars_dict):
-        for widget in frame.winfo_children():
-            widget.destroy()
-
-        for i, track in enumerate(tracks_info):
-            track_url = track['url']
-            var = ctk.BooleanVar(value=False)
-            vars_dict[track_url] = var
-            cb = ctk.CTkCheckBox(frame, text=f"{i+1}. {track['name']}", variable=var,
-                                 fg_color=self.theme["accent"], hover_color=self.theme["accent_hover"], text_color=self.theme["text_secondary"],
-                                 font=ctk.CTkFont(size=12))
-            cb.pack(anchor="w", pady=2)
-
     def _gui_log(self, message):
         self._safe_after(0, self.log, message)
-
-    def download_selected_items(self, urls):
-        """Expand albums to tracks, dedupe, then hand the batch to the manager."""
-        os.makedirs(LIBRARY_DIR, exist_ok=True)
-
-        track_urls, seen = [], set()
-        for url in urls:
-            try:
-                expanded = (get_spotify_album_tracks(self.sp, url)
-                            if 'album' in url else [url] if 'track' in url else [])
-            except Exception as e:
-                self._gui_log(f"Error reading {url}: {e}")
-                continue
-            for t in expanded:
-                if t not in seen:
-                    seen.add(t)
-                    track_urls.append(t)
-
-        self._start_batch(track_urls)
 
     def _start_batch(self, track_urls, labels=None, meta=None):
         if not track_urls:

@@ -23,6 +23,9 @@ import time
 import requests
 
 SEARCH_URL = "https://itunes.apple.com/search"
+# Search finds things by name; lookup walks the relationships between them --
+# an artist's releases, a release's tracks. Both are keyless.
+LOOKUP_URL = "https://itunes.apple.com/lookup"
 LOOKUP_TIMEOUT = 12
 # Apple asks for about twenty calls a minute; the cache is what keeps a user
 # typing in the palette from getting anywhere near that.
@@ -37,6 +40,16 @@ def _artwork(url, size=600):
         if token in url:
             return url.replace(token, "%dx%d" % (size, size))
     return url
+
+
+def _plain_id(value):
+    """The numeric half of an id like "itunes:1234".
+
+    Ids are prefixed everywhere they leave this module so the UI can tell one
+    provider's artist from another's, but Apple only answers to the number.
+    """
+    text = str(value or "")
+    return text.split(":", 1)[1] if text.startswith("itunes:") else text
 
 
 class ITunesProvider:
@@ -58,31 +71,38 @@ class ITunesProvider:
         query = (query or "").strip()
         if not query:
             return []
-        key = (query.lower(), int(limit))
+        payload = self._get(SEARCH_URL,
+                            {"term": query, "media": "music", "entity": "song",
+                             "limit": max(1, min(int(limit), 50)),
+                             "country": self.country})
+        out = [self._as_track(item) for item in payload.get("results") or []]
+        return [track for track in out if track]
+
+    def _get(self, url, params):
+        """A cached GET. Returns an empty payload rather than raising.
+
+        Every call in this module is a read of a public catalogue, so a
+        failure means "nothing found" and the caller falls back. Caching on
+        the parameters rather than on a per-method key means opening an
+        artist, going back and opening them again costs one request.
+        """
+        key = (url, tuple(sorted((k, str(v)) for k, v in params.items())))
         with self._lock:
             hit = self._cache.get(key)
         if hit is not None:
             return hit
-
         try:
-            response = self._session.get(
-                SEARCH_URL,
-                params={"term": query, "media": "music", "entity": "song",
-                        "limit": max(1, min(int(limit), 50)),
-                        "country": self.country},
-                timeout=LOOKUP_TIMEOUT)
+            response = self._session.get(url, params=params,
+                                         timeout=LOOKUP_TIMEOUT)
             response.raise_for_status()
             payload = response.json()
         except Exception:
-            return []
-
-        out = [self._as_track(item) for item in payload.get("results") or []]
-        out = [track for track in out if track]
+            return {}
         with self._lock:
             if len(self._cache) > CACHE_LIMIT:
                 self._cache.clear()
-            self._cache[key] = out
-        return out
+            self._cache[key] = payload
+        return payload
 
     def _as_track(self, item):
         if not item.get("trackName") or not item.get("artistName"):
@@ -107,6 +127,99 @@ class ITunesProvider:
             "track_number": item.get("trackNumber"),
             "disc_number": item.get("discNumber"),
             "album_artist": item.get("collectionArtistName") or artist,
+        }
+
+    # --------------------------------------------------------------- browse
+
+    def search_artists(self, query, limit=8):
+        """Artists matching a query, so a search can lead to a discography."""
+        query = (query or "").strip()
+        if not query:
+            return []
+        payload = self._get(SEARCH_URL,
+                            {"term": query, "media": "music",
+                             "entity": "musicArtist",
+                             "limit": max(1, min(int(limit), 50)),
+                             "country": self.country})
+        out = [self._as_artist(item) for item in payload.get("results") or []]
+        return [artist for artist in out if artist][:limit]
+
+    def artist_albums(self, artist, limit=200):
+        """Everything Apple lists under an artist, newest first."""
+        artist_id = _plain_id((artist or {}).get("id"))
+        if not artist_id:
+            return []
+        payload = self._get(LOOKUP_URL,
+                            {"id": artist_id, "entity": "album",
+                             "limit": max(1, min(int(limit), 200)),
+                             "country": self.country})
+        out = []
+        for item in payload.get("results") or []:
+            # The lookup echoes the artist back as the first result; only the
+            # collections after it are releases.
+            if item.get("wrapperType") != "collection":
+                continue
+            album = self._as_album(item)
+            if album:
+                out.append(album)
+        out.sort(key=lambda album: album["name"].lower())
+        out.sort(key=lambda album: album["year"] or "", reverse=True)
+        return out
+
+    def album_tracks(self, album, limit=200):
+        """The tracks on one release, in disc and track order."""
+        album_id = _plain_id((album or {}).get("id"))
+        if not album_id:
+            return []
+        payload = self._get(LOOKUP_URL,
+                            {"id": album_id, "entity": "song",
+                             "limit": max(1, min(int(limit), 200)),
+                             "country": self.country})
+        out = []
+        for item in payload.get("results") or []:
+            if item.get("wrapperType") != "track":
+                continue
+            track = self._as_track(item)
+            if track:
+                out.append(track)
+        out.sort(key=lambda track: (track.get("disc_number") or 1,
+                                    track.get("track_number") or 0))
+        return out
+
+    def _as_artist(self, item):
+        name = item.get("artistName")
+        if not name:
+            return None
+        return {
+            "source": "itunes",
+            "id": "itunes:%s" % item.get("artistId"),
+            "name": name,
+            "url": item.get("artistLinkUrl") or "",
+            # Apple's search returns no portrait for a musicArtist entity, so
+            # this is always None here and the UI draws an initial instead.
+            # Spotify does supply one.
+            "image_url": None,
+            "genres": [g for g in (item.get("primaryGenreName"),) if g],
+        }
+
+    def _as_album(self, item):
+        name = item.get("collectionName")
+        if not name:
+            return None
+        return {
+            "source": "itunes",
+            "id": "itunes:%s" % item.get("collectionId"),
+            "name": name,
+            "artist": item.get("artistName") or "",
+            "year": (item.get("releaseDate") or "")[:4],
+            # Apple does not label singles and compilations the way Spotify
+            # does, so everything lands in one group rather than being
+            # sorted into sections on a guess.
+            "album_type": "album",
+            "total_tracks": item.get("trackCount") or 0,
+            "url": item.get("collectionViewUrl") or "",
+            "cover_url": item.get("artworkUrl100"),
+            "cover_large": _artwork(item.get("artworkUrl100")),
         }
 
     # -------------------------------------------------------------- tagging

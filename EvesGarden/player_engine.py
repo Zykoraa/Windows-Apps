@@ -17,7 +17,11 @@ EQ_FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 EQ_Q = 1.41  # roughly one octave per band
 
 MIN_DB, MAX_DB = -24.0, 12.0
-NUM_VIS_BANDS = 16
+# 16 was the whole reason the visualisers looked coarse: every mode, radial
+# ones included, was drawing a picture of sixteen numbers. A 2048-sample
+# chunk gives about a thousand usable FFT bins, so the resolution was there
+# all along and was being thrown away one step after it was computed.
+NUM_VIS_BANDS = 64
 
 
 def _design_peaking(f0, q, gain_db, fs):
@@ -417,13 +421,23 @@ class PlayerEngine:
         if len(fft_data) <= NUM_VIS_BANDS:
             return
 
-        indices = np.logspace(
-            0, np.log10(len(fft_data) - 1), num=NUM_VIS_BANDS + 1, dtype=int
-        )
+        # Float edges, not integer ones. Rounding them to bins first collapsed
+        # the bottom of the range -- log spacing puts the first several edges
+        # inside bin 1 -- so the lowest bands were handed a copy of the same
+        # number and the bass end moved as one block.
+        edges = np.logspace(0, np.log10(len(fft_data) - 1),
+                            num=NUM_VIS_BANDS + 1)
+        bins = np.arange(len(fft_data))
         energies = np.empty(NUM_VIS_BANDS)
         for i in range(NUM_VIS_BANDS):
-            start, end = indices[i], max(indices[i + 1], indices[i] + 1)
-            energies[i] = np.mean(fft_data[start:end])
+            low, high = edges[i], edges[i + 1]
+            start, end = int(np.floor(low)), int(np.ceil(high))
+            if end - start >= 2:
+                energies[i] = fft_data[start:end].mean()
+            else:
+                # Narrower than one bin: read between the two either side
+                # rather than repeating whichever one it lands on.
+                energies[i] = np.interp((low + high) / 2.0, bins, fft_data)
 
         # Normalise against chunk length so the scale no longer depends on it,
         # then use a dB curve so quiet passages still show movement.

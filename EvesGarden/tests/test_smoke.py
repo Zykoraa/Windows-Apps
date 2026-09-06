@@ -54,6 +54,34 @@ class OfflineCatalogue:
                  "cover_large": None}
                 for i in range(min(3, limit))]
 
+    @staticmethod
+    def search_artists(query, limit=6):
+        return [{"source": "offline", "id": "offline:artist:%d" % i,
+                 "name": "Artist %d for %s" % (i, query), "url": "",
+                 "image_url": None, "genres": ["Rock"]}
+                for i in range(min(2, limit))]
+
+    @staticmethod
+    def artist_albums(artist):
+        return [{"source": "offline", "id": "offline:album:%d" % i,
+                 "name": "Album %d" % i, "artist": artist["name"],
+                 "year": "200%d" % i,
+                 "album_type": ("album", "single", "compilation")[i],
+                 "total_tracks": 3, "url": "", "cover_url": None,
+                 "cover_large": None}
+                for i in range(3)]
+
+    @staticmethod
+    def album_tracks(album):
+        return [{"source": "offline", "id": "%s:t%d" % (album["id"], i),
+                 "title": "Track %d" % i, "artists": ["Someone"],
+                 "artist": "Someone", "album": album["name"],
+                 "year": album["year"], "duration": 180.0,
+                 "duration_ms": 180000, "url": "", "cover_url": None,
+                 "cover_large": None, "track_number": i + 1,
+                 "disc_number": 1, "album_artist": "Someone"}
+                for i in range(3)]
+
 
 def _has_display():
     try:
@@ -123,8 +151,6 @@ class SurfaceWalk:
 
         for label, opener, closer in (
             ("downloader", app.open_downloader, app.close_downloader),
-            ("visualiser", app.toggle_visualizer_visibility,
-             app.toggle_visualizer_visibility),
             ("now playing", app.toggle_now_playing_overlay,
              app.toggle_now_playing_overlay),
             ("queue panel", app.toggle_queue, app.toggle_queue),
@@ -136,6 +162,58 @@ class SurfaceWalk:
             self.mark("close %s" % label)
             closer()
             yield 320
+
+        # Searching an artist's name used to answer with their loose tracks
+        # only, so there was no way through to an album. Walk the whole path:
+        # the results, the discography, one album opened, and back again.
+        self.mark("open downloader for search")
+        app.open_downloader()
+        yield 400
+
+        self.mark("search results list artists as well as songs")
+        app.url_entry.delete(0, "end")
+        app.url_entry.insert(0, "someone")
+        app.run_discover_search()
+        yield from self._until("the search never answered",
+                               lambda: bool(app.discover_artists))
+        headings = self._labels(app.results_frame)
+        assert "Artists" in headings and "Songs" in headings, (
+            "results panel showed %s, not both artists and songs" % headings)
+
+        self.mark("open a discography")
+        app.open_artist(app.discover_artists[0])
+        yield from self._until(
+            "the discography never rendered",
+            lambda: self._button(app.results_frame, "Back to results") is not None)
+        assert self._button(app.results_frame, "Download album") is not None, (
+            "a discography with no way to take an album")
+        headings = self._labels(app.results_frame)
+        assert "Albums" in headings and "Singles & EPs" in headings, (
+            "releases were not grouped by kind: %s" % headings)
+
+        self.mark("expand an album")
+        toggle = self._button(app.results_frame, "\u25bc")
+        assert toggle is not None, "an album that cannot be opened"
+        toggle.invoke()
+        yield from self._until(
+            "the album never opened",
+            lambda: "Track 1" in self._labels(app.results_frame))
+
+        self.mark("collapse it again")
+        self._button(app.results_frame, "\u25b2").invoke()
+        yield from self._until(
+            "collapsing an album left its tracks on screen",
+            lambda: "Track 1" not in self._labels(app.results_frame))
+
+        self.mark("back to the results")
+        self._button(app.results_frame, "Back to results").invoke()
+        yield from self._until(
+            "going back did not restore the search results",
+            lambda: "Songs" in self._labels(app.results_frame))
+
+        self.mark("close downloader after search")
+        app.close_downloader()
+        yield 320
 
         # The lyrics pane has three shapes and none of them can be reached
         # without the network, so they are handed straight to the renderer.
@@ -156,6 +234,46 @@ class SurfaceWalk:
         app._scroll_lyric_into_view(3)
         yield 220
 
+        # A long song, because the bug this covers only shows once the words
+        # outgrow the pane: CTkScrollableFrame keeps the canvas scrollregion
+        # up to date from its own <Configure> binding, and binding over that
+        # without add="+" left the canvas believing the whole song already
+        # fit. Nothing scrolled -- not the follow, not the wheel.
+        self.mark("lyrics: a song longer than the pane")
+        app.setup_lyrics(([(float(i * 3),
+                            "Line %d of a song with enough words to wrap" % i)
+                           for i in range(60)], True))
+        yield 400
+        canvas = app.lyrics_scroll._parent_canvas
+        assert canvas.cget("scrollregion"), (
+            "the lyrics canvas has no scrollregion, so it cannot scroll at all")
+        first, last = canvas.yview()
+        assert last - first < 0.9, (
+            "the pane thinks a 60-line song already fits: yview=%s"
+            % (canvas.yview(),))
+
+        self.mark("lyrics: the song scrolls itself")
+        app._lyrics_touched_at = 0.0
+        app._scroll_lyric_into_view(50, smooth=False)
+        yield 260
+        moved = canvas.yview()[0]
+        assert moved > 0.5, (
+            "following the song did not move the pane: yview=%s" % (canvas.yview(),))
+
+        self.mark("lyrics: a hand on the pane wins")
+        app._lyrics_user_took_over()
+        app._scroll_lyric_into_view(0, smooth=False)
+        yield 160
+        assert canvas.yview()[0] == moved, (
+            "the song pulled the pane back while it was being read")
+
+        self.mark("lyrics: and it takes it back afterwards")
+        app._lyrics_touched_at = 0.0
+        app._scroll_lyric_into_view(0, smooth=False)
+        yield 160
+        assert canvas.yview()[0] < 0.1, (
+            "the song never took the pane back after the reader let go")
+
         self.mark("lyrics: words with no timings")
         app.setup_lyrics(([(None, "Just the words"), (None, ""),
                            (None, "On three lines")], False))
@@ -170,6 +288,56 @@ class SurfaceWalk:
         yield 220
         app.toggle_now_playing_overlay()
         yield 300
+
+        self.mark("visualiser draws behind now playing")
+        app.toggle_now_playing_overlay()
+        yield 420
+        canvas = app.np_canvas
+        keep = set(canvas.find_all()) - set(canvas.find_withtag(self.gui.visualizers.TAG))
+        assert keep, "the now playing canvas was empty before the visualiser"
+        app._draw_bands([0.5] * 64)
+        yield 220
+        viz = canvas.find_withtag(self.gui.visualizers.TAG)
+        assert viz, "the visualiser drew nothing behind now playing"
+        assert keep <= set(canvas.find_all()), (
+            "drawing the visualiser wiped the cover or the titles off the "
+            "canvas it shares with them")
+
+        self.mark("the backdrop stays in its band")
+        height = canvas.winfo_height()
+        floor = height * (1.0 - app.NP_VIZ_BAND) - 4
+        highest = min(canvas.bbox(item)[1] for item in viz)
+        assert highest >= floor, (
+            "the backdrop reached %dpx up a %dpx canvas, past the %dpx band"
+            % (height - highest, height, height * app.NP_VIZ_BAND))
+
+        self.mark("the pickers are clear of the cards")
+        def box(widget):
+            return (widget.winfo_rootx(), widget.winfo_rooty(),
+                    widget.winfo_rootx() + widget.winfo_width(),
+                    widget.winfo_rooty() + widget.winfo_height())
+        for picker in (app.viz_dropdown, app.viz_palette_dropdown):
+            for card, name in ((app.np_lyrics_card, "lyrics"),
+                               (app.np_queue_card, "queue")):
+                if not (picker.winfo_ismapped() and card.winfo_ismapped()):
+                    continue
+                ax0, ay0, ax1, ay1 = box(picker)
+                bx0, by0, bx1, by1 = box(card)
+                assert not (ax0 < bx1 and bx0 < ax1
+                            and ay0 < by1 and by0 < ay1), (
+                    "a visualiser picker is sitting on top of the %s card, "
+                    "covering its heading" % name)
+
+        self.mark("the titles stay on top of it")
+        order = canvas.find_all()
+        assert order.index(app._np_title_id) > order.index(viz[-1]), (
+            "the title is underneath the backdrop")
+
+        self.mark("closing now playing clears the backdrop")
+        app.toggle_now_playing_overlay()
+        yield 420
+        assert not canvas.find_withtag(self.gui.visualizers.TAG), (
+            "the last frame was left on the canvas after closing")
 
         self.mark("command palette")
         app.toggle_palette()
@@ -410,15 +578,28 @@ class SurfaceWalk:
             app.change_theme(name)
             yield 260
 
+        # Every mode, drawn on the canvas it now shares with the cover and
+        # the cards. A mode that forgets to tag what it draws would clear
+        # them, and a mode that throws would take the whole backdrop down.
         self.mark("visualiser modes")
-        app.toggle_visualizer_visibility()
-        yield 260
+        app.toggle_now_playing_overlay()
+        yield 300
+        protected = (set(app.np_canvas.find_all())
+                     - set(app.np_canvas.find_withtag(self.gui.visualizers.TAG)))
         for index in range(len(self.gui.VIZ_MODES)):
             app.set_visualizer_mode(index)
-            app.update_visualizer([0.4] * 24)
+            app._draw_bands([0.4 + 0.3 * ((i * 7) % 11) / 11.0
+                             for i in range(64)])
+            yield 30
+            assert protected <= set(app.np_canvas.find_all()), (
+                "mode %r wiped the cover or the titles off the shared canvas"
+                % self.gui.VIZ_MODES[index])
+        for name in self.gui.visualizers.palette_names():
+            app.set_visualizer_palette(name)
+            app._draw_bands([0.5] * 64)
             yield 20
-        app.toggle_visualizer_visibility()
-        yield 200
+        app.toggle_now_playing_overlay()
+        yield 240
 
         # Windows decides whether it will snap or tile a window from its
         # style bits alone. A frameless window is a WS_POPUP and gets neither
@@ -494,6 +675,65 @@ class SurfaceWalk:
         app._toggle_mute()
         yield 200
 
+    def _until(self, what, ready, budget=8000, step=100):
+        """Yield until `ready()` holds, rather than guessing a delay.
+
+        A render handed over from a worker thread lands whenever the UI pump
+        next runs, and how soon that is depends on what else the app has in
+        flight -- so a walk that waits a fixed number of milliseconds passes
+        or fails by luck.
+        """
+        waited = 0
+        while waited < budget:
+            if ready():
+                return
+            yield step
+            waited += step
+        raise AssertionError("%s within %dms" % (what, budget))
+
+    def _widgets(self, parent):
+        found = [parent]
+        for child in parent.winfo_children():
+            found.extend(self._widgets(child))
+        return found
+
+    def _labels(self, parent):
+        """Every piece of text actually on screen in a panel.
+
+        Mapped only: collapsing an album unmaps its tracks but keeps them, so
+        that re-opening it is instant -- and a walk that asked which widgets
+        exist rather than which are visible could not tell the difference.
+        """
+        out = []
+        for widget in self._widgets(parent):
+            try:
+                if not widget.winfo_ismapped():
+                    continue
+                text = widget.cget("text")
+            except Exception:
+                continue
+            if isinstance(text, str) and text:
+                out.append(text)
+        return out
+
+    def _button(self, parent, text):
+        """The first button whose label contains `text`.
+
+        Contains rather than equals: these labels carry a leading glyph, so
+        the back button reads "\u2190  Back to results" rather than the words
+        on their own.
+        """
+        for widget in self._widgets(parent):
+            if not isinstance(widget, self.gui.ctk.CTkButton):
+                continue
+            try:
+                label = widget.cget("text")
+            except Exception:
+                continue
+            if isinstance(label, str) and text in label:
+                return widget
+        return None
+
     def mark(self, what):
         self.visited.append(what)
 
@@ -564,7 +804,13 @@ class Smoke(unittest.TestCase):
         try:
             app = gui.App()
             app.geometry("1280x800+40+40")
+            # No Spotify client to prefer over the canned results, and no
+            # preview warming -- resolving a YouTube URL is a real network
+            # call, and four of them behind every search starve the UI pump
+            # the walk waits on.
+            app.discover.sp = None
             app.discover.fallback = OfflineCatalogue()
+            app.discover.prefetch = lambda track: None
             app.catalogue = OfflineCatalogue()
             walk = SurfaceWalk(gui, app)
             walk.run()

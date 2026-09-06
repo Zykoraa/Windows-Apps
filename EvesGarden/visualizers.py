@@ -14,6 +14,12 @@ import colorsys
 import math
 import random
 
+# Every item a mode draws carries this tag, so a frame can be cleared without
+# touching anything else on the canvas. That is what lets the visualiser
+# share the Now Playing canvas with the cover, the titles and the cards
+# rather than needing a canvas -- and a background -- of its own.
+TAG = "viz"
+
 _REGISTRY = []
 
 
@@ -168,10 +174,10 @@ class Frame:
 
     __slots__ = ("canvas", "bands", "accent", "width", "height",
                  "cx", "cy", "n", "avg", "now", "bar_width", "_palette",
-                 "_ring", "peaks")
+                 "_ring", "peaks", "_dim", "_dim_to")
 
     def __init__(self, canvas, bands, accent, width, height, now, palette,
-                 peaks=()):
+                 peaks=(), dim=0.0, dim_to="#000000"):
         self.canvas = canvas
         self.bands = bands
         self.accent = accent
@@ -184,6 +190,11 @@ class Frame:
         self.now = now
         self.bar_width = width / self.n if self.n else width
         self._palette = PALETTES.get(palette, PALETTES["Accent"])
+        # How far every colour is pulled toward the surface behind it. Zero
+        # on a page of its own; higher when the visualiser is the backdrop to
+        # a title and two cards, which have to stay readable over it.
+        self._dim = min(1.0, max(0.0, dim))
+        self._dim_to = dim_to
         self._ring = None
         # Held peaks for this frame, one per band. Worked out once for the
         # frame rather than per mode, so a mode reading them cannot advance
@@ -191,11 +202,17 @@ class Frame:
         self.peaks = peaks or bands
 
     def colour(self, t=0.0):
-        """Colour at position t (0..1) through the palette."""
+        """Colour at position t (0..1) through the palette.
+
+        Dimming happens here rather than in each mode, so all thirty-two of
+        them read as a backdrop when they are being used as one, without
+        knowing anything about it.
+        """
         try:
-            return self._palette(t, self.accent, self.now)
+            shade = self._palette(t, self.accent, self.now)
         except Exception:
-            return self.accent
+            shade = self.accent
+        return _mix(shade, self._dim_to, self._dim) if self._dim else shade
 
     def band_colour(self, i):
         return self.colour(i / max(1, self.n - 1))
@@ -244,6 +261,18 @@ class Frame:
     # turned every quiet band into a ball.
     BAR_RADIUS = 4
 
+    def slot(self, i, gap=None):
+        """The x range of band `i`, with a gap that scales with the bar.
+
+        The gap used to be a flat 2px. At sixteen bands that was a hairline;
+        at sixty-four it is a third of the bar, and the analyser reads as a
+        dotted line rather than a row of bars.
+        """
+        if gap is None:
+            gap = min(2.0, self.bar_width * 0.18)
+        x0 = i * self.bar_width + gap
+        return x0, x0 + self.bar_width - gap * 2
+
     def bar(self, x0, x1, top, bottom, colour, dome="top"):
         """One bar of the analyser, rounded at the end it grows towards.
 
@@ -257,32 +286,63 @@ class Frame:
         if dome and radius >= 1.5 and (bottom - top) >= radius:
             if dome == "top":
                 self.canvas.create_oval(x0, top, x1, top + radius * 2,
-                                        fill=colour, outline="")
+                                        fill=colour, outline="", tags=TAG)
                 top += radius
             else:
                 self.canvas.create_oval(x0, bottom - radius * 2, x1, bottom,
-                                        fill=colour, outline="")
+                                        fill=colour, outline="", tags=TAG)
                 bottom -= radius
         if bottom > top:
             self.canvas.create_rectangle(x0, top, x1, bottom, fill=colour,
-                                         outline="")
+                                         outline="", tags=TAG)
 
-    def cap(self, x0, x1, y, below=False):
-        """The peak marker, sitting just clear of where the bar reached."""
+    # Below this a held peak is indistinguishable from silence, and drawing
+    # it anyway is what put a dotted rule along the foot of the analyser: at
+    # sixty-four bands most of the top end is near-silent most of the time,
+    # so most of the row was markers for peaks that were never there.
+    CAP_FLOOR = 0.04
+
+    def cap(self, x0, x1, y, below=False, strength=None):
+        """The peak marker, sitting just clear of where the bar reached.
+
+        `strength` is the held peak the marker is for. A marker for nothing
+        reads as a rendering fault rather than as a peak.
+        """
+        if strength is not None and strength < self.CAP_FLOOR:
+            return
         y0 = y if below else y - self.CAP_H
         self.canvas.create_rectangle(x0, y0, x1, y0 + self.CAP_H,
-                                     fill=self.colour(0.98), outline="")
+                                     fill=self.colour(0.98), outline="",
+                                     tags=TAG)
 
 
-def draw(canvas, mode, bands, accent, width, height, now, palette="Accent"):
-    """Render one frame. `mode` is an index; out-of-range falls back to 0."""
+def _mix(a, b, t):
+    """Blend two "#rrggbb" colours, for pulling a frame toward its backdrop."""
+    try:
+        ar, ag, ab = int(a[1:3], 16), int(a[3:5], 16), int(a[5:7], 16)
+        br, bg, bb = int(b[1:3], 16), int(b[3:5], 16), int(b[5:7], 16)
+    except (ValueError, IndexError, TypeError):
+        return a
+    return "#%02x%02x%02x" % (int(ar + (br - ar) * t),
+                              int(ag + (bg - ag) * t),
+                              int(ab + (bb - ab) * t))
+
+
+def draw(canvas, mode, bands, accent, width, height, now, palette="Accent",
+         dim=0.0, dim_to="#000000"):
+    """Render one frame. `mode` is an index; out-of-range falls back to 0.
+
+    Only items tagged TAG are cleared, so the canvas may already hold other
+    things -- a cover, a title, embedded cards -- and keep them.
+    """
     if not bands or width <= 1 or height <= 1:
         return 0
     if not (0 <= mode < len(_REGISTRY)):
         mode = 0
-    canvas.delete("all")
+    canvas.delete(TAG)
     _REGISTRY[mode][1](Frame(canvas, bands, accent, width, height, now,
-                             palette, _peaks.update(bands, now)))
+                             palette, _peaks.update(bands, now),
+                             dim=dim, dim_to=dim_to))
     return len(_REGISTRY)
 
 
@@ -306,25 +366,24 @@ def _standard(f):
     still there after the bar has dropped away from it.
     """
     for i, energy in enumerate(f.bands):
-        x0 = i * f.bar_width + 2
-        x1 = x0 + f.bar_width - 2
+        x0, x1 = f.slot(i)
         f.bar(x0, x1, f.height - energy * f.height, f.height, f.band_colour(i))
-        f.cap(x0, x1, f.height - f.peaks[i] * f.height)
+        f.cap(x0, x1, f.height - f.peaks[i] * f.height,
+              strength=f.peaks[i])
 
 
 @visualizer("Mirrored Bars")
 def _mirrored(f):
     """The same, opening from the middle in both directions."""
     for i, energy in enumerate(f.bands):
-        x0 = i * f.bar_width + 2
-        x1 = x0 + f.bar_width - 2
+        x0, x1 = f.slot(i)
         reach = energy * f.cy
         colour = f.band_colour(i)
         f.bar(x0, x1, f.cy - reach, f.cy, colour)
         f.bar(x0, x1, f.cy, f.cy + reach, colour, dome="bottom")
         held = f.peaks[i] * f.cy
-        f.cap(x0, x1, f.cy - held)
-        f.cap(x0, x1, f.cy + held, below=True)
+        f.cap(x0, x1, f.cy - held, strength=f.peaks[i])
+        f.cap(x0, x1, f.cy + held, below=True, strength=f.peaks[i])
 
 
 @visualizer("Bar Reflection")
@@ -332,13 +391,13 @@ def _reflection(f):
     """Bars standing on a mirrored, faded copy of themselves."""
     floor = f.height * 0.62
     for i, energy in enumerate(f.bands):
-        x0 = i * f.bar_width + 3
-        x1 = x0 + f.bar_width - 6
+        x0, x1 = f.slot(i, gap=min(3.0, f.bar_width * 0.22))
         h = energy * floor * 0.95
         f.bar(x0, x1, floor - h, floor, f.band_colour(i))
         f.bar(x0, x1, floor + 3, floor + 3 + h * 0.42, f.colour(0.15),
               dome="bottom")
-        f.cap(x0, x1, floor - f.peaks[i] * floor * 0.95)
+        f.cap(x0, x1, floor - f.peaks[i] * floor * 0.95,
+              strength=f.peaks[i])
 
 
 @visualizer("Waveform")
@@ -350,7 +409,7 @@ def _waveform(f):
             points.extend([i * f.bar_width, f.cy + sign * energy * f.cy])
         if points:
             f.canvas.create_line(*points, fill=f.colour(0.5), width=3,
-                                 smooth=True, capstyle="round")
+                                 smooth=True, capstyle="round", tags=TAG)
 
 
 @visualizer("Spectrum Ribbon")
@@ -363,9 +422,10 @@ def _ribbon(f):
         top.extend([x, y])
         crest.extend([x, y])
     poly = [0, f.height] + top + [f.width, f.height]
-    f.canvas.create_polygon(poly, fill=f.colour(0.35), outline="", smooth=True)
+    f.canvas.create_polygon(poly, fill=f.colour(0.35), outline="",
+                            smooth=True, tags=TAG)
     f.canvas.create_line(*crest, fill=f.colour(0.95), width=3, smooth=True,
-                         capstyle="round")
+                         capstyle="round", tags=TAG)
 
 
 @visualizer("Aurora")
@@ -382,7 +442,7 @@ def _aurora(f):
         if len(pts) >= 6:
             band = pts + [f.width, f.height, 0, f.height]
             f.canvas.create_polygon(band, fill=f.colour(0.2 + layer * 0.25),
-                                    outline="", smooth=True)
+                                    outline="", smooth=True, tags=TAG)
 
 
 @visualizer("Circular")
@@ -400,7 +460,7 @@ def _circular(f):
         f.canvas.create_line(f.cx + ca * inner, f.cy + sa * inner,
                              f.cx + ca * r, f.cy + sa * r,
                              fill=f.ring_colour(i), width=width,
-                             capstyle="round")
+                             capstyle="round", tags=TAG)
 
 
 @visualizer("Tunnel")
@@ -415,7 +475,8 @@ def _tunnel(f):
         f.canvas.create_rectangle(f.cx - r, f.cy - r * 0.72,
                                   f.cx + r, f.cy + r * 0.72,
                                   outline=f.colour(1 - depth),
-                                  width=max(1, int(1 + (1 - depth) * 5)))
+                                  width=max(1, int(1 + (1 - depth) * 5)),
+                                  tags=TAG)
 
 
 @visualizer("Ripple")
@@ -429,4 +490,5 @@ def _ripple(f):
             continue
         f.canvas.create_oval(f.cx - r, f.cy - r, f.cx + r, f.cy + r,
                              outline=f.colour(1 - phase),
-                             width=max(1, int((1 - phase) * 6 + f.avg * 4)))
+                             width=max(1, int((1 - phase) * 6 + f.avg * 4)),
+                             tags=TAG)

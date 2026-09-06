@@ -22,6 +22,7 @@ from play_queue import PlayQueue
 import colorsys
 import downloader
 import metadata
+import discover
 import audio_files
 import loudness
 import lyrics
@@ -622,9 +623,11 @@ class FakeSession:
         self.payload = payload if payload is not None else {"results": []}
         self.explode = explode
         self.calls = 0
+        self.params = {}
 
     def get(self, url, params=None, timeout=None):
         self.calls += 1
+        self.params = dict(params or {})
         if self.explode:
             raise IOError("no network")
         return FakeResponse(self.payload)
@@ -2265,3 +2268,470 @@ class WatchedPlaylists(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ITunesBrowsing(unittest.TestCase):
+    """Following a search through to an artist's releases, with no account.
+
+    The bug this covers: searching an artist's name answered only with their
+    loose tracks, so there was no way to reach an album, let alone take one.
+    """
+
+    ARTIST = {"wrapperType": "artist", "artistId": 507077,
+              "artistName": "John Mayer", "primaryGenreName": "Rock",
+              "artistLinkUrl": "https://music.apple.com/artist/507077"}
+    ALBUM = {"wrapperType": "collection", "collectionId": 201,
+             "collectionName": "Continuum", "artistName": "John Mayer",
+             "releaseDate": "2006-09-12T07:00:00Z", "trackCount": 12,
+             "collectionViewUrl": "https://music.apple.com/album/201",
+             "artworkUrl100": "https://example.test/c/100x100bb.jpg"}
+    OLDER = dict(ALBUM, collectionId=202, collectionName="Heavier Things",
+                 releaseDate="2003-09-09T07:00:00Z")
+
+    def provider(self, payload):
+        session = FakeSession(payload)
+        return metadata.ITunesProvider(session=session), session
+
+    def test_an_artist_search_maps_into_a_shape_the_ui_can_open(self):
+        p, _ = self.provider({"results": [self.ARTIST]})
+        artist = p.search_artists("john mayer")[0]
+        self.assertEqual(artist["source"], "itunes")
+        self.assertEqual(artist["name"], "John Mayer")
+        self.assertEqual(artist["id"], "itunes:507077")
+        self.assertEqual(artist["genres"], ["Rock"])
+        # No portrait comes back for a musicArtist, and the UI relies on
+        # that being None rather than a broken URL.
+        self.assertIsNone(artist["image_url"])
+
+    def test_the_artist_echoed_back_by_a_lookup_is_not_a_release(self):
+        p, _ = self.provider({"results": [self.ARTIST, self.ALBUM]})
+        albums = p.artist_albums({"id": "itunes:507077"})
+        self.assertEqual([a["name"] for a in albums], ["Continuum"])
+        self.assertEqual(albums[0]["total_tracks"], 12)
+        self.assertEqual(albums[0]["year"], "2006")
+
+    def test_a_discography_reads_newest_first(self):
+        p, _ = self.provider({"results": [self.ARTIST, self.OLDER, self.ALBUM]})
+        albums = p.artist_albums({"id": "itunes:507077"})
+        self.assertEqual([a["year"] for a in albums], ["2006", "2003"])
+
+    def test_a_lookup_asks_apple_for_the_bare_id(self):
+        p, session = self.provider({"results": []})
+        p.artist_albums({"id": "itunes:507077"})
+        self.assertEqual(session.params["id"], "507077")
+
+    def test_an_album_opens_onto_its_tracks_in_order(self):
+        songs = [dict(ITUNES_ITEM, wrapperType="track", trackNumber=n)
+                 for n in (3, 1, 2)]
+        p, _ = self.provider({"results": [self.ALBUM] + songs})
+        tracks = p.album_tracks({"id": "itunes:201"})
+        self.assertEqual([t["track_number"] for t in tracks], [1, 2, 3])
+        # The collection wrapper is not a song and must not become a row.
+        self.assertEqual(len(tracks), 3)
+
+    def test_browsing_without_an_id_never_asks(self):
+        p, session = self.provider({"results": []})
+        self.assertEqual(p.artist_albums({}), [])
+        self.assertEqual(p.album_tracks({}), [])
+        self.assertEqual(session.calls, 0)
+
+    def test_a_dead_network_is_an_empty_discography_not_a_crash(self):
+        session = FakeSession({"results": []}, explode=True)
+        p = metadata.ITunesProvider(session=session)
+        self.assertEqual(p.search_artists("john mayer"), [])
+        self.assertEqual(p.artist_albums({"id": "itunes:1"}), [])
+        self.assertEqual(p.album_tracks({"id": "itunes:1"}), [])
+
+
+class BrowsableSpotify:
+    """Just the endpoints browsing uses, with paging."""
+
+    def __init__(self, artists=(), albums=(), tracks=(), explode=False):
+        self.artists = list(artists)
+        self.albums = list(albums)
+        self.tracks = list(tracks)
+        self.explode = explode
+
+    def _page(self, items):
+        # One item per page, so the pagination loop is actually exercised.
+        if not items:
+            return {"items": [], "next": None}
+        return {"items": [items[0]], "next": bool(items[1:]) or None,
+                "_rest": items[1:]}
+
+    def next(self, page):
+        return self._page(page.get("_rest") or [])
+
+    def search(self, q=None, limit=None, offset=0, type=None):
+        if self.explode:
+            raise RuntimeError("spotify is down")
+        return {"artists": {"items": self.artists}}
+
+    def artist_albums(self, artist_id, album_type=None, limit=None):
+        if self.explode:
+            raise RuntimeError("spotify is down")
+        return self._page(self.albums)
+
+    def album_tracks(self, album_id, limit=None):
+        if self.explode:
+            raise RuntimeError("spotify is down")
+        return self._page(self.tracks)
+
+
+def _browse_album(name, year, album_id="a1", group="album", tracks=10):
+    return {"id": album_id, "name": name, "release_date": year,
+            "album_group": group, "total_tracks": tracks,
+            "artists": [{"name": "John Mayer"}],
+            "external_urls": {"spotify": "https://open.spotify.com/album/" + album_id},
+            "images": [{"url": "big.jpg"}, {"url": "small.jpg"}]}
+
+
+class DiscoverBrowsing(unittest.TestCase):
+    """Artist and album browsing, and which provider answers."""
+
+    def build(self, sp=None, fallback=None):
+        return discover.Discover(sp, lambda: {}, lambda *a: 0,
+                                 fallback=fallback)
+
+    def test_a_reissue_does_not_duplicate_the_album_it_reissues(self):
+        d = self.build(BrowsableSpotify(albums=[
+            _browse_album("Continuum", "2016-01-01", "new"),
+            _browse_album("Continuum", "2006-09-12", "old"),
+        ]))
+        albums = d.artist_albums({"source": "spotify", "id": "x"})
+        # One row, and it is the original pressing rather than the repress.
+        self.assertEqual(len(albums), 1)
+        self.assertEqual(albums[0]["year"], "2006")
+
+    def test_a_discography_reads_newest_first(self):
+        d = self.build(BrowsableSpotify(albums=[
+            _browse_album("Heavier Things", "2003-09-09", "b"),
+            _browse_album("Continuum", "2006-09-12", "a"),
+        ]))
+        albums = d.artist_albums({"source": "spotify", "id": "x"})
+        self.assertEqual([a["name"] for a in albums],
+                         ["Continuum", "Heavier Things"])
+
+    def test_a_single_stays_out_of_the_albums_group(self):
+        d = self.build(BrowsableSpotify(albums=[
+            _browse_album("Continuum", "2006", "a"),
+            _browse_album("Gravity", "2007", "b", group="single"),
+        ]))
+        groups = {a["name"]: a["album_type"]
+                  for a in d.artist_albums({"source": "spotify", "id": "x"})}
+        self.assertEqual(groups, {"Continuum": "album", "Gravity": "single"})
+
+    def test_tracks_inside_an_album_inherit_that_album(self):
+        # A track listed under an album carries no album of its own, so
+        # without this every row downloads untagged and shows no cover.
+        d = self.build(BrowsableSpotify(tracks=[{
+            "id": "t1", "name": "Gravity", "duration_ms": 245773,
+            "track_number": 4, "disc_number": 1,
+            "artists": [{"name": "John Mayer"}],
+            "external_urls": {"spotify": "https://open.spotify.com/track/t1"},
+        }]))
+        album = _browse_album("Continuum", "2006-09-12")
+        track = d.album_tracks(discover._as_album(album))[0]
+        self.assertEqual(track["album"], "Continuum")
+        self.assertEqual(track["year"], "2006")
+        self.assertEqual(track["cover_large"], "big.jpg")
+        self.assertEqual(track["cover_url"], "small.jpg")
+        self.assertEqual(track["album_artist"], "John Mayer")
+        # The same keys a search result has, so the same rows can render it.
+        for key in ("source", "id", "title", "artist", "artists", "duration",
+                    "duration_ms", "url"):
+            self.assertIn(key, track)
+
+    def test_paging_walks_past_the_ten_item_cap(self):
+        d = self.build(BrowsableSpotify(albums=[
+            _browse_album("One", "2001", "a"), _browse_album("Two", "2002", "b"),
+            _browse_album("Three", "2003", "c"),
+        ]))
+        self.assertEqual(len(d.artist_albums({"source": "spotify", "id": "x"})), 3)
+
+    def test_an_apple_artist_is_never_opened_through_spotify(self):
+        sp = BrowsableSpotify(albums=[_browse_album("Wrong", "2020")])
+        fallback = metadata.ITunesProvider(
+            session=FakeSession({"results": [ITunesBrowsing.ARTIST,
+                                             ITunesBrowsing.ALBUM]}))
+        d = self.build(sp, fallback=fallback)
+        albums = d.artist_albums({"source": "itunes", "id": "itunes:507077"})
+        self.assertEqual([a["name"] for a in albums], ["Continuum"])
+
+    def test_a_spotify_failure_falls_back_rather_than_showing_nothing(self):
+        fallback = metadata.ITunesProvider(
+            session=FakeSession({"results": [ITunesBrowsing.ARTIST]}))
+        d = self.build(BrowsableSpotify(explode=True), fallback=fallback)
+        artists = d.search_artists("john mayer")
+        self.assertEqual([a["source"] for a in artists], ["itunes"])
+
+    def test_no_spotify_at_all_still_finds_artists(self):
+        fallback = metadata.ITunesProvider(
+            session=FakeSession({"results": [ITunesBrowsing.ARTIST]}))
+        d = self.build(None, fallback=fallback)
+        self.assertEqual(d.search_artists("john mayer")[0]["name"], "John Mayer")
+
+    def test_a_provider_that_cannot_browse_is_an_empty_answer(self):
+        class Basic:
+            def search(self, query, limit=25):
+                return []
+        d = self.build(None, fallback=Basic())
+        self.assertEqual(d.search_artists("x"), [])
+        self.assertEqual(d.artist_albums({"source": "itunes", "id": "1"}), [])
+        self.assertEqual(d.album_tracks({"source": "itunes", "id": "1"}), [])
+
+    def test_nothing_to_browse_is_safe(self):
+        d = self.build(BrowsableSpotify())
+        self.assertEqual(d.search_artists("  "), [])
+        self.assertEqual(d.artist_albums(None), [])
+        self.assertEqual(d.album_tracks(None), [])
+
+    def test_an_apple_discography_folds_duplicates_too(self):
+        # Apple lists Sob Rock twice under two collection ids; the shared
+        # fold is what stops both reaching the UI.
+        twice = [dict(ITunesBrowsing.ALBUM, collectionId=cid,
+                      collectionName="Sob Rock", releaseDate="2021-07-16")
+                 for cid in (1, 2)]
+        fallback = metadata.ITunesProvider(
+            session=FakeSession({"results": [ITunesBrowsing.ARTIST] + twice}))
+        d = self.build(None, fallback=fallback)
+        albums = d.artist_albums({"source": "itunes", "id": "itunes:507077"})
+        self.assertEqual([a["name"] for a in albums], ["Sob Rock"])
+
+    def test_a_deluxe_edition_wins_over_a_shorter_cut_of_itself(self):
+        short = discover._as_album(_browse_album("Sob Rock", "2021", "a", tracks=10))
+        full = discover._as_album(_browse_album("Sob Rock", "2021", "b", tracks=14))
+        self.assertEqual(discover.dedupe_albums([short, full])[0]["total_tracks"], 14)
+        self.assertEqual(discover.dedupe_albums([full, short])[0]["total_tracks"], 14)
+
+
+class SpectrumBands(unittest.TestCase):
+    """Turning an FFT into the numbers a visualiser draws.
+
+    The modes looked coarse because they were: sixteen bands, and the lowest
+    several of them were literally the same number, because the log-spaced
+    edges were rounded to integer bins before they were used and the bottom
+    of the range collapsed into bin 1.
+    """
+
+    def spectrum(self):
+        import numpy as np
+        rate, size = 44100, 2048
+        t = np.arange(size) / rate
+        signal = (0.05 * np.sin(2 * np.pi * 80 * t)
+                  + 0.03 * np.sin(2 * np.pi * 900 * t)
+                  + 0.01 * np.sin(2 * np.pi * 6000 * t))
+        return np.abs(np.fft.rfft(signal * np.hanning(size)))[2:]
+
+    def bands(self):
+        import numpy as np
+        import player_engine
+        fft_data = self.spectrum()
+        edges = np.logspace(0, np.log10(len(fft_data) - 1),
+                            num=player_engine.NUM_VIS_BANDS + 1)
+        bins = np.arange(len(fft_data))
+        out = []
+        for i in range(player_engine.NUM_VIS_BANDS):
+            low, high = edges[i], edges[i + 1]
+            start, end = int(np.floor(low)), int(np.ceil(high))
+            out.append(fft_data[start:end].mean() if end - start >= 2
+                       else np.interp((low + high) / 2.0, bins, fft_data))
+        return out
+
+    def test_there_are_enough_bands_to_draw_detail(self):
+        import player_engine
+        self.assertGreaterEqual(player_engine.NUM_VIS_BANDS, 48)
+
+    def test_no_two_neighbours_are_handed_the_same_number(self):
+        bands = self.bands()
+        runs, longest = 1, 1
+        for previous, current in zip(bands, bands[1:]):
+            runs = runs + 1 if previous == current else 1
+            longest = max(longest, runs)
+        # The old integer-edge mapping produced runs of seven identical
+        # bands at the bottom, so the whole bass end moved as one block.
+        self.assertEqual(longest, 1)
+
+    def test_the_bass_end_is_not_a_single_repeated_value(self):
+        low = self.bands()[:10]
+        self.assertEqual(len(set(low)), len(low))
+
+    def test_a_chunk_too_short_to_analyse_is_ignored(self):
+        import numpy as np
+        import player_engine
+        engine = player_engine.PlayerEngine.__new__(player_engine.PlayerEngine)
+        engine.visualizer_enabled = True
+        engine.visualizer_callback = None
+        engine.smoothed_bands = np.zeros(player_engine.NUM_VIS_BANDS)
+        engine.compute_visualizer(np.zeros((4, 2), dtype=np.float32))
+        self.assertTrue((engine.smoothed_bands == 0).all())
+
+
+class FakeCanvas:
+    """Records what a mode drew, and what tags it drew it under."""
+
+    def __init__(self):
+        self.items = []
+
+    def _add(self, kind, kwargs):
+        self.items.append((kind, kwargs.get("tags")))
+        return len(self.items)
+
+    def __getattr__(self, name):
+        if not name.startswith("create_"):
+            raise AttributeError(name)
+        return lambda *a, **kw: self._add(name, kw)
+
+    def delete(self, which):
+        if which == "all":
+            self.items = []
+        else:
+            self.items = [i for i in self.items if i[1] != which]
+
+
+class SharedCanvas(unittest.TestCase):
+    """The visualiser draws onto the Now Playing canvas, alongside its cover.
+
+    So a frame has to clear only its own items. `delete("all")` there would
+    take the backdrop, the titles and the cards with it.
+    """
+
+    BANDS = [0.2 + 0.6 * ((i * 7) % 11) / 11.0 for i in range(64)]
+
+    def test_every_mode_tags_everything_it_draws(self):
+        # Static, because a mode that forgets is only caught at runtime by
+        # whichever canvas it happens to wipe.
+        source = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "visualizers.py")
+        tree = ast.parse(open(source, encoding="utf-8").read())
+        untagged = [
+            node.func.attr + " at line %d" % node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr.startswith("create_")
+            and not any(kw.arg == "tags" for kw in node.keywords)
+        ]
+        self.assertEqual(untagged, [])
+
+    def test_a_frame_clears_only_its_own_items(self):
+        canvas = FakeCanvas()
+        canvas.items.append(("create_image", "cover"))
+        for mode in range(len(visualizers.names())):
+            visualizers.draw(canvas, mode, self.BANDS, "#1db954", 900, 500, 0.0)
+            self.assertIn(("create_image", "cover"), canvas.items,
+                          "mode %r cleared the canvas it was sharing"
+                          % visualizers.names()[mode])
+
+    def test_every_mode_actually_draws_something(self):
+        for mode in range(len(visualizers.names())):
+            canvas = FakeCanvas()
+            visualizers.draw(canvas, mode, self.BANDS, "#1db954", 900, 500, 0.0)
+            self.assertTrue(canvas.items,
+                            "mode %r drew nothing" % visualizers.names()[mode])
+
+    def test_a_silent_band_gets_no_peak_marker(self):
+        # At sixty-four bands most of the top end is near-silent most of the
+        # time, and a marker for each of those drew a dotted rule along the
+        # foot of the analyser that read as a rendering fault.
+        loud = FakeCanvas()
+        visualizers.draw(loud, 0, [0.8] * 64, "#1db954", 900, 500, 0.0)
+        quiet = FakeCanvas()
+        visualizers.draw(quiet, 0, [0.0] * 64, "#1db954", 900, 500, 0.0)
+        self.assertGreater(len(loud.items), len(quiet.items))
+
+    def test_dimming_pulls_colours_toward_the_surface_behind(self):
+        frame = visualizers.Frame(FakeCanvas(), self.BANDS, "#ffffff",
+                                  900, 500, 0.0, "Accent")
+        dimmed = visualizers.Frame(FakeCanvas(), self.BANDS, "#ffffff",
+                                   900, 500, 0.0, "Accent",
+                                   dim=1.0, dim_to="#000000")
+        self.assertEqual(frame.colour(0.5), "#ffffff")
+        self.assertEqual(dimmed.colour(0.5), "#000000")
+
+    def test_bars_keep_a_gap_that_scales_with_the_band_count(self):
+        wide = visualizers.Frame(FakeCanvas(), [0.5] * 8, "#1db954",
+                                 800, 400, 0.0, "Accent")
+        narrow = visualizers.Frame(FakeCanvas(), [0.5] * 64, "#1db954",
+                                   800, 400, 0.0, "Accent")
+        # A flat 2px gap is a hairline at eight bands and a third of the bar
+        # at sixty-four, which reads as a dotted line rather than bars.
+        wide_x0, wide_x1 = wide.slot(0)
+        narrow_x0, narrow_x1 = narrow.slot(0)
+        self.assertGreater(wide_x1 - wide_x0, 0)
+        self.assertGreater(narrow_x1 - narrow_x0, 0)
+        self.assertGreater((narrow_x1 - narrow_x0) / narrow.bar_width, 0.5)
+
+
+class NowPlayingGeometry(unittest.TestCase):
+    """The full-screen layout, at sizes this machine will not produce.
+
+    Worth testing without a window precisely because the app does not choose
+    its own size. Under a tiling compositor every geometry() request is
+    ignored -- measured on Hyprland, seven different requested sizes all came
+    back as the same tiled 2540x1385 -- so the only way to know the layout
+    holds at a size is to ask the layout directly.
+    """
+
+    # Wide and short, tall and narrow, and the thresholds either side of the
+    # point where the queue column appears.
+    SIZES = [(w, h)
+             for w in (240, 320, 480, 620, 720, 900, 1079, 1080, 1280,
+                       1920, 2540, 3840)
+             for h in (200, 300, 400, 500, 620, 688, 800, 1080, 1385)]
+
+    def layouts(self):
+        import gui
+        for w, h in self.SIZES:
+            yield w, h, gui.np_layout(w, h, 52)
+
+    def test_nothing_is_placed_outside_the_canvas(self):
+        for w, h, L in self.layouts():
+            lx, ly, lw, lh = L["lyrics"]
+            self.assertGreaterEqual(lx, 0, "%dx%d" % (w, h))
+            self.assertGreaterEqual(ly, 0, "%dx%d" % (w, h))
+            # The lyrics card used to carry a 200px minimum width and be
+            # placed to the right of the cover, so on a narrow window it was
+            # positioned past the edge and was not on screen at all.
+            self.assertLessEqual(lx + lw, w, "lyrics past the right at %dx%d"
+                                 % (w, h))
+            self.assertLessEqual(ly + lh, h, "lyrics past the bottom at %dx%d"
+                                 % (w, h))
+
+    def test_every_panel_has_a_positive_size(self):
+        for w, h, L in self.layouts():
+            where = "%dx%d" % (w, h)
+            self.assertGreater(L["cover"], 0, where)
+            self.assertGreater(L["lyrics"][2], 0, where)
+            self.assertGreater(L["lyrics"][3], 0, where)
+            if L["show_queue"]:
+                self.assertGreater(L["queue"][2], 0, where)
+
+    def test_the_queue_never_sits_under_the_lyrics(self):
+        for w, h, L in self.layouts():
+            if not L["show_queue"]:
+                continue
+            lx, _, lw, _ = L["lyrics"]
+            qx, _, qw, _ = L["queue"]
+            self.assertLessEqual(lx + lw, qx,
+                                 "the cards overlap at %dx%d" % (w, h))
+            self.assertLessEqual(qx + qw, w,
+                                 "the queue is off the edge at %dx%d" % (w, h))
+
+    def test_the_title_stays_on_the_canvas(self):
+        for w, h, L in self.layouts():
+            self.assertLessEqual(L["text_y"], h,
+                                 "the title is below the canvas at %dx%d"
+                                 % (w, h))
+
+    def test_the_queue_is_dropped_before_the_window_is_too_narrow_for_it(self):
+        import gui
+        self.assertFalse(gui.np_layout(1079, 800, 52)["show_queue"])
+        self.assertTrue(gui.np_layout(1080, 800, 52)["show_queue"])
+
+    def test_a_canvas_that_is_not_laid_out_yet_is_survivable(self):
+        import gui
+        for w, h in ((0, 0), (1, 1), (-5, -5)):
+            L = gui.np_layout(w, h, 52)
+            self.assertGreater(L["cover"], 0)
+            self.assertGreater(L["lyrics"][2], 0)
