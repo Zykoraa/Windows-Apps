@@ -16,6 +16,7 @@ here, not the word "localhost".
 
 import os
 import threading
+import time
 
 import requests
 from urllib3.util.retry import Retry
@@ -52,6 +53,65 @@ RETRY_AFTER_CAP = 8.0
 # "Too many requests". Spotify's own code for it, and the one status this
 # will not sit and wait on.
 RATE_LIMIT = 429
+
+# Once refused, how long Spotify is left alone before being asked again.
+# Spotify says how long it wants and has asked for eleven hours; the cap is
+# there because a limit that lifts early should be noticed rather than sat
+# out to the letter, and because everything this app asks Spotify can also
+# be asked of a catalogue that needs no account.
+MIN_COOLDOWN = 30.0
+MAX_COOLDOWN = 600.0
+
+_limit_lock = threading.Lock()
+_limited_until = 0.0
+
+
+def retry_after_of(exc):
+    """How long Spotify asked us to wait, off the exception it raised."""
+    headers = getattr(exc, "headers", None) or {}
+    for name in ("Retry-After", "retry-after"):
+        value = headers.get(name)
+        if value:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def note_refusal(exc):
+    """Remember a rate limit, so the next call does not go and earn another.
+
+    Being rate-limited is not a per-call accident, it is a state that lasts:
+    without this every search paid a network round trip to be told the same
+    thing again before falling back. Returns whether this was a rate limit.
+    """
+    global _limited_until
+    if getattr(exc, "http_status", None) != RATE_LIMIT:
+        return False
+    wait = min(max(retry_after_of(exc), MIN_COOLDOWN), MAX_COOLDOWN)
+    with _limit_lock:
+        _limited_until = max(_limited_until, time.time() + wait)
+    return True
+
+
+def rate_limited():
+    """Whether Spotify is to be left alone for the moment."""
+    with _limit_lock:
+        return time.time() < _limited_until
+
+
+def rate_limit_clears_in():
+    """Seconds until Spotify is asked again. 0 when it is not being avoided."""
+    with _limit_lock:
+        return max(0.0, _limited_until - time.time())
+
+
+def forget_rate_limit():
+    """Ask again now -- after a fresh sign-in, or in a test."""
+    global _limited_until
+    with _limit_lock:
+        _limited_until = 0.0
 
 
 class _CappedRetry(Retry):

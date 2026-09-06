@@ -25,6 +25,7 @@ import requests
 # The same reduction the library uses to decide two files are the same song:
 # it already strips "(Deluxe Edition)", "- Remastered" and the rest, and it
 # is already under test. An album title needs exactly that.
+import spotify_auth
 from library_index import normalise_title
 
 MAX_RESULTS = 25
@@ -192,13 +193,30 @@ class Discover:
         """
         if not query.strip():
             return []
-        if self.sp is None:
+        if self._spotify() is None:
             return self._fallback_search(query, limit)
         try:
             found = self._spotify_search(query, limit)
-        except Exception:
-            found = []
+        except Exception as e:
+            found = self._refused(e)
         return found or self._fallback_search(query, limit)
+
+    def _spotify(self):
+        """The Spotify client, unless it has just told us to go away.
+
+        A rate limit lasts hours, so trying anyway costs a round trip per
+        search to be refused again. Every question asked here can also be
+        put to the keyless catalogue, so while a limit is in force that one
+        is asked first rather than second.
+        """
+        if self.sp is None or spotify_auth.rate_limited():
+            return None
+        return self.sp
+
+    def _refused(self, exc):
+        """Note a refusal. Always returns nothing found, for the callers."""
+        spotify_auth.note_refusal(exc)
+        return []
 
     def _fallback_search(self, query, limit):
         return self._fallback("search", query, limit=limit)
@@ -259,12 +277,12 @@ class Discover:
         """Artists matching a query, best first."""
         if not query.strip():
             return []
-        if self.sp is None:
+        if self._spotify() is None:
             return self._fallback("search_artists", query, limit=limit)
         try:
             found = self._spotify_artists(query, limit)
-        except Exception:
-            found = []
+        except Exception as e:
+            found = self._refused(e)
         return found or self._fallback("search_artists", query, limit=limit)
 
     def artist_albums(self, artist):
@@ -276,14 +294,28 @@ class Discover:
         """
         if not artist:
             return []
-        if artist.get("source") == "spotify" and self.sp is not None:
+        if artist.get("source") != "spotify":
+            return dedupe_albums(self._fallback("artist_albums", artist))
+
+        found = []
+        if self._spotify() is not None:
             try:
                 found = self._spotify_artist_albums(artist["id"])
-            except Exception:
-                return []
-        else:
-            found = self._fallback("artist_albums", artist)
-        return dedupe_albums(found)
+            except Exception as e:
+                found = self._refused(e)
+        # Refused, rate-limited, or simply nothing: an artist can be found
+        # by name on the keyless catalogue even though their Spotify id
+        # means nothing to it, so this no longer dead-ends on an empty page.
+        return dedupe_albums(found or self._keyless_artist_albums(artist))
+
+    def _keyless_artist_albums(self, artist):
+        """The same artist's releases, from the provider that needs no account."""
+        name = artist.get("name") or ""
+        if not name:
+            return []
+        for other in self._fallback("search_artists", name, limit=1) or []:
+            return self._fallback("artist_albums", other)
+        return []
 
     def find_album(self, name, artist=""):
         """The release a track came from, by name.
@@ -296,11 +328,11 @@ class Discover:
         if not name:
             return None
         candidates = []
-        if self.sp is not None:
+        if self._spotify() is not None:
             try:
                 candidates = self._spotify_albums(name, artist)
-            except Exception:
-                candidates = []
+            except Exception as e:
+                candidates = self._refused(e)
         if not candidates:
             candidates = self._fallback("search_albums", name, artist) or []
         return _pick_album(name, candidates)
@@ -320,22 +352,29 @@ class Discover:
         """The tracks on one release, ready to preview or download."""
         if not album:
             return []
-        if album.get("source") == "spotify" and self.sp is not None:
-            refusal = None
+        if album.get("source") != "spotify":
+            return self._fallback("album_tracks", album)
+
+        # Routed by where the album came from, not by whether Spotify is up:
+        # a Spotify id means nothing to the keyless catalogue, so handing it
+        # one is the same as asking for nothing. While a rate limit is in
+        # force there is no client to ask at all, and the release has to be
+        # found again by name either way.
+        refusal = None
+        if self._spotify() is not None:
             try:
                 found = self._spotify_album_tracks(album)
             except Exception as e:
-                found, refusal = [], e
+                found, refusal = self._refused(e), e
             if found:
                 return found
-            found = self._keyless_album_tracks(album)
-            if not found and refusal is not None:
-                # Nothing from either provider, and Spotify said why. Saying
-                # "this album has no tracks" would be a different, wrong
-                # answer -- so the reason travels instead.
-                raise refusal
-            return found
-        return self._fallback("album_tracks", album)
+        found = self._keyless_album_tracks(album)
+        if not found and refusal is not None:
+            # Nothing from either provider, and Spotify said why. Saying
+            # "this album has no tracks" would be a different, wrong
+            # answer -- so the reason travels instead.
+            raise refusal
+        return found
 
     def _keyless_album_tracks(self, album):
         """The same release, read from the provider that needs no account.

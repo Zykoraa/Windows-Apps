@@ -736,6 +736,9 @@ def process_track(sp, track, output_dir, log_callback=print,
         try:
             metadata = get_spotify_track_info(sp, track)
         except Exception as e:
+            # One refusal is enough for a whole batch: without noting it,
+            # every remaining track went and earned its own.
+            spotify_auth.note_refusal(e)
             reason = ("Spotify is rate-limiting this app -- too many "
                       "lookups too quickly. Try again later."
                       if is_rate_limit(e) else "Could not read track "

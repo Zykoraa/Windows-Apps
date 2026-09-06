@@ -2982,6 +2982,115 @@ class SpotifyRetryPolicy(unittest.TestCase):
         self.assertFalse(retry.is_retry("GET", 429, has_retry_after=True))
 
 
+class RateLimitCooldown(unittest.TestCase):
+    """Spotify is left alone once it has refused.
+
+    Being rate-limited is a state that lasts hours, not a per-call accident.
+    Without remembering it, every search paid a network round trip to be
+    told the same thing again before falling back -- so the app stayed slow
+    and kept feeding the limit that was slowing it.
+    """
+
+    class Refused(Exception):
+        http_status = 429
+
+        def __init__(self, retry_after=None):
+            Exception.__init__(self, "too many requests")
+            self.headers = ({"Retry-After": str(retry_after)}
+                            if retry_after is not None else {})
+
+    def setUp(self):
+        spotify_auth.forget_rate_limit()
+        self.addCleanup(spotify_auth.forget_rate_limit)
+
+    def test_nothing_is_avoided_to_begin_with(self):
+        self.assertFalse(spotify_auth.rate_limited())
+
+    def test_a_refusal_is_remembered(self):
+        self.assertTrue(spotify_auth.note_refusal(self.Refused(60)))
+        self.assertTrue(spotify_auth.rate_limited())
+
+    def test_any_other_failure_is_not(self):
+        # A dead network or a bad id says nothing about the quota.
+        self.assertFalse(spotify_auth.note_refusal(RuntimeError("offline")))
+        self.assertFalse(spotify_auth.rate_limited())
+
+    def test_an_eleven_hour_ban_is_not_honoured_to_the_letter(self):
+        # Spotify really does ask for this. Waiting it out exactly would
+        # mean the app never notices a limit that lifted early.
+        spotify_auth.note_refusal(self.Refused(41549))
+        self.assertLessEqual(spotify_auth.rate_limit_clears_in(),
+                             spotify_auth.MAX_COOLDOWN)
+
+    def test_a_refusal_with_no_header_still_backs_off(self):
+        spotify_auth.note_refusal(self.Refused())
+        self.assertGreaterEqual(spotify_auth.rate_limit_clears_in(),
+                                spotify_auth.MIN_COOLDOWN - 1)
+
+
+class ColdSpotifyFallsBack(unittest.TestCase):
+    """What the browser does while Spotify is being left alone."""
+
+    class Counting:
+        """A client that records being used, and should not be."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def search(self, **kwargs):
+            self.calls += 1
+            return {"artists": {"items": []}, "tracks": {"items": []}}
+
+        def artist_albums(self, *a, **k):
+            self.calls += 1
+            return {"items": [], "next": None}
+
+    class Catalogue:
+        def search(self, query, limit=25):
+            return [{"source": "itunes", "id": "t1", "title": "A Song",
+                     "artist": "Somebody"}]
+
+        def search_artists(self, query, limit=6):
+            return [{"source": "itunes", "id": "itunes:1", "name": query}]
+
+        def artist_albums(self, artist, limit=50):
+            return [{"source": "itunes", "id": "itunes:9", "name": "A Record",
+                     "artist": artist.get("name") or "", "year": "2011"}]
+
+    def setUp(self):
+        spotify_auth.forget_rate_limit()
+        self.addCleanup(spotify_auth.forget_rate_limit)
+        self.sp = self.Counting()
+        self.d = discover.Discover(self.sp, lambda: {}, lambda *a: 0,
+                                   fallback=self.Catalogue())
+
+    def _go_cold(self):
+        spotify_auth.note_refusal(RateLimitCooldown.Refused(60))
+
+    def test_spotify_is_not_even_asked_while_it_is_refusing(self):
+        self._go_cold()
+        self.assertIsNone(self.d._spotify())
+        self.assertEqual([t["title"] for t in self.d.search("anything")],
+                         ["A Song"])
+        self.assertEqual(self.sp.calls, 0)
+
+    def test_and_is_asked_again_once_the_wait_is_over(self):
+        self._go_cold()
+        spotify_auth.forget_rate_limit()
+        self.d.search("anything")
+        self.assertEqual(self.sp.calls, 1)
+
+    def test_an_artist_page_still_fills_while_cold(self):
+        # A Spotify id means nothing to the keyless catalogue, so this used
+        # to dead-end on an empty page rather than looking the artist up by
+        # name -- and it did that even when Spotify simply failed.
+        self._go_cold()
+        albums = self.d.artist_albums({"source": "spotify", "id": "x",
+                                       "name": "John Mayer"})
+        self.assertEqual([a["name"] for a in albums], ["A Record"])
+        self.assertEqual(self.sp.calls, 0)
+
+
 class RateLimitedAlbum(unittest.TestCase):
     """A refused album and an empty one are not the same answer."""
 
