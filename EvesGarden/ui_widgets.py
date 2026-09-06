@@ -727,8 +727,28 @@ def _g_leaf(c, cx, cy, s, col, w):
     return items
 
 
+def _g_download(c, cx, cy, s, col, w):
+    """An arrow into a tray. The row's Download button, without the word."""
+    return [c.create_line(_pts([(12, 4), (12, 14.5)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND),
+            c.create_line(_pts([(7.5, 10.5), (12, 15), (16.5, 10.5)], cx, cy, s),
+                          fill=col, width=w, capstyle=tk.ROUND,
+                          joinstyle=tk.ROUND),
+            c.create_line(_pts([(6, 19), (18, 19)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND)]
+
+
+def _g_check(c, cx, cy, s, col, w):
+    """A tick: this one is already in the library."""
+    return [c.create_line(_pts([(6, 12.5), (10.5, 17), (18, 7.5)], cx, cy, s),
+                          fill=col, width=w, capstyle=tk.ROUND,
+                          joinstyle=tk.ROUND)]
+
+
 GLYPHS = {
     "close": _g_close,
+    "download": _g_download,
+    "check": _g_check,
     "search": _g_search,
     "leaf": _g_leaf,
     "play": _g_play,

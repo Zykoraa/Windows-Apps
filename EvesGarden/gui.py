@@ -72,7 +72,8 @@ from PIL import Image
 import io
 import tkinter as tk
 from PIL import ImageTk
-from library_index import LibraryIndex, SORTS, normalise_artist
+from library_index import (LibraryIndex, SORTS, normalise_artist,
+                           normalise_title)
 from library_view import LibraryView
 import queue as thread_queue
 import dialogs
@@ -3051,6 +3052,11 @@ class App(ctk.CTk):
             except Exception as e:
                 print(f"Library scan failed: {e}")
                 return
+            # Always, not just when the count moved: the first scan can
+            # finish after a search has already asked what we own, and a
+            # table cached while the index was still empty says you own
+            # nothing for the rest of the session.
+            self._owned_cache = None
             if added or removed:
                 self._safe_after(0, self.library.invalidate)
             self._safe_after(0, self.render_library)
@@ -4357,6 +4363,33 @@ class App(ctk.CTk):
             for track in results:
                 self._discover_row(track)
 
+    def _owned_fingerprints(self):
+        """Normalised (artist, title) of everything in the library.
+
+        Cached, because a result list asks once per row and the index is read
+        whole to answer. Dropped whenever the library changes.
+        """
+        table = getattr(self, "_owned_cache", None)
+        if table is None:
+            try:
+                table = self.index.fingerprints()
+            except Exception:
+                table = {}
+            self._owned_cache = table
+        return table
+
+    def _already_owned(self, track):
+        """Whether a search result is a track the library already has.
+
+        The same loose fingerprint the duplicate finder uses, so "Gravity"
+        and "Gravity - Remastered" count as the record you already own
+        rather than as something new to fetch.
+        """
+        artists = track.get("artists") or [track.get("artist", "")]
+        key = (normalise_artist(artists[0] if artists else ""),
+               normalise_title(track.get("title", "")))
+        return bool(key[1]) and key in self._owned_fingerprints()
+
     def _clear_results(self):
         for widget in self.results_frame.winfo_children():
             widget.destroy()
@@ -4420,17 +4453,7 @@ class App(ctk.CTk):
             track["cover_url"], 42,
             lambda img, lbl=art: self._safe_after(0, self._set_discover_art, lbl, img))
 
-        download = ctk.CTkButton(row, text="Download", width=94, height=30,
-                                 corner_radius=15, font=theme_ui.font("small"),
-                                 command=lambda t=track: self.download_discovered(t))
-        download.pack(side="right", padx=(6, 10))
-
-        preview = ctk.CTkButton(row, text="\u25b6  Preview", width=100, height=30,
-                                corner_radius=15, font=theme_ui.font("small"),
-                                fg_color="transparent", border_width=1,
-                                command=lambda t=track, b=None: self.preview_track(t))
-        preview.pack(side="right", padx=4)
-        track["_preview_btn"] = preview
+        self._row_actions(row, track, pad=(6, 10))
 
         ctk.CTkLabel(row, text=fmt_time(track["duration"]), width=48, anchor="e",
                      font=theme_ui.font("time"),
@@ -4458,6 +4481,45 @@ class App(ctk.CTk):
             ctk.CTkLabel(line, text="  ·  " + rest, anchor="w", justify="left",
                          font=theme_ui.font("caption"),
                          text_color=self.theme["text_secondary"]).pack(side="left")
+
+    def _row_actions(self, row, track, pad=(6, 10)):
+        """Play, keep, and whether you already have it.
+
+        The words went: a row of "Preview" and "Download" spelled out is a
+        column of text repeating itself down the list, and the two things it
+        says are the two most recognisable symbols there are. The tick is
+        the one thing a symbol could not say on its own, so it is the only
+        one that keeps a tooltip-shaped label beside it.
+        """
+        owned = self._already_owned(track)
+        if owned:
+            # Drawn, not a font glyph, so it cannot come out as a box.
+            mark = ui_widgets.GlyphButton(
+                row, self._row_glyph_theme(accent=self.theme["accent"]),
+                "check", size=30, command=lambda: self.log(
+                    "%s is already in your library." % track["title"]))
+            mark.pack(side="right", padx=pad)
+        else:
+            download = ui_widgets.GlyphButton(
+                row, self._row_glyph_theme(), "download", size=30,
+                command=lambda t=track: self.download_discovered(t))
+            download.pack(side="right", padx=pad)
+            track["_download_btn"] = download
+
+        preview = ui_widgets.GlyphButton(
+            row, self._row_glyph_theme(), "play", size=30,
+            command=lambda t=track: self.preview_track(t))
+        preview.pack(side="right", padx=4)
+        track["_preview_btn"] = preview
+        return preview
+
+    def _row_glyph_theme(self, accent=None):
+        """A theme for a row control, optionally forced to one colour."""
+        theme = dict(self.theme)
+        if accent:
+            theme["text_secondary"] = accent
+            theme["text"] = accent
+        return theme
 
     def _set_discover_art(self, label, image):
         try:
@@ -4761,16 +4823,7 @@ class App(ctk.CTk):
                      font=theme_ui.font("time"),
                      text_color=self.theme["text_secondary"]).pack(side="left")
 
-        ctk.CTkButton(row, text="Download", width=80, height=24,
-                      corner_radius=12, font=theme_ui.font("small"),
-                      command=lambda t=track: self.download_discovered(t)).pack(
-                          side="right", padx=(6, 4))
-        preview = ctk.CTkButton(row, text="\u25b6", width=32, height=24,
-                                corner_radius=12, font=theme_ui.font("small"),
-                                fg_color="transparent", border_width=1,
-                                command=lambda t=track: self.preview_track(t))
-        preview.pack(side="right", padx=2)
-        track["_preview_btn"] = preview
+        self._row_actions(row, track, pad=(6, 4))
 
         ctk.CTkLabel(row, text=fmt_time(track["duration"]), width=48, anchor="e",
                      font=theme_ui.font("time"),
@@ -4823,15 +4876,24 @@ class App(ctk.CTk):
 
     def preview_track(self, track):
         """Stream a search result without saving it to disk."""
-        button = track.get("_preview_btn")
-        if button is not None:
-            try:
-                button.configure(text="Loading...", state="disabled")
-            except Exception:
-                pass
+        self._set_preview_busy(track, True)
         self._streaming_track = track
         self._set_now_playing_text(track["title"],
                                    f"{track['artist']}  ·  preview")
+
+        def work(retrying=False):
+            try:
+                resolved = self.discover.stream_url(track)
+            except Exception as e:
+                self._safe_after(0, self._preview_failed, track, str(e))
+                return
+            self._safe_after(0, self._start_preview, track, resolved, retrying)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _retry_preview(self, track):
+        """Resolve the stream again, once, after a cached URL failed."""
+        self.discover.forget(track)
 
         def work():
             try:
@@ -4839,41 +4901,84 @@ class App(ctk.CTk):
             except Exception as e:
                 self._safe_after(0, self._preview_failed, track, str(e))
                 return
-            self._safe_after(0, self._start_preview, track, resolved)
+            self._safe_after(0, self._start_preview, track, resolved, True)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _start_preview(self, track, resolved):
+    def _start_preview(self, track, resolved, retrying=False):
         ok = self.player.load_stream(resolved["url"],
                                      duration=resolved.get("duration") or track["duration"],
                                      title=track["title"])
-        button = track.get("_preview_btn")
         if not ok:
+            if not retrying:
+                # A signed URL can be refused before it formally expires, and
+                # the only way to find out is to ask for a new one. Once.
+                self.log("That stream would not open -- finding it again...")
+                self._retry_preview(track)
+                return
             self._preview_failed(track, self.player.last_error or "stream failed")
             return
         self.player.play()
         self.play_btn.set_glyph("pause")
-        if button is not None:
-            try:
-                button.configure(text="\u25b6  Preview", state="normal")
-            except Exception:
-                pass
+        self._set_preview_busy(track, False)
         # A stream is not in the library, so nothing to highlight or like.
         self._now_playing_row = {"path": None, "title": track["title"],
                                  "artist": track["artist"],
                                  "album": track["album"],
                                  "cover_url": track.get("cover_large")}
+        self._show_stream_art(track)
         self._push_discord(playing=True)
         self.log(f"Previewing {track['artist']} - {track['title']} (not downloaded)")
 
-    def _preview_failed(self, track, message):
-        button = track.get("_preview_btn")
-        if button is not None:
+    def _show_stream_art(self, track):
+        """Put a previewed track's cover in the bar.
+
+        Only local files went through extract_album_art, so a preview left
+        whatever played before it on screen -- the last song's sleeve above
+        this song's title.
+        """
+        url = track.get("cover_large") or track.get("cover_url")
+        if not url:
+            # No cover to show is still not the last one: a placeholder says
+            # this track has none, where the old sleeve said the wrong thing.
+            self._apply_album_art(None, None, None)
+            return
+
+        def arrived(image):
             try:
-                button.configure(text="\u25b6  Preview", state="normal")
+                thumb = image.resize((64, 64), Image.Resampling.LANCZOS)
+                accent = None
+                try:
+                    colors = colorgram.extract(image.resize((100, 100)), 2)
+                    if colors:
+                        c = colors[0].rgb
+                        accent = f"#{c.r:02x}{c.g:02x}{c.b:02x}"
+                except Exception:
+                    pass
+                self._safe_after(0, self._apply_album_art, thumb, image, accent)
             except Exception:
-                pass
+                self._safe_after(0, self._apply_album_art, None, None, None)
+
+        self.discover.fetch_cover(url, 400, arrived)
+
+    def _preview_failed(self, track, message):
+        self._set_preview_busy(track, False)
         self.log(f"Could not preview {track['title']}: {message}")
+
+    def _set_preview_busy(self, track, busy):
+        """Light the row's play control while its stream is being resolved.
+
+        Resolving goes to YouTube and takes a few seconds, so without this
+        the row does nothing at all for long enough to be pressed twice.
+        """
+        button = track.get("_preview_btn")
+        if button is None:
+            return
+        try:
+            if button.winfo_exists():
+                button.set_active(bool(busy))
+        except Exception:
+            pass
 
     def download_discovered(self, track):
         """Keep a previewed track: download and tag it properly."""

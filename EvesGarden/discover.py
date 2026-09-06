@@ -16,6 +16,8 @@ album can be taken in one go rather than found a song at a time.
 
 import io
 import threading
+import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -31,6 +33,26 @@ ARTIST_RESULTS = 6
 # anything larger answers "400 Invalid limit" -- but offset paging still
 # works, so everything here asks for small pages and walks them.
 PAGE = 10
+
+# A resolved YouTube URL is signed and dies on a clock -- about six hours,
+# and it says so in its own query string. Cached past that, pressing play got
+# a 403 and, before start() learned to check, silence with nothing to say
+# why. This is the fallback for a URL that carries no expiry of its own.
+STREAM_TTL = 900.0
+
+
+def _url_expiry(url):
+    """When a signed media URL stops working, from the URL itself."""
+    try:
+        stamp = urllib.parse.parse_qs(
+            urllib.parse.urlparse(url).query).get("expire", [None])[0]
+        if stamp:
+            # A minute short of the real thing, so a stream cannot expire
+            # between being handed over and being opened.
+            return float(stamp) - 60.0
+    except (ValueError, TypeError):
+        pass
+    return time.time() + STREAM_TTL
 
 
 def dedupe_albums(albums):
@@ -396,7 +418,7 @@ class Discover:
         """
         with self._lock:
             hit = self._stream_cache.get(track["id"])
-        if hit:
+        if hit and hit["expires_at"] > time.time():
             return hit
 
         import yt_dlp
@@ -427,10 +449,24 @@ class Discover:
 
         resolved = {"url": url,
                     "duration": best.get("duration") or track["duration"],
-                    "title": best.get("title") or track["title"]}
+                    "title": best.get("title") or track["title"],
+                    "expires_at": _url_expiry(url)}
         with self._lock:
             self._stream_cache[track["id"]] = resolved
         return resolved
+
+    def forget(self, track):
+        """Drop a cached stream, so the next play resolves it again.
+
+        For when a URL turns out not to work after all: the signature can be
+        rejected before it has formally expired, and re-resolving is the only
+        way to find out.
+        """
+        try:
+            with self._lock:
+                self._stream_cache.pop(track["id"], None)
+        except Exception:
+            pass
 
     def prefetch(self, track):
         """Warm the cache in the background so pressing play feels instant."""

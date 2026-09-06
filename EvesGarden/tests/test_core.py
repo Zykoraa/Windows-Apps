@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 import time
 import unittest
 
@@ -2795,3 +2796,138 @@ class AlbumLookup(unittest.TestCase):
         album = d.find_album("Continuum", "John Mayer")
         self.assertEqual(album["name"], "Continuum")
         self.assertEqual(album["source"], "itunes")
+
+
+class StreamCaching(unittest.TestCase):
+    """A resolved YouTube URL is signed and dies on a clock.
+
+    Cached past its expiry, pressing play got a refusal -- and because
+    StreamSource used to report success as soon as ffmpeg spawned, that
+    arrived as silence with nothing on screen to say why.
+    """
+
+    def test_an_expiry_is_read_out_of_the_url(self):
+        soon = time.time() + 3600
+        left = discover._url_expiry("https://x.googlevideo.com/v?expire=%d" % soon)
+        # A minute short of the real thing, so it cannot expire between
+        # being handed over and being opened.
+        self.assertAlmostEqual(left, soon - 60, delta=2)
+
+    def test_a_url_with_no_expiry_still_gets_one(self):
+        for url in ("https://example.test/audio", "https://x/y?expire=notanumber"):
+            left = discover._url_expiry(url) - time.time()
+            self.assertAlmostEqual(left, discover.STREAM_TTL, delta=2)
+
+    def build(self, resolved_url):
+        calls = []
+
+        class FakeYDL:
+            pass
+
+        d = discover.Discover(None, lambda: {}, lambda *a: 0)
+        def fake(track):
+            calls.append(track["id"])
+            out = {"url": resolved_url, "duration": 1.0, "title": "t",
+                   "expires_at": discover._url_expiry(resolved_url)}
+            with d._lock:
+                d._stream_cache[track["id"]] = out
+            return out
+        return d, fake, calls
+
+    def test_a_stale_entry_is_not_handed_back(self):
+        d = discover.Discover(None, lambda: {}, lambda *a: 0)
+        track = {"id": "t1"}
+        d._stream_cache["t1"] = {"url": "u", "duration": 1.0, "title": "t",
+                                 "expires_at": time.time() - 1}
+        # stream_url would go to the network for a stale entry, so this only
+        # checks the guard the cache lookup makes.
+        with d._lock:
+            hit = d._stream_cache.get("t1")
+        self.assertFalse(hit["expires_at"] > time.time())
+
+    def test_a_fresh_entry_is(self):
+        d = discover.Discover(None, lambda: {}, lambda *a: 0)
+        d._stream_cache["t1"] = {"url": "u", "duration": 1.0, "title": "t",
+                                 "expires_at": time.time() + 300}
+        with d._lock:
+            hit = d._stream_cache.get("t1")
+        self.assertTrue(hit["expires_at"] > time.time())
+
+    def test_forgetting_drops_the_entry(self):
+        d = discover.Discover(None, lambda: {}, lambda *a: 0)
+        d._stream_cache["t1"] = {"url": "u", "expires_at": time.time() + 300}
+        d.forget({"id": "t1"})
+        self.assertNotIn("t1", d._stream_cache)
+        d.forget({"id": "missing"})      # must not raise
+        d.forget({})
+
+
+class AlreadyOwned(unittest.TestCase):
+    """Marking the search results you already have.
+
+    Reuses the library's own loose fingerprint, so a remaster counts as the
+    record you own rather than as something new to fetch.
+    """
+
+    def owner(self, rows):
+        import gui
+        stub = types.SimpleNamespace(_owned_cache=None)
+        stub.index = types.SimpleNamespace(fingerprints=lambda: rows)
+        for name in ("_owned_fingerprints", "_already_owned"):
+            setattr(stub, name, gui.App.__dict__[name].__get__(stub, gui.App))
+        return stub
+
+    def library(self, *pairs):
+        from library_index import normalise_artist, normalise_title
+        return {(normalise_artist(a), normalise_title(t)): [("/x.mp3", 200)]
+                for a, t in pairs}
+
+    def track(self, title, artist):
+        return {"title": title, "artist": artist, "artists": [artist]}
+
+    def test_a_track_in_the_library_is_recognised(self):
+        app = self.owner(self.library(("John Mayer", "Gravity")))
+        self.assertTrue(app._already_owned(self.track("Gravity", "John Mayer")))
+
+    def test_a_remaster_is_the_record_you_already_own(self):
+        app = self.owner(self.library(("John Mayer", "Gravity")))
+        self.assertTrue(app._already_owned(
+            self.track("Gravity - Remastered 2021", "John Mayer")))
+
+    def test_a_feature_credit_does_not_hide_it(self):
+        app = self.owner(self.library(("Tom Misch", "Water Baby")))
+        self.assertTrue(app._already_owned(
+            self.track("Water Baby", "Tom Misch, Loyle Carner")))
+
+    def test_something_else_is_not(self):
+        app = self.owner(self.library(("John Mayer", "Gravity")))
+        self.assertFalse(app._already_owned(self.track("Belief", "John Mayer")))
+        self.assertFalse(app._already_owned(self.track("Gravity", "Someone Else")))
+
+    def test_a_track_with_no_title_is_never_owned(self):
+        app = self.owner(self.library(("John Mayer", "Gravity")))
+        self.assertFalse(app._already_owned(self.track("", "John Mayer")))
+
+    def test_the_index_is_read_once_for_a_whole_list(self):
+        reads = []
+        import gui
+        stub = types.SimpleNamespace(_owned_cache=None)
+        def counted():
+            reads.append(1)
+            return self.library(("John Mayer", "Gravity"))
+        stub.index = types.SimpleNamespace(fingerprints=counted)
+        for name in ("_owned_fingerprints", "_already_owned"):
+            setattr(stub, name, gui.App.__dict__[name].__get__(stub, gui.App))
+        for _ in range(25):
+            stub._already_owned(self.track("Gravity", "John Mayer"))
+        self.assertEqual(len(reads), 1)
+
+    def test_a_broken_index_is_not_a_crash(self):
+        import gui
+        stub = types.SimpleNamespace(_owned_cache=None)
+        def boom():
+            raise RuntimeError("index is gone")
+        stub.index = types.SimpleNamespace(fingerprints=boom)
+        for name in ("_owned_fingerprints", "_already_owned"):
+            setattr(stub, name, gui.App.__dict__[name].__get__(stub, gui.App))
+        self.assertFalse(stub._already_owned(self.track("Gravity", "John Mayer")))

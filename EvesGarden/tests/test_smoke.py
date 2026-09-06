@@ -197,6 +197,40 @@ class SurfaceWalk:
         assert "Artists" in headings and "Songs" in headings, (
             "results panel showed %s, not both artists and songs" % headings)
 
+        # The words went. What is left has to actually be there, and the
+        # tick has to replace the download rather than sit next to it.
+        self.mark("result rows are symbols, not words")
+        texts = self._labels(app.results_frame)
+        assert not any(t in ("Preview", "Download", "\u25b6  Preview")
+                       for t in texts), (
+            "a result row is still spelling its actions out: %s" % texts)
+        glyphs = [w for w in self._widgets(app.results_frame)
+                  if isinstance(w, self.gui.ui_widgets.GlyphButton)]
+        assert glyphs, "the result rows have no controls at all"
+        kinds = {w._glyph for w in glyphs}
+        assert "play" in kinds, "no play control on a result row: %s" % kinds
+        assert kinds <= {"play", "download", "check"}, (
+            "unexpected control on a result row: %s" % kinds)
+
+        self.mark("a track already in the library is marked, not offered")
+        owned = dict(app.discover_results[0])
+        app._owned_cache = {
+            (self.gui.normalise_artist(owned["artist"]),
+             self.gui.normalise_title(owned["title"])): [("/x.mp3", 200)]}
+        app._render_discover(app.discover_results, app.discover_artists)
+        yield 260
+        marks = [w for w in self._widgets(app.results_frame)
+                 if isinstance(w, self.gui.ui_widgets.GlyphButton)
+                 and w._glyph == "check"]
+        assert marks, "an owned track was not marked as already in the library"
+        app._owned_cache = {}
+        app._render_discover(app.discover_results, app.discover_artists)
+        yield 220
+        assert not [w for w in self._widgets(app.results_frame)
+                    if isinstance(w, self.gui.ui_widgets.GlyphButton)
+                    and w._glyph == "check"], (
+            "the tick stayed after the track left the library")
+
         self.mark("open a discography")
         app.open_artist(app.discover_artists[0])
         yield from self._until(

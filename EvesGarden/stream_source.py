@@ -20,6 +20,11 @@ BYTES_PER_FRAME = 4          # s16le stereo
 TARGET_SECONDS = 12          # how far ahead to buffer
 READ_CHUNK = 1 << 16
 
+# How long start() waits to see that audio is really coming before it says
+# the stream is playing. Long enough to cover a slow first connection, short
+# enough that a dead URL is reported rather than sat through.
+START_TIMEOUT = 4.0
+
 
 class StreamSource:
     """A seekable PCM feed backed by ffmpeg reading a URL."""
@@ -40,6 +45,7 @@ class StreamSource:
         self._lock = threading.Lock()
         self._space = threading.Condition(self._lock)
         self._stop = threading.Event()
+        self._first_data = threading.Event()
         self._eof = False
         self._started_at = 0.0     # stream position ffmpeg was told to start at
         self._frames_read = 0
@@ -54,6 +60,7 @@ class StreamSource:
     def start(self, offset=0.0):
         self.stop()
         self._stop.clear()
+        self._first_data = threading.Event()
         self._eof = False
         self._buffer.clear()
         self._buffered = 0
@@ -93,6 +100,33 @@ class StreamSource:
 
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
+
+        # ffmpeg spawning is not the stream working. An expired or blocked
+        # URL exits it a moment later, and this used to have already
+        # reported success -- so the caller said "now playing", started the
+        # clock, and the track was silence with nothing to say why.
+        if not self._await_audio():
+            self.error = self.error or "The stream ended before it started"
+            if self.on_error:
+                self.on_error(self.error)
+            self.stop()
+            return False
+        return True
+
+    def _await_audio(self, timeout=START_TIMEOUT):
+        """Whether audio is actually arriving, or ffmpeg has given up."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._first_data.is_set():
+                return True
+            if self.error:
+                return False
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                return False
+            time.sleep(0.05)
+        # Still connecting rather than broken: read() already waits, and a
+        # slow network is not a failure.
         return True
 
     def stop(self):
@@ -140,6 +174,7 @@ class StreamSource:
                 with self._lock:
                     self._buffer.append(data)
                     self._buffered += len(data)
+                self._first_data.set()
         except Exception as e:
             self.error = str(e)
         finally:

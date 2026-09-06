@@ -57,6 +57,11 @@ duration and penalised for `live`, `karaoke`, `remix`, `full album` and the
 like, so you get the right version rather than the first hit. Downloads run
 three at a time with per-track state, cancel, and retry-failed.
 
+**Search results** carry a play control and either a download arrow or a
+green tick, which says the track is already in your library -- matched on
+the same loose fingerprint the duplicate finder uses, so a remaster counts
+as the record you own. Previewing streams the track without keeping it.
+
 **Browsing an artist** — a search answers with artists as well as songs, and
 either the artist or the credit under a track opens their discography:
 albums, singles and compilations, newest first, with reissues and alternate
