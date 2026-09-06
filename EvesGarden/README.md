@@ -119,6 +119,12 @@ signed-in user. Press **Sign in to Spotify** in the downloader, approve it in
 the browser once, and playlist links start working. The token is cached, so
 it only asks the first time.
 
+Spotify will ask **which account** to sign in as. That screen is worth
+reading rather than clicking through: the account you created the developer
+app on and the account you actually listen with do not have to be the same
+one, and picking the wrong one makes every playlist you own look unreadable.
+Signing out and back in lets you change it.
+
 Three read-only scopes are requested: `playlist-read-private`,
 `playlist-read-collaborative` and `user-library-read` (the last one is what
 makes **Liked Songs** downloadable — paste
@@ -130,12 +136,29 @@ editorial and algorithmic playlists were closed to the API in 2024 and return
 404 even to the user they were made for. Copy the tracks into a playlist of
 your own and use that instead.
 
+**Every other playlist is readable only by the account that owns it**, or by
+one added to it as a collaborator. Whether it is public makes no difference —
+somebody else's public playlist is refused exactly as a private one is. Sign
+in as the account that owns it, or copy the tracks into a playlist of your
+own and paste that.
+
 They are saved to `EvesGarden.env` next to the executable, so a copied folder
 stays working. If the app lives somewhere read-only it falls back to
 `%LOCALAPPDATA%\EvesGarden\`. See `.env.example` to write the file by hand
 instead.
 
 Discord Rich Presence needs no setup.
+
+### Sharing credentials with somebody else
+
+Don't. Each person should create their own developer app: it is free, takes
+a minute, and makes them its owner, which is always permitted.
+
+If you do hand out your Client ID and Secret, a Spotify app starts in
+**Development mode** — capped at 25 users, each of whom you have to add by
+email under **User Management** in the dashboard. Until you do, they get 403
+on everything, and the app will report it as a playlist permissions problem,
+because from the outside that is precisely what it looks like.
 
 ## Running from source
 
