@@ -110,10 +110,8 @@ def read_playlist(user_sp, playlist):
 
     tracks = []
     for item in items:
-        track = _track_of(item)
-        # Local files added from someone's own machine, and podcast episodes,
-        # both arrive here with nothing to download.
-        if not track or track.get("is_local") or track.get("type") != "track":
+        track = track_of(item)
+        if not is_downloadable(track):
             continue
         meta = as_metadata(track)
         if meta:
@@ -139,16 +137,31 @@ def _playlist_items(user_sp, playlist_id):
     return _pages(user_sp, page)
 
 
-def _track_of(item):
+def track_of(entry):
     """The track on one playlist entry.
 
     It used to be `track`. On the /items endpoint it is `item`. Liked Songs
     comes from a different endpoint and still says `track`, so both names
     have to work.
+
+    Public because the downloader reads the same endpoint when a playlist
+    link is pasted, and got this wrong for exactly as long as it had its own
+    copy of the rule.
     """
-    if not item:
+    if not entry:
         return None
-    return item.get("item") or item.get("track")
+    return entry.get("item") or entry.get("track")
+
+
+def is_downloadable(track):
+    """Whether a playlist entry is something there is any point fetching.
+
+    A file somebody added from their own machine, and a podcast episode,
+    both sit in a playlist looking like tracks and have nothing behind them
+    to download.
+    """
+    return bool(track) and not track.get("is_local") \
+        and track.get("type") == "track"
 
 
 def _pages(user_sp, results):

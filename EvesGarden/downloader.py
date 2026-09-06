@@ -7,6 +7,7 @@ import requests
 import yt_dlp
 
 import audio_files
+import spotify_import
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from mutagen.mp3 import MP3
@@ -287,16 +288,26 @@ def get_spotify_playlist_tracks(sp, playlist_url, user_sp=None):
             ) from e
         raise
 
-    tracks = results["items"]
+    entries = results["items"]
     while results["next"]:
         results = client.next(results)
-        tracks.extend(results["items"])
+        entries.extend(results["items"])
 
-    return [
-        item["track"]["external_urls"]["spotify"]
-        for item in tracks
-        if item.get("track") and item["track"].get("external_urls")
-    ]
+    # The track hangs off `item` here, not `track` -- Spotify moved playlist
+    # reads to /playlists/{id}/items and renamed the field with it. Reading
+    # only `track` does not fail, it silently matches nothing, so a playlist
+    # that was fetched perfectly well came back as "Nothing to download."
+    # spotify_import.track_of knows both names; this used to keep its own
+    # copy of that rule, and only one of the two got fixed.
+    urls = []
+    for entry in entries:
+        track = spotify_import.track_of(entry)
+        if not spotify_import.is_downloadable(track):
+            continue
+        url = (track.get("external_urls") or {}).get("spotify")
+        if url:
+            urls.append(url)
+    return urls
 
 
 def get_spotify_album_tracks(sp, album_url):

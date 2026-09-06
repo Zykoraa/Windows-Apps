@@ -1006,6 +1006,51 @@ class SpotifyApiShape(unittest.TestCase):
             self.assertEqual([t["name"] for t in tracks], ["A"], wrapper)
 
 
+class PastedPlaylistLink(unittest.TestCase):
+    """Pasting a playlist link, which reads the same endpoint as importing.
+
+    The rename from `track` to `item` was fixed in spotify_import and missed
+    here, because this path had no test at all. It did not raise: it matched
+    nothing and reported "Nothing to download." on a playlist that had been
+    fetched perfectly well.
+    """
+
+    def _urls(self, entries):
+        sp = FakeSpotify(items={"p": entries}, tracks_forbidden=False)
+        return downloader.get_spotify_playlist_tracks(None, "p", user_sp=sp)
+
+    def test_every_track_comes_back(self):
+        got = self._urls([_item(_sp_track("A", "X")),
+                          _item(_sp_track("B", "Y"))])
+        self.assertEqual(len(got), 2)
+
+    def test_the_old_name_still_works(self):
+        # Whichever way round Spotify has it this week.
+        for wrapper in ("item", "track"):
+            got = self._urls([{"is_local": False,
+                               wrapper: _sp_track("A", "X")}])
+            self.assertEqual(len(got), 1, wrapper)
+
+    def test_a_local_file_is_not_offered_as_a_download(self):
+        local = _sp_track("Riff.mp3", "Me", extra={"is_local": True})
+        self.assertEqual(self._urls([_item(local)]), [])
+
+    def test_a_podcast_episode_is_not_offered_as_a_download(self):
+        show = _sp_track("Ep 12", "A Show", extra={"type": "episode"})
+        self.assertEqual(self._urls([_item(show)]), [])
+
+    def test_a_withdrawn_entry_is_skipped(self):
+        # A track pulled from the catalogue comes back as a null entry.
+        self.assertEqual(self._urls([{"is_local": False, "item": None}]), [])
+
+    def test_liked_songs_still_reads_from_me_tracks(self):
+        sp = FakeSpotify(liked=[{"track": _sp_track("A", "X")},
+                                {"track": _sp_track("B", "Y")}])
+        got = downloader.get_spotify_playlist_tracks(
+            None, "https://open.spotify.com/collection/tracks", user_sp=sp)
+        self.assertEqual(len(got), 2)
+
+
 class SpotifyImportReading(unittest.TestCase):
 
     def test_liked_songs_leads_and_ownership_is_marked(self):
