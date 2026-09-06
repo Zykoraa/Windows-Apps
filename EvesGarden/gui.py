@@ -72,7 +72,7 @@ from PIL import Image
 import io
 import tkinter as tk
 from PIL import ImageTk
-from library_index import LibraryIndex, SORTS
+from library_index import LibraryIndex, SORTS, normalise_artist
 from library_view import LibraryView
 import queue as thread_queue
 import dialogs
@@ -289,6 +289,7 @@ class App(ctk.CTk):
                                  fallback=self.catalogue)
         self.discover_results = []
         self.discover_artists = []
+        self._songs_heading = None
         # What the results panel is showing: the search, or one artist's
         # releases. Going back re-renders the stored search rather than
         # running it again.
@@ -1042,6 +1043,16 @@ class App(ctk.CTk):
                                             anchor="w", justify="left")
         self.now_playing_sub.pack(anchor="w")
 
+        # The two things written here are the two places you would want to
+        # go next, so they are the way there: the title opens the record it
+        # is from, the credit opens the artist.
+        self._click_through(self.now_playing_label,
+                            self._browse_playing_album,
+                            hover=self.theme["accent"])
+        self._click_through(self.now_playing_sub,
+                            self._browse_playing_artist,
+                            hover=self.theme["accent"])
+
         self.controls_frame = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         # The seek bar keeps 20px above its track clear for the scrub
         # readout, so an evenly padded transport ends up sitting high with a
@@ -1307,7 +1318,6 @@ class App(ctk.CTk):
         if getattr(self, "dl_overlay", None) is not None:
             self._slide_out(self.dl_overlay)
         self.dl_visible = False
-        self.suggestions_frame.place_forget()
 
     def build_eq_overlay(self):
         # EQ Frame (Overlay/Hidden)
@@ -1921,13 +1931,8 @@ class App(ctk.CTk):
         self.url_entry.pack(side="left", fill="both", expand=True,
                             padx=(0, 20))
         self.url_entry.bind("<KeyRelease>", self._on_discover_key)
-        self.url_entry.bind("<FocusIn>", lambda e: self.on_key_release(None))
+        self.url_entry.bind("<FocusIn>", self._on_discover_key)
         self.url_entry.bind("<Return>", lambda e: self.start_download())
-
-        self.search_timer = None
-        self.suggestions_frame = ctk.CTkScrollableFrame(
-            self.dl_frame, height=210, corner_radius=15,
-            fg_color=self.theme["surface"])
 
         buttons = ctk.CTkFrame(self.dl_frame, fg_color="transparent")
         buttons.grid(row=2, column=0, padx=36, pady=(2, 8), sticky="ew")
@@ -2208,7 +2213,7 @@ class App(ctk.CTk):
             # Scrolling frames have to be repainted by name: they own a canvas
             # that keeps whatever colour it was built with.
             ("library_frame", "bg"), ("queue_list", "surface"),
-            ("queue_panel", "surface"), ("suggestions_frame", "surface"),
+            ("queue_panel", "surface"),
             ("results_frame", "surface"), ("jobs_frame", "surface"),
             ("dl_search_row", "surface"),
         ):
@@ -2705,6 +2710,25 @@ class App(ctk.CTk):
 
     # How much room the track and artist get in the bottom bar.
     NP_TEXT_W = 240
+
+    def _browse_playing_album(self):
+        """The album of whatever is in the bar."""
+        row = getattr(self, "_now_playing_row", None) or {}
+        if not row:
+            return
+        self.open_album_of(row.get("title"), row.get("artist"),
+                           row.get("album"))
+
+    def _browse_playing_artist(self):
+        """The discography of whoever is in the bar."""
+        row = getattr(self, "_now_playing_row", None) or {}
+        artist = (row.get("artist") or "").strip()
+        if not artist:
+            return
+        # Tags credit everyone on the track; the discography belongs to the
+        # first name, not to "A, B and C" as one string nothing will match.
+        # normalise_artist is what the library already uses to decide that.
+        self.open_artist_by_name(normalise_artist(artist) or artist)
 
     def _set_now_playing_text(self, title, subtitle=""):
         """Put the track in the bar, trimmed to the room it has."""
@@ -4267,7 +4291,13 @@ class App(ctk.CTk):
 
     def run_discover_search(self):
         query = self.url_entry.get().strip()
-        if not query or "http" in query:
+        if "http" in query:
+            return
+        if not query:
+            # More from whoever is playing, in the results panel rather than
+            # in a second one floated over the search bar.
+            threading.Thread(target=self.fetch_recommendations,
+                             daemon=True).start()
             return
         self._render_discover_message("Searching...")
 
@@ -4303,13 +4333,14 @@ class App(ctk.CTk):
                      text_color=self.theme["text_secondary"]).pack(
                          pady=64, padx=30)
 
-    def _render_discover(self, results, artists=None):
+    def _render_discover(self, results, artists=None, songs_heading=None):
         if not self._dl_alive():
             return
         self.discover_results = results
         if artists is not None:
             self.discover_artists = artists
         artists = self.discover_artists
+        self._songs_heading = songs_heading
         self._clear_results()
         if not results and not artists:
             self._render_discover_message("Nothing found.")
@@ -4321,8 +4352,8 @@ class App(ctk.CTk):
                 self._artist_row(artist)
 
         if results:
-            if artists:
-                self._results_heading("Songs")
+            if songs_heading or artists:
+                self._results_heading(songs_heading or "Songs")
             for track in results:
                 self._discover_row(track)
 
@@ -4463,6 +4494,7 @@ class App(ctk.CTk):
         """Open a discography from a credit, which carries no artist id."""
         if not name:
             return
+        self._show_downloader_for_browsing()
         self._render_discover_message("Finding %s..." % name)
 
         def work():
@@ -4544,9 +4576,88 @@ class App(ctk.CTk):
         for album in remaining:
             self._album_row(album)
 
+    def open_album_of(self, title, artist, album):
+        """Open the record a track came from, from its name alone."""
+        if not album:
+            self.log("No album is recorded for %s." % (title or "this track"))
+            return
+        self._show_downloader_for_browsing()
+        self._render_discover_message("Finding %s..." % album)
+
+        def work():
+            try:
+                found = self.discover.find_album(album, artist)
+            except Exception:
+                found = None
+            if not found:
+                self._safe_after(0, self._render_discover_message,
+                                 "Could not find the album %s." % album)
+                return
+            try:
+                tracks = self.discover.album_tracks(found)
+            except Exception:
+                tracks = []
+            self._safe_after(0, self._render_album, found, tracks)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_downloader_for_browsing(self):
+        """Bring up the panel the results live in, without toggling it shut."""
+        if not getattr(self, "dl_visible", False):
+            self.open_downloader()
+
+    def _render_album(self, album, tracks):
+        """One release on its own: what it is, and everything on it."""
+        if not self._dl_alive():
+            return
+        self._clear_results()
+
+        header = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        header.pack(fill="x", padx=4, pady=(4, 8))
+        ctk.CTkButton(header, text="\u2190  Back to results", width=150, height=30,
+                      corner_radius=15, font=theme_ui.font("small"),
+                      fg_color="transparent", border_width=1,
+                      text_color=self.theme["text"],
+                      hover_color=self.theme["surface_hover"],
+                      command=self._back_to_results).pack(anchor="w", padx=8)
+
+        title = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        title.pack(fill="x", padx=12, pady=(0, 6))
+        ctk.CTkLabel(title, text=album["name"], anchor="w",
+                     font=theme_ui.font("title"),
+                     text_color=self.theme["text"]).pack(anchor="w")
+        credit = ctk.CTkLabel(
+            title, text="  \u00b7  ".join(
+                x for x in (album.get("artist"), album.get("year")) if x),
+            anchor="w", font=theme_ui.font("caption"),
+            text_color=self.theme["text_secondary"])
+        credit.pack(anchor="w")
+        if album.get("artist"):
+            self._click_through(
+                credit, lambda: self.open_artist_by_name(album["artist"]),
+                hover=self.theme["text"])
+
+        ctk.CTkButton(title, text="Download album", width=140, height=32,
+                      corner_radius=16, font=theme_ui.font("small"),
+                      command=lambda: self.download_album(album)).pack(
+                          anchor="w", pady=(8, 0))
+
+        if not tracks:
+            ctk.CTkLabel(self.results_frame,
+                         text="Could not read this album's tracks.",
+                         anchor="w", font=theme_ui.font("caption"),
+                         text_color=self.theme["text_secondary"]).pack(
+                             anchor="w", padx=12)
+            return
+        listing = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        listing.pack(fill="x", padx=(12, 8))
+        for index, track in enumerate(tracks, 1):
+            self._album_track_row(listing, index, track)
+
     def _back_to_results(self):
         self._discover_artist = None
-        self._render_discover(self.discover_results, self.discover_artists)
+        self._render_discover(self.discover_results, self.discover_artists,
+                              getattr(self, "_songs_heading", None))
 
     def _album_row(self, album):
         """One release: take the whole thing, or open it and pick."""
@@ -4762,90 +4873,43 @@ class App(ctk.CTk):
         """Keep a previewed track: download and tag it properly."""
         self._download_tracks([track])
 
-    def on_key_release(self, event):
-        if self.search_timer:
-            self.after_cancel(self.search_timer)
-        self.search_timer = self._safe_after(400, self.perform_search)
-
-    def perform_search(self):
-        query = self.url_entry.get().strip()
-        if query:
-            # A typed query belongs to the results panel, which answers with
-            # artists and their releases as well as loose tracks. This
-            # dropdown used to answer the same query at the same time, laying
-            # a shorter and worse copy of the list over the top of it.
-            self.suggestions_frame.place_forget()
-            return
-        # An empty box is the one thing the results panel has nothing to say
-        # about, so this stays: more from whoever is playing.
-        threading.Thread(target=self.fetch_recommendations, daemon=True).start()
-
     def fetch_recommendations(self):
+        """More from whoever is playing, for an empty search box.
+
+        This used to float its own panel under the search bar, so with
+        Spotify connected the downloader opened showing two search surfaces
+        at once -- the results panel, and a second narrower list on top of
+        it answering a question nobody had asked. It renders into the
+        results panel now, because there is only one place answers belong.
+        """
         try:
             if not self.sp or not self.current_playlist or self.current_index < 0:
-                self._safe_after(0, self.suggestions_frame.place_forget)
                 return
-
             file_path = self.current_playlist[self.current_index]
             tags = audio_files.read_tags(file_path)
             title, artist = tags["title"], tags["artist"]
-
             if not title or not artist:
-                self._safe_after(0, self.suggestions_frame.place_forget)
                 return
 
-            # Find the Spotify Track ID for the local file
-            search_res = self.sp.search(q=f"track:{title} artist:{artist}", limit=1, type='track')
-            if not search_res['tracks']['items']:
-                self._safe_after(0, self.suggestions_frame.place_forget)
+            found = self.sp.search(q=f"track:{title} artist:{artist}",
+                                   limit=1, type="track")["tracks"]["items"]
+            if not found:
                 return
-            track_id = search_res['tracks']['items'][0]['id']
 
             # sp.recommendations() now returns HTTP 404: Spotify retired
             # /v1/recommendations for newly-registered apps, so this feature
             # was dead. Derive suggestions from artist top tracks instead.
-            tracks = get_related_tracks(self.sp, track_id, limit=5)
+            tracks = get_related_tracks(self.sp, found[0]["id"], limit=8)
             if not tracks:
-                self._safe_after(0, self.suggestions_frame.place_forget)
                 return
-
             # Named for what it can actually deliver. Spotify closed the
             # endpoints that made real recommendations possible, so calling
             # these "suggested for you" would be overselling a search.
-            self._safe_after(0, self.show_suggestions, tracks,
-                             f"More from {artist}")
+            self._safe_after(0, self._render_discover,
+                             [metadata.as_spotify_track(t) for t in tracks],
+                             [], "More from %s" % artist)
         except Exception as e:
             print(f"Recommendation error: {e}")
-            self._safe_after(0, self.suggestions_frame.place_forget)
-
-    def show_suggestions(self, tracks, tracks_title="Tracks"):
-        for widget in self.suggestions_frame.winfo_children():
-            widget.destroy()
-
-        if not tracks:
-            self.suggestions_frame.place_forget()
-            return
-
-        if tracks:
-            ctk.CTkLabel(self.suggestions_frame, text=tracks_title, font=ctk.CTkFont(weight="bold"), text_color=self.theme["text_secondary"]).pack(anchor="w", padx=10, pady=(5,0))
-            for track in tracks:
-                name = track['name']
-                art = ", ".join(a['name'] for a in track['artists'])
-                url = track['external_urls']['spotify']
-                btn_text = f"{name}  ·  {art}"
-                btn = ctk.CTkButton(self.suggestions_frame, text=btn_text, anchor="w", fg_color="transparent",
-                                    text_color=self.theme["text"], hover_color=self.theme["surface_hover"], corner_radius=8,
-                                    command=lambda u=url, t=btn_text: self.select_suggestion(u, t))
-                btn.pack(fill="x", padx=5, pady=2)
-
-        self.suggestions_frame.configure(width=self.url_entry.winfo_width())
-        self.suggestions_frame.place(x=self.url_entry.winfo_x(), y=self.url_entry.winfo_y() + self.url_entry.winfo_height() + 5)
-        self.suggestions_frame.lift()
-
-    def select_suggestion(self, url, text):
-        self.suggestions_frame.place_forget()
-        self.url_entry.delete(0, "end")
-        self.url_entry.insert(0, url)
 
     def _gui_log(self, message):
         self._safe_after(0, self.log, message)

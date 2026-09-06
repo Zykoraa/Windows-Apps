@@ -20,6 +20,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
+# The same reduction the library uses to decide two files are the same song:
+# it already strips "(Deluxe Edition)", "- Remastered" and the rest, and it
+# is already under test. An album title needs exactly that.
+from library_index import normalise_title
+
 MAX_RESULTS = 25
 ARTIST_RESULTS = 6
 # Spotify caps every paged endpoint at 10 per call for app-only credentials --
@@ -62,6 +67,33 @@ def dedupe_albums(albums):
     return out
 
 
+def _album_key(name):
+    """A title reduced to what a match should care about."""
+    return "".join(ch for ch in normalise_title(name) if ch.isalnum())
+
+
+def album_matches(wanted, candidate):
+    """Whether a search result is plausibly the record that was asked for.
+
+    A catalogue always answers something. Searching for an album that is not
+    in it returned whatever ranked first -- so a track whose album tag was a
+    typo opened a stranger's single, presented as the record you were
+    listening to. Better to say it could not be found.
+    """
+    a, b = _album_key(wanted), _album_key(candidate)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if a not in b and b not in a:
+        return False
+    # Containment on its own is not enough in the shorter-candidate
+    # direction: a two-word title sits inside plenty of unrelated ones, and
+    # "zzz" is contained in "zzzzz not a real album". The overlap has to be
+    # most of both names, which "Continuum" and "Continuum (Deluxe)" are.
+    return min(len(a), len(b)) / float(max(len(a), len(b))) >= 0.5
+
+
 def _as_artist(artist):
     """A Spotify artist object, flattened to what the UI needs."""
     images = artist.get("images") or []
@@ -73,6 +105,20 @@ def _as_artist(artist):
         "image_url": images[-1]["url"] if images else None,
         "genres": list(artist.get("genres") or []),
     }
+
+
+def _pick_album(wanted, candidates):
+    """The best of a catalogue's answers, or nothing if none of them fit.
+
+    An exact title beats whatever ranked first -- searching for Continuum
+    otherwise lands on a compilation that merely mentions it.
+    """
+    plausible = [a for a in candidates if a and album_matches(wanted, a["name"])]
+    key = _album_key(wanted)
+    for album in plausible:
+        if _album_key(album["name"]) == key:
+            return album
+    return plausible[0] if plausible else None
 
 
 def _as_album(album):
@@ -216,6 +262,37 @@ class Discover:
         else:
             found = self._fallback("artist_albums", artist)
         return dedupe_albums(found)
+
+    def find_album(self, name, artist=""):
+        """The release a track came from, by name.
+
+        The now playing bar knows an album's name and nothing else -- tags
+        carry no ids -- so getting from "the song I am listening to" to the
+        record it is on means looking it up again.
+        """
+        name = (name or "").strip()
+        if not name:
+            return None
+        candidates = []
+        if self.sp is not None:
+            try:
+                candidates = self._spotify_albums(name, artist)
+            except Exception:
+                candidates = []
+        if not candidates:
+            candidates = self._fallback("search_albums", name, artist) or []
+        return _pick_album(name, candidates)
+
+    def _spotify_albums(self, name, artist):
+        query = 'album:"%s"' % name
+        if artist:
+            query += ' artist:"%s"' % artist
+        items = self.sp.search(q=query, limit=PAGE,
+                               type="album")["albums"]["items"]
+        if not items:
+            items = self.sp.search(q=name, limit=PAGE,
+                                   type="album")["albums"]["items"]
+        return [_as_album(a) for a in items if a]
 
     def album_tracks(self, album):
         """The tracks on one release, ready to preview or download."""

@@ -2735,3 +2735,63 @@ class NowPlayingGeometry(unittest.TestCase):
             L = gui.np_layout(w, h, 52)
             self.assertGreater(L["cover"], 0)
             self.assertGreater(L["lyrics"][2], 0)
+
+
+class AlbumLookup(unittest.TestCase):
+    """Getting from a playing track to the record it is on.
+
+    The transport bar knows an album by name and nothing else -- tags carry
+    no ids -- so the title in it can only be a way in if the name can be
+    looked up again, and only safely if a bad lookup says so rather than
+    opening a stranger's single.
+    """
+
+    def test_an_edition_suffix_is_not_a_different_album(self):
+        # The common real case: the file says "(Deluxe Edition)" and the
+        # catalogue has the plain title, or the other way round.
+        self.assertTrue(discover.album_matches("Continuum (Deluxe Edition)",
+                                               "Continuum"))
+        self.assertTrue(discover.album_matches("Continuum",
+                                               "Continuum (Deluxe)"))
+        self.assertTrue(discover.album_matches("Sob Rock", "Sob Rock (Live)"))
+
+    def test_a_short_title_does_not_match_everything_containing_it(self):
+        # A catalogue always answers something; "zzz" sits inside plenty of
+        # unrelated titles, and matching it presented a stranger's single as
+        # the record you were listening to.
+        self.assertFalse(discover.album_matches("zzzzz not a real album", "zzz"))
+        self.assertFalse(discover.album_matches("Belief", "Beliefs of a Nation"))
+
+    def test_nothing_matches_nothing(self):
+        self.assertFalse(discover.album_matches("", "Continuum"))
+        self.assertFalse(discover.album_matches("Continuum", ""))
+
+    def test_an_exact_title_beats_whatever_ranked_first(self):
+        candidates = [{"name": "Continuum Live", "year": "2019"},
+                      {"name": "Continuum", "year": "2006"}]
+        self.assertEqual(discover._pick_album("Continuum", candidates)["year"],
+                         "2006")
+
+    def test_no_plausible_answer_is_no_answer(self):
+        self.assertIsNone(discover._pick_album(
+            "Some Album That Is Not There", [{"name": "zzz", "year": "2026"}]))
+        self.assertIsNone(discover._pick_album("Continuum", []))
+
+    def test_a_lookup_with_no_name_never_asks(self):
+        class Boom:
+            def search(self, *a, **k): raise AssertionError("asked anyway")
+        d = discover.Discover(None, lambda: {}, lambda *a: 0, fallback=Boom())
+        self.assertIsNone(d.find_album("", "John Mayer"))
+        self.assertIsNone(d.find_album(None))
+
+    def test_apple_can_answer_the_lookup_too(self):
+        payload = {"results": [
+            {"wrapperType": "collection", "collectionId": 1,
+             "collectionName": "Continuum", "artistName": "John Mayer",
+             "releaseDate": "2006-09-12T07:00:00Z", "trackCount": 12,
+             "collectionViewUrl": "u", "artworkUrl100": "a/100x100bb.jpg"}]}
+        fallback = metadata.ITunesProvider(session=FakeSession(payload))
+        d = discover.Discover(None, lambda: {}, lambda *a: 0, fallback=fallback)
+        album = d.find_album("Continuum", "John Mayer")
+        self.assertEqual(album["name"], "Continuum")
+        self.assertEqual(album["source"], "itunes")

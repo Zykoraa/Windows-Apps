@@ -144,6 +144,23 @@ class ITunesProvider:
         out = [self._as_artist(item) for item in payload.get("results") or []]
         return [artist for artist in out if artist][:limit]
 
+    def search_albums(self, name, artist="", limit=10):
+        """Releases matching a name, for getting from a track to its album."""
+        term = ("%s %s" % (artist, name)).strip() if artist else (name or "")
+        if not term.strip():
+            return []
+        payload = self._get(SEARCH_URL,
+                            {"term": term, "media": "music", "entity": "album",
+                             "limit": max(1, min(int(limit), 50)),
+                             "country": self.country})
+        out = [self._as_album(item) for item in payload.get("results") or []]
+        out = [album for album in out if album]
+        wanted = (name or "").strip().lower()
+        for album in out:
+            if album["name"].strip().lower() == wanted:
+                return [album] + [a for a in out if a is not album]
+        return out
+
     def artist_albums(self, artist, limit=200):
         """Everything Apple lists under an artist, newest first."""
         artist_id = _plain_id((artist or {}).get("id"))

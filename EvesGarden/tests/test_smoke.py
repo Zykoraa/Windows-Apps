@@ -72,6 +72,13 @@ class OfflineCatalogue:
                 for i in range(3)]
 
     @staticmethod
+    def search_albums(name, artist="", limit=10):
+        return [{"source": "offline", "id": "offline:album:0", "name": name,
+                 "artist": artist or "Someone", "year": "2006",
+                 "album_type": "album", "total_tracks": 3, "url": "",
+                 "cover_url": None, "cover_large": None}]
+
+    @staticmethod
     def album_tracks(album):
         return [{"source": "offline", "id": "%s:t%d" % (album["id"], i),
                  "title": "Track %d" % i, "artists": ["Someone"],
@@ -170,6 +177,16 @@ class SurfaceWalk:
         app.open_downloader()
         yield 400
 
+        self.mark("only one search surface in the downloader")
+        entries = [w for w in self._widgets(app.dl_frame)
+                   if isinstance(w, self.gui.ctk.CTkEntry)]
+        assert len(entries) == 1, (
+            "the downloader is showing %d search boxes; the old suggestions "
+            "panel used to float a second one under the real one whenever "
+            "Spotify was connected" % len(entries))
+        assert not hasattr(app, "suggestions_frame"), (
+            "the floating suggestions panel is back")
+
         self.mark("search results list artists as well as songs")
         app.url_entry.delete(0, "end")
         app.url_entry.insert(0, "someone")
@@ -210,6 +227,35 @@ class SurfaceWalk:
         yield from self._until(
             "going back did not restore the search results",
             lambda: "Songs" in self._labels(app.results_frame))
+
+        # The transport used to be a dead end: the two things written in it
+        # are the two places you would want to go next.
+        self.mark("the transport title opens the album")
+        app._now_playing_row = {"path": None, "title": "Gravity",
+                                "artist": "John Mayer, Tom Misch",
+                                "album": "Continuum", "cover_url": None}
+        app._browse_playing_album()
+        yield from self._until(
+            "the album never opened from the transport",
+            lambda: "Continuum" in self._labels(app.results_frame))
+        assert self._button(app.results_frame, "Download album") is not None, (
+            "the album opened with no way to take it")
+        assert self._button(app.results_frame, "Back to results") is not None, (
+            "the album opened with no way back out")
+
+        self.mark("the transport credit opens the artist")
+        app._browse_playing_artist()
+        yield from self._until(
+            "the discography never opened from the transport",
+            lambda: self._button(app.results_frame, "Back to results") is not None
+                    and "Albums" in self._labels(app.results_frame))
+
+        self.mark("a track with no album says so rather than guessing")
+        app._now_playing_row = {"path": None, "title": "Something",
+                                "artist": "Someone", "album": "",
+                                "cover_url": None}
+        app._browse_playing_album()
+        yield 200
 
         self.mark("close downloader after search")
         app.close_downloader()
