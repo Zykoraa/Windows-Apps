@@ -5409,24 +5409,24 @@ class App(ctk.CTk):
                 # open.spotify.com/collection/tracks, so the plain
                 # "playlist" check below never matched it.
                 self._gui_log("Fetching your Liked Songs...")
-                track_urls = get_spotify_playlist_tracks(self.sp, url,
-                                                         user_sp=self.user_sp)
+                tracks = get_spotify_playlist_tracks(self.sp, url,
+                                                     user_sp=self.user_sp)
             elif "track" in url:
-                track_urls = [url]
+                tracks = [url]
             elif "playlist" in url:
                 self._gui_log("Fetching playlist tracks...")
-                track_urls = get_spotify_playlist_tracks(self.sp, url,
-                                                         user_sp=self.user_sp)
+                tracks = get_spotify_playlist_tracks(self.sp, url,
+                                                     user_sp=self.user_sp)
             elif "album" in url:
                 self._gui_log("Fetching album tracks...")
-                track_urls = get_spotify_album_tracks(self.sp, url)
+                tracks = get_spotify_album_tracks(self.sp, url)
             else:
                 self._gui_log(f"Searching Spotify for '{url}'...")
                 found = search_spotify_track(self.sp, url)
                 if not found:
                     self._gui_log(f"Could not find any track matching '{url}'.")
                     return
-                track_urls = [found]
+                tracks = [found]
         except SpotifyAuthError as e:
             # e.g. a private or Spotify-curated playlist, which app-only
             # credentials cannot read -- previously surfaced as a raw 401.
@@ -5436,7 +5436,39 @@ class App(ctk.CTk):
             self._gui_log(f"An error occurred: {e}")
             return
 
-        self._safe_after(0, self._start_batch, track_urls)
+        self._safe_after(0, self._start_spotify_batch, tracks)
+
+    def _start_spotify_batch(self, tracks):
+        """Queue what a Spotify link resolved to.
+
+        An entry is either a bare URL -- a single track link, which the
+        pipeline looks up itself -- or the metadata a playlist or album read
+        already carried. Handing that through is the point of reading it:
+        looking each track up again cost one API call per track, so a long
+        playlist spent its way into a rate limit partway down and every
+        track after that failed.
+        """
+        keys, labels, meta = [], {}, {}
+        for track in tracks:
+            if isinstance(track, str):
+                key, described = track, None
+            else:
+                described = track
+                # A key is only an identity here. Preferring the URL keeps
+                # the same track from two playlist editions to one job.
+                key = track.get("spotify_url") or "%s - %s" % (
+                    ", ".join(track.get("artists") or []),
+                    track.get("name") or "")
+            if not key or key in labels:
+                continue
+            keys.append(key)
+            if described is not None:
+                labels[key] = "%s - %s" % (", ".join(described["artists"]),
+                                           described["name"])
+                meta[key] = described
+            else:
+                labels[key] = key
+        self._start_batch(keys, labels=labels, meta=meta or None)
 
     def _download_from_link(self, url):
         """Fetch what is at a link, rather than looking for it on Spotify.

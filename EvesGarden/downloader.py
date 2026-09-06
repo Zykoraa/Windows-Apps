@@ -251,11 +251,7 @@ def get_liked_songs(user_sp):
     while results["next"]:
         results = user_sp.next(results)
         items.extend(results["items"])
-    return [
-        i["track"]["external_urls"]["spotify"]
-        for i in items
-        if i.get("track") and i["track"].get("external_urls")
-    ]
+    return _described(items)
 
 
 def get_spotify_playlist_tracks(sp, playlist_url, user_sp=None):
@@ -315,24 +311,48 @@ def get_spotify_playlist_tracks(sp, playlist_url, user_sp=None):
     # that was fetched perfectly well came back as "Nothing to download."
     # spotify_import.track_of knows both names; this used to keep its own
     # copy of that rule, and only one of the two got fixed.
-    urls = []
+    return _described(entries)
+
+
+def _described(entries):
+    """Playlist entries as metadata, rather than as links to fetch again.
+
+    Reading a playlist already returns everything the tagger needs -- name,
+    artists, album, artwork, track number. Returning only the URLs threw
+    that away and made the downloader ask Spotify about each track a second
+    time, one call apiece. A 924 track playlist therefore spent 924 calls
+    restating what it had just been told, which is how an afternoon's
+    downloading earned an eleven hour rate limit. Carried through, the
+    whole batch costs the calls to page the playlist and nothing more.
+    """
+    out = []
     for entry in entries:
         track = spotify_import.track_of(entry)
         if not spotify_import.is_downloadable(track):
             continue
-        url = (track.get("external_urls") or {}).get("spotify")
-        if url:
-            urls.append(url)
-    return urls
+        described = spotify_import.as_metadata(track)
+        if described:
+            out.append(described)
+    return out
 
 
 def get_spotify_album_tracks(sp, album_url):
-    results = sp.album_tracks(album_url)
-    tracks = results["items"]
-    while results["next"]:
-        results = sp.next(results)
-        tracks.extend(results["items"])
-    return [item["external_urls"]["spotify"] for item in tracks]
+    """Every track on an album, described from the album itself.
+
+    Same reasoning as _described: twenty tracks looked up individually is
+    twenty-one calls to learn what one already said. A track listed inside
+    an album carries no album of its own -- it is already in one -- so the
+    name, year and artwork are grafted on from the release that was asked
+    for, exactly as the browser does it.
+    """
+    album = sp.album(album_url)
+    page = album.get("tracks") or {}
+    items = list(page.get("items") or [])
+    while page.get("next"):
+        page = sp.next(page)
+        items.extend(page.get("items") or [])
+    return _described({"item": dict(track, album=album)}
+                      for track in items if track)
 
 
 def get_spotify_album_tracks_info(sp, url):
@@ -935,26 +955,27 @@ def main():
     url = args.url
     try:
         if "track" in url:
-            urls = [url]
+            tracks = [url]
         elif "playlist" in url:
             print("Fetching playlist tracks...")
-            urls = get_spotify_playlist_tracks(sp, url)
+            tracks = get_spotify_playlist_tracks(sp, url)
         elif "album" in url:
             print("Fetching album tracks...")
-            urls = get_spotify_album_tracks(sp, url)
+            tracks = get_spotify_album_tracks(sp, url)
         else:
             print(f"Searching Spotify for '{url}'...")
             found = search_spotify_track(sp, url)
             if not found:
                 print(f"Could not find any track matching '{url}' on Spotify.")
                 return 1
-            urls = [found]
+            tracks = [found]
     except SpotifyAuthError as e:
         print(f"Error: {e}")
         return 1
 
-    print(f"Processing {len(urls)} track(s) with {args.jobs} worker(s).")
-    results = download_many(sp, urls, args.output, jobs=args.jobs, quality=args.quality)
+    print(f"Processing {len(tracks)} track(s) with {args.jobs} worker(s).")
+    results = download_many(sp, tracks, args.output, jobs=args.jobs,
+                            quality=args.quality)
     ok = sum(1 for r in results if r and r.get("ok"))
     print(f"\nFinished: {ok} succeeded, {len(results) - ok} failed.")
     return 0 if ok == len(results) else 1

@@ -1016,40 +1016,98 @@ class PastedPlaylistLink(unittest.TestCase):
     fetched perfectly well.
     """
 
-    def _urls(self, entries):
+    def _tracks(self, entries):
         sp = FakeSpotify(items={"p": entries}, tracks_forbidden=False)
         return downloader.get_spotify_playlist_tracks(None, "p", user_sp=sp)
 
     def test_every_track_comes_back(self):
-        got = self._urls([_item(_sp_track("A", "X")),
-                          _item(_sp_track("B", "Y"))])
-        self.assertEqual(len(got), 2)
+        got = self._tracks([_item(_sp_track("A", "X")),
+                            _item(_sp_track("B", "Y"))])
+        self.assertEqual([t["name"] for t in got], ["A", "B"])
+
+    def test_what_was_read_is_kept_rather_than_asked_for_again(self):
+        # The reason this returns descriptions and not links: without them
+        # the downloader asked Spotify about every track a second time, one
+        # call apiece, and a long playlist rate-limited itself partway down.
+        track = self._tracks([_item(_sp_track("A", "X"))])[0]
+        for field in ("name", "artists", "album", "album_artist", "cover_url",
+                      "track_number", "duration_ms", "spotify_url"):
+            self.assertIsNotNone(track.get(field), field)
 
     def test_the_old_name_still_works(self):
         # Whichever way round Spotify has it this week.
         for wrapper in ("item", "track"):
-            got = self._urls([{"is_local": False,
-                               wrapper: _sp_track("A", "X")}])
+            got = self._tracks([{"is_local": False,
+                                 wrapper: _sp_track("A", "X")}])
             self.assertEqual(len(got), 1, wrapper)
 
     def test_a_local_file_is_not_offered_as_a_download(self):
         local = _sp_track("Riff.mp3", "Me", extra={"is_local": True})
-        self.assertEqual(self._urls([_item(local)]), [])
+        self.assertEqual(self._tracks([_item(local)]), [])
 
     def test_a_podcast_episode_is_not_offered_as_a_download(self):
         show = _sp_track("Ep 12", "A Show", extra={"type": "episode"})
-        self.assertEqual(self._urls([_item(show)]), [])
+        self.assertEqual(self._tracks([_item(show)]), [])
 
     def test_a_withdrawn_entry_is_skipped(self):
         # A track pulled from the catalogue comes back as a null entry.
-        self.assertEqual(self._urls([{"is_local": False, "item": None}]), [])
+        self.assertEqual(self._tracks([{"is_local": False, "item": None}]), [])
 
     def test_liked_songs_still_reads_from_me_tracks(self):
         sp = FakeSpotify(liked=[{"track": _sp_track("A", "X")},
                                 {"track": _sp_track("B", "Y")}])
         got = downloader.get_spotify_playlist_tracks(
             None, "https://open.spotify.com/collection/tracks", user_sp=sp)
-        self.assertEqual(len(got), 2)
+        self.assertEqual([t["name"] for t in got], ["A", "B"])
+
+
+class AlbumIsReadOnce(unittest.TestCase):
+    """Downloading an album should not then ask about each track on it."""
+
+    ALBUM = {"name": "Continuum", "release_date": "2006-09-12",
+             "images": [{"url": "http://art/big.jpg"}],
+             "artists": [{"name": "John Mayer"}]}
+
+    class Spotify:
+        def __init__(self, album, count=3):
+            self.album_body = album
+            self.calls = []
+            self.items = [{"name": "T%d" % i, "type": "track",
+                           "artists": [{"name": "John Mayer"}],
+                           "track_number": i, "disc_number": 1,
+                           "duration_ms": 1000 * i,
+                           "external_urls": {"spotify": "u%d" % i}}
+                          for i in range(1, count + 1)]
+
+        def album(self, album_url):
+            # One track per page, so the paging loop is exercised rather
+            # than assumed.
+            self.calls.append("album")
+            head, rest = self.items[:1], self.items[1:]
+            return dict(self.album_body,
+                        tracks={"items": head, "next": bool(rest) or None,
+                                "_rest": rest})
+
+        def next(self, page):
+            self.calls.append("next")
+            return {"items": page.get("_rest") or [], "next": None,
+                    "_rest": []}
+
+    def test_the_album_is_read_once_and_its_tracks_described_from_it(self):
+        sp = self.Spotify(self.ALBUM)
+        got = downloader.get_spotify_album_tracks(sp, "album-url")
+        self.assertEqual([t["name"] for t in got], ["T1", "T2", "T3"])
+        self.assertEqual(sp.calls.count("album"), 1)
+
+    def test_a_track_inside_an_album_is_given_the_album_it_is_in(self):
+        # It carries none of its own -- it is already in one -- so without
+        # this every downloaded file would be tagged with a blank album and
+        # no artwork.
+        got = downloader.get_spotify_album_tracks(self.Spotify(self.ALBUM),
+                                                  "album-url")
+        self.assertTrue(all(t["album"] == "Continuum" for t in got))
+        self.assertTrue(all(t["release_date"] == "2006" for t in got))
+        self.assertTrue(all(t["cover_url"] for t in got))
 
 
 class SpotifyAccountSwitching(unittest.TestCase):
