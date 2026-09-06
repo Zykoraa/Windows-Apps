@@ -7,6 +7,7 @@ import requests
 import yt_dlp
 
 import audio_files
+import spotify_auth
 import spotify_import
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
@@ -74,8 +75,20 @@ def setup_spotify():
             cache_handler=cache_handler,
         ),
         requests_timeout=15,
-        retries=3,
+        # Not spotipy's own session: its retry policy will sleep for as long
+        # as a rate limit tells it to, which is hours. See spotify_auth.
+        requests_session=spotify_auth.api_session(),
     )
+
+
+def is_rate_limit(exc):
+    """Whether Spotify refused because too much was asked of it.
+
+    Worth telling apart from every other failure: nothing is wrong with the
+    link, the credentials or the track, and the only useful advice is to
+    wait.
+    """
+    return getattr(exc, "http_status", None) == 429
 
 
 def get_spotify_track_info(sp, track_url):
@@ -703,8 +716,12 @@ def process_track(sp, track, output_dir, log_callback=print,
         try:
             metadata = get_spotify_track_info(sp, track)
         except Exception as e:
-            log_callback(f"  x Could not read track metadata: {e}")
-            return {"ok": False, "error": str(e), "metadata": None}
+            reason = ("Spotify is rate-limiting this app -- too many "
+                      "lookups too quickly. Try again later."
+                      if is_rate_limit(e) else "Could not read track "
+                      "metadata: %s" % e)
+            log_callback("  x " + reason)
+            return {"ok": False, "error": reason, "metadata": None}
 
     label = f"{', '.join(metadata['artists'])} - {metadata['name']}"
     safe_filename = sanitize_filename(label)

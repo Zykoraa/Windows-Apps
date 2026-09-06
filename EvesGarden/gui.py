@@ -5095,15 +5095,17 @@ class App(ctk.CTk):
                      text_color=self.theme["text_secondary"]).pack(anchor="w")
 
         def work():
+            reason = None
             try:
                 tracks = self.discover.album_tracks(album)
-            except Exception:
-                tracks = []
-            self._safe_after(0, self._render_album_track_list, frame, tracks)
+            except Exception as e:
+                tracks, reason = [], self._album_read_error(album["name"], e)
+            self._safe_after(0, self._render_album_track_list, frame, tracks,
+                             reason)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _render_album_track_list(self, frame, tracks):
+    def _render_album_track_list(self, frame, tracks, reason=None):
         try:
             if not frame.winfo_exists():
                 return
@@ -5112,9 +5114,12 @@ class App(ctk.CTk):
         for widget in frame.winfo_children():
             widget.destroy()
         if not tracks:
-            ctk.CTkLabel(frame, text="Could not load this album's tracks.",
-                         anchor="w", font=theme_ui.font("caption"),
-                         text_color=self.theme["text_secondary"]).pack(anchor="w")
+            ctk.CTkLabel(frame,
+                         text=reason or "Could not load this album's tracks.",
+                         anchor="w", justify="left", wraplength=520,
+                         font=theme_ui.font("caption"),
+                         text_color=self.theme["text_secondary"]).pack(
+                             anchor="w", fill="x")
             return
         for index, track in enumerate(tracks, 1):
             self._album_track_row(frame, index, track)
@@ -5139,6 +5144,15 @@ class App(ctk.CTk):
                      text_color=self.theme["text"]).pack(side="left", padx=(8, 0),
                                                          fill="x", expand=True)
 
+    def _album_read_error(self, name, exc):
+        """Why an album came back with nothing, in words worth reading."""
+        if downloader.is_rate_limit(exc):
+            return ("Spotify is rate-limiting this app -- too many lookups "
+                    "too quickly, usually a large download still running. "
+                    "%s is not on the keyless catalogue either, so there is "
+                    "nothing to fall back to. Try again later." % name)
+        return "Could not read %s: %s" % (name, exc)
+
     def download_album(self, album):
         """Take a whole release in one go."""
         self.log("Reading %s..." % album["name"])
@@ -5147,7 +5161,7 @@ class App(ctk.CTk):
             try:
                 tracks = self.discover.album_tracks(album)
             except Exception as e:
-                self._gui_log("Could not read %s: %s" % (album["name"], e))
+                self._gui_log(self._album_read_error(album["name"], e))
                 return
             if not tracks:
                 self._gui_log("No tracks listed for %s." % album["name"])

@@ -2815,6 +2815,114 @@ class NowPlayingGeometry(unittest.TestCase):
             self.assertGreater(L["lyrics"][2], 0)
 
 
+class SpotifyRetryPolicy(unittest.TestCase):
+    """What happens when Spotify says "too many requests".
+
+    It answers a rate limit with Retry-After, and does not ask for seconds:
+    a real one from this app was 41549, eleven and a half hours. urllib3
+    obeys that with a bare time.sleep() inside the request, so nothing
+    raises and requests_timeout does not apply -- it bounds the socket, not
+    the waiting. The thread that went to read an album never came back and
+    the window sat on "Reading ..." until the app was killed.
+    """
+
+    class Response:
+        """Only what urllib3 reads off a response to decide on a retry."""
+
+        def __init__(self, seconds):
+            self.headers = {"Retry-After": str(seconds)}
+
+    def test_an_eleven_hour_wait_is_not_slept_through(self):
+        retry = spotify_auth._CappedRetry(total=3)
+        self.assertEqual(retry.get_retry_after(self.Response(41549)),
+                         spotify_auth.RETRY_AFTER_CAP)
+
+    def test_urllib3_on_its_own_would_still_sleep_for_hours(self):
+        # It does have a ceiling of its own -- and it is six hours, which is
+        # a freeze rather than a retry. This is why the cap above is ours
+        # and not just the library's default.
+        from urllib3.util.retry import Retry
+        self.assertGreater(Retry(total=3).get_retry_after(
+            self.Response(41549)), 3600)
+
+    def test_a_short_wait_is_still_honoured(self):
+        retry = spotify_auth._CappedRetry(total=3)
+        self.assertEqual(retry.get_retry_after(self.Response(2)), 2)
+
+    def test_a_rate_limit_is_not_retried_at_all(self):
+        # Keeping 429 out of status_forcelist is not enough: urllib3 retries
+        # any Retry-After-bearing response whose status is in
+        # RETRY_AFTER_STATUS_CODES whatever the list says, and 429 is one.
+        # Three attempts cannot outlast an eleven hour limit anyway -- they
+        # only turn an instant answer into a long pause and fail regardless.
+        retry = spotify_auth._CappedRetry(total=3)
+        self.assertFalse(retry.is_retry("GET", 429, has_retry_after=True))
+
+    def test_a_server_error_still_is(self):
+        retry = spotify_auth._CappedRetry(
+            total=3, status_forcelist=(500, 502, 503, 504))
+        self.assertTrue(retry.is_retry("GET", 503, has_retry_after=True))
+
+    def test_the_session_the_clients_are_built_on_agrees(self):
+        retry = spotify_auth.api_session().get_adapter(
+            "https://api.spotify.com").max_retries
+        self.assertNotIn(429, retry.status_forcelist)
+        self.assertFalse(retry.is_retry("GET", 429, has_retry_after=True))
+
+
+class RateLimitedAlbum(unittest.TestCase):
+    """A refused album and an empty one are not the same answer."""
+
+    class Refused(Exception):
+        http_status = 429
+
+    class Catalogue:
+        """A keyless provider that has the record Spotify would not serve."""
+
+        def search_albums(self, name, artist="", limit=10):
+            return [{"source": "itunes", "id": "itunes:1", "name": name,
+                     "artist": artist or "Someone"}]
+
+        def album_tracks(self, album, limit=200):
+            return [{"source": "itunes", "id": "t1", "title": "A Song",
+                     "album": album["name"]}]
+
+    def _refusing_spotify(self):
+        sp = BrowsableSpotify()
+
+        def boom(*args, **kwargs):
+            raise RateLimitedAlbum.Refused("too many requests")
+
+        sp.album_tracks = boom
+        return sp
+
+    ALBUM = {"source": "spotify", "id": "a1", "name": "Continuum",
+             "artist": "John Mayer"}
+
+    def test_the_keyless_catalogue_answers_instead_when_it_can(self):
+        d = discover.Discover(self._refusing_spotify(), lambda: {},
+                              lambda *a: 0, fallback=self.Catalogue())
+        self.assertEqual([t["title"] for t in d.album_tracks(self.ALBUM)],
+                         ["A Song"])
+
+    def test_a_refusal_travels_when_nothing_can_answer(self):
+        # Reporting an empty album would be a different, wrong answer: the
+        # release is fine, the app has simply been told to go away.
+        d = discover.Discover(self._refusing_spotify(), lambda: {},
+                              lambda *a: 0)
+        with self.assertRaises(RateLimitedAlbum.Refused):
+            d.album_tracks(self.ALBUM)
+
+    def test_a_genuinely_empty_album_is_still_just_empty(self):
+        d = discover.Discover(BrowsableSpotify(tracks=[]), lambda: {},
+                              lambda *a: 0)
+        self.assertEqual(d.album_tracks(self.ALBUM), [])
+
+    def test_a_rate_limit_is_told_apart_from_every_other_failure(self):
+        self.assertTrue(downloader.is_rate_limit(self.Refused()))
+        self.assertFalse(downloader.is_rate_limit(RuntimeError("no")))
+
+
 class AlbumLookup(unittest.TestCase):
     """Getting from a playing track to the record it is on.
 

@@ -321,11 +321,36 @@ class Discover:
         if not album:
             return []
         if album.get("source") == "spotify" and self.sp is not None:
+            refusal = None
             try:
-                return self._spotify_album_tracks(album)
-            except Exception:
-                return []
+                found = self._spotify_album_tracks(album)
+            except Exception as e:
+                found, refusal = [], e
+            if found:
+                return found
+            found = self._keyless_album_tracks(album)
+            if not found and refusal is not None:
+                # Nothing from either provider, and Spotify said why. Saying
+                # "this album has no tracks" would be a different, wrong
+                # answer -- so the reason travels instead.
+                raise refusal
+            return found
         return self._fallback("album_tracks", album)
+
+    def _keyless_album_tracks(self, album):
+        """The same release, read from the provider that needs no account.
+
+        A Spotify id means nothing to Apple, so the release has to be found
+        there by name first. Worth the extra lookup: this runs when Spotify
+        has refused -- a rate limit, most often -- and the alternative is
+        telling somebody their album has no tracks on it.
+        """
+        name = album.get("name") or ""
+        if not name:
+            return []
+        match = _pick_album(name, self._fallback("search_albums", name,
+                                                 album.get("artist") or "") or [])
+        return self._fallback("album_tracks", match) if match else []
 
     def _spotify_artists(self, query, limit):
         items = self.sp.search(q=query, limit=min(limit, PAGE),
